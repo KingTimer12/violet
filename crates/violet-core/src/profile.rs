@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -62,7 +63,10 @@ impl fmt::Display for DriverId {
 pub enum SslMode {
     /// Plain text. Only sensible on localhost.
     Disable,
-    /// TLS when the server offers it, plain text otherwise.
+    /// TLS when the server offers it, plain text otherwise — but only on
+    /// this machine. Anyone on the path to a remote server could refuse TLS
+    /// on its behalf and read the password, so off loopback `Prefer` is
+    /// enforced as [`SslMode::Require`]; see [`SslMode::effective`].
     #[default]
     Prefer,
     /// TLS or fail. The server certificate is verified against the bundled
@@ -81,6 +85,30 @@ impl SslMode {
             Self::Require => "Require",
         }
     }
+
+    /// The mode a driver must actually use to reach `host`.
+    ///
+    /// Falling back to plain text is a downgrade an attacker can force, so
+    /// it is only allowed for loopback hosts and Unix sockets. Choosing
+    /// [`SslMode::Disable`] explicitly is still honoured.
+    #[must_use]
+    pub fn effective(self, host: &str) -> Self {
+        match self {
+            Self::Prefer if !is_loopback(host) => Self::Require,
+            mode => mode,
+        }
+    }
+}
+
+/// Whether `host` is this machine: `localhost`, a loopback address, or a
+/// Unix socket directory.
+#[must_use]
+pub fn is_loopback(host: &str) -> bool {
+    let host = host.trim();
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host.starts_with('/')
+        || bare.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// A saved connection.
@@ -165,5 +193,36 @@ mod tests {
         assert_eq!(profile.validate(), Err("User is required".to_owned()));
         profile.username = "app".to_owned();
         assert_eq!(profile.validate(), Ok(()));
+    }
+
+    #[test]
+    fn prefer_cannot_fall_back_to_plain_text_off_loopback() {
+        for host in [
+            "localhost",
+            "127.0.0.1",
+            "127.8.0.1",
+            "::1",
+            "[::1]",
+            "/var/run/postgresql",
+        ] {
+            assert!(is_loopback(host), "{host}");
+            assert_eq!(SslMode::Prefer.effective(host), SslMode::Prefer, "{host}");
+        }
+        for host in [
+            "db.example.com",
+            "10.0.0.5",
+            "localhost.evil.com",
+            "",
+            "::2",
+        ] {
+            assert!(!is_loopback(host), "{host}");
+            assert_eq!(SslMode::Prefer.effective(host), SslMode::Require, "{host}");
+        }
+        // An explicit choice is kept.
+        assert_eq!(
+            SslMode::Disable.effective("db.example.com"),
+            SslMode::Disable
+        );
+        assert_eq!(SslMode::Require.effective("localhost"), SslMode::Require);
     }
 }

@@ -29,6 +29,8 @@ impl PgSession {
         profile: &ConnectionProfile,
         credentials: &Credentials,
     ) -> Result<Self> {
+        // Never let `Prefer` silently drop to plain text on a remote host.
+        let ssl = profile.ssl.effective(&profile.host);
         let mut config = Config::new();
         config
             .host(&profile.host)
@@ -36,7 +38,7 @@ impl PgSession {
             .user(&profile.username)
             .application_name("Violet")
             .connect_timeout(CONNECT_TIMEOUT)
-            .ssl_mode(match profile.ssl {
+            .ssl_mode(match ssl {
                 SslMode::Disable => tokio_postgres::config::SslMode::Disable,
                 SslMode::Prefer => tokio_postgres::config::SslMode::Prefer,
                 SslMode::Require => tokio_postgres::config::SslMode::Require,
@@ -48,7 +50,7 @@ impl PgSession {
             config.password(password.expose());
         }
 
-        let (client, connection) = match profile.ssl {
+        let (client, connection) = match ssl {
             SslMode::Disable => {
                 let (client, connection) =
                     config.connect(NoTls).await.map_err(|e| error::map(&e))?;
@@ -62,11 +64,11 @@ impl PgSession {
                 (client, tokio::spawn(drive(connection)))
             }
         };
-        log::info!(target: "violet::postgres", "connected ({:?})", profile.ssl);
+        log::info!(target: "violet::postgres", "connected ({ssl:?})");
         Ok(Self {
             client,
             connection,
-            ssl: profile.ssl,
+            ssl,
         })
     }
 

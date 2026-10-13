@@ -47,6 +47,9 @@ The connection form, tree, editor and grid work unchanged.
   buffers are zeroed when dialogs close.
 - Profiles are written atomically with mode `0600`.
 - TLS (`Prefer`/`Require`) verifies the server against the web PKI roots.
+  `Prefer` only falls back to plain text on loopback hosts and Unix sockets;
+  for any other host it is enforced as `Require`, so a network attacker
+  cannot downgrade the connection and read the password.
 - Catalog queries use bind parameters; generated SQL quotes identifiers.
 - Result sets are capped (10 000 rows) so a stray `SELECT *` cannot exhaust
   memory; running queries can be cancelled server-side.

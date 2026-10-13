@@ -2,7 +2,7 @@
 
 use egui::{CornerRadius, RichText, Sense, Stroke, Vec2};
 use violet_app::RequestId;
-use violet_core::{ConnectionProfile, DriverInfo, Secret, ServerInfo, SslMode};
+use violet_core::{ConnectionProfile, DriverInfo, Secret, ServerInfo, SslMode, is_loopback};
 use zeroize::Zeroize as _;
 
 use super::action::Action;
@@ -252,7 +252,7 @@ pub fn show(
                     });
                 });
             });
-            if form.profile.ssl == SslMode::Disable && tls && !is_local(&form.profile.host) {
+            if form.profile.ssl == SslMode::Disable && tls && !is_loopback(&form.profile.host) {
                 notice(
                     ui,
                     &palette,
@@ -337,10 +337,6 @@ pub fn show(
         open = false;
     }
     open
-}
-
-fn is_local(host: &str) -> bool {
-    matches!(host.trim(), "localhost" | "127.0.0.1" | "::1" | "") || host.starts_with('/')
 }
 
 fn swatch(ui: &mut egui::Ui, value: &mut Option<[u8; 3]>, tag: Option<[u8; 3]>, palette: &Palette) {
