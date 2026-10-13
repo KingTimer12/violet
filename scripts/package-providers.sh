@@ -18,11 +18,13 @@ wasm=""
 for manifest in providers/*/Cargo.toml; do
     dir=$(dirname "$manifest")
     echo "building $dir" >&2
-    cargo build --release --target wasm32-wasip2 --manifest-path "$manifest"
+    cargo build --release --locked --target wasm32-wasip2 --manifest-path "$manifest"
     for file in "$dir"/target/wasm32-wasip2/release/*.wasm; do
         wasm="$wasm $file"
     done
 done
 
+# The packaging tool only inspects components; a debug build (dependencies
+# are optimised anyway) saves the release profile's long link.
 # shellcheck disable=SC2086
-cargo run --quiet --release -p violet-provider-cli -- package --out "$out" $wasm
+cargo run --quiet --locked -p violet-provider-cli -- package --out "$out" $wasm

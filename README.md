@@ -136,8 +136,19 @@ changed:
 cargo run --release
 ```
 
-To publish providers, run `scripts/package-providers.sh` and attach the
-files in `dist/` to a GitHub release.
+### Releases
+
+`.github/workflows/release.yml` builds the Windows app and the providers.
+Push a tag to publish both as a GitHub release:
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+The release carries `violet-<tag>-windows-x64.zip` (with its SHA-256) and,
+at its top level, `providers.json` and each provider's `.wasm`, where
+Violet's default catalogue URL finds them. Running the workflow by hand
+builds the same files as artifacts without publishing.
 
 | Shortcut | Action |
 | --- | --- |

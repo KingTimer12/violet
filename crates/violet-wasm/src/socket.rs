@@ -357,7 +357,7 @@ mod tests {
     fn socket_names_stay_in_their_directory() {
         assert_eq!(
             local_path("/var/run/postgresql", ".s.PGSQL.5432").ok(),
-            Some(PathBuf::from("/var/run/postgresql/.s.PGSQL.5432"))
+            Some(Path::new("/var/run/postgresql").join(".s.PGSQL.5432"))
         );
         for name in ["", ".", "..", "../etc/passwd", "a/b", "a\\b", "a\0"] {
             assert!(local_path("/tmp", name).is_err(), "{name:?}");

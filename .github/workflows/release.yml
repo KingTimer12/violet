@@ -1,0 +1,119 @@
+# Builds Violet for Windows and the database providers (WebAssembly
+# components), and publishes them.
+#
+# - Push a tag `v*` (git tag v0.1.0 && git push origin v0.1.0): both are
+#   built and attached to a GitHub release of that tag. The providers'
+#   files sit at the release's top level, where Violet looks for them:
+#   releases/latest/download/providers.json.
+# - Run it by hand (Actions > Release > Run workflow): both are built and
+#   kept as workflow artifacts only, nothing is published.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  providers:
+    name: WebAssembly providers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      # The packaging tool links Violet's storage crate, whose keychain
+      # support needs D-Bus on Linux.
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            providers/postgres -> target
+
+      - name: Build and package
+        run: scripts/package-providers.sh dist
+
+      - name: Check the catalogue
+        run: |
+          test -s dist/providers.json
+          ls -l dist
+          cat dist/providers.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: providers
+          path: dist/
+          if-no-files-found: error
+
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked --bin violet
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { "dev-$($env:GITHUB_SHA.Substring(0, 7))" }
+          $name = "violet-$version-windows-x64"
+          New-Item -ItemType Directory -Path "package/$name" | Out-Null
+          Copy-Item target/release/violet.exe "package/$name/"
+          Copy-Item README.md "package/$name/"
+          Compress-Archive -Path "package/$name" -DestinationPath "package/$name.zip"
+          $hash = (Get-FileHash "package/$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File -Encoding ascii "package/$name.zip.sha256"
+          Remove-Item -Recurse "package/$name"
+          Get-ChildItem package
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: package/
+          if-no-files-found: error
+
+  release:
+    name: Publish
+    needs: [providers, windows]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l assets
+          gh release create "$GITHUB_REF_NAME" assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Violet $GITHUB_REF_NAME" \
+            --generate-notes
