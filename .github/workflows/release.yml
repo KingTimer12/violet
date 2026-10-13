@@ -7,6 +7,9 @@
 #   releases/latest/download/providers.json.
 # - Run it by hand (Actions > Release > Run workflow): both are built and
 #   kept as workflow artifacts only, nothing is published.
+#
+# Actions are pinned to commit SHAs (Dependabot keeps them current), so a
+# moved tag upstream cannot change what builds the release.
 name: Release
 
 on:
@@ -30,9 +33,9 @@ jobs:
     name: WebAssembly providers
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           targets: wasm32-wasip2
 
@@ -41,7 +44,10 @@ jobs:
       - name: System libraries
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
 
-      - uses: Swatinem/rust-cache@v2
+      # Published builds start clean: a poisoned cache must not reach a
+      # release.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: github.ref_type != 'tag'
         with:
           workspaces: |
             . -> target
@@ -56,7 +62,7 @@ jobs:
           ls -l dist
           cat dist/providers.json
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: providers
           path: dist/
@@ -66,11 +72,12 @@ jobs:
     name: Windows x64
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: github.ref_type != 'tag'
 
       - name: Build
         run: cargo build --release --locked --bin violet
@@ -89,7 +96,7 @@ jobs:
           Remove-Item -Recurse "package/$name"
           Get-ChildItem package
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows
           path: package/
@@ -103,7 +110,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: assets
           merge-multiple: true
