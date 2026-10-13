@@ -9,6 +9,8 @@ use directories::ProjectDirs;
 pub struct AppDirs {
     config: PathBuf,
     state: PathBuf,
+    data: PathBuf,
+    cache: PathBuf,
 }
 
 impl AppDirs {
@@ -22,7 +24,12 @@ impl AppDirs {
             .state_dir()
             .unwrap_or_else(|| dirs.data_local_dir())
             .to_path_buf();
-        Some(Self { config, state })
+        Some(Self {
+            config,
+            state,
+            data: dirs.data_dir().to_path_buf(),
+            cache: dirs.cache_dir().to_path_buf(),
+        })
     }
 
     /// Directories rooted at `root`, for tests and portable installs.
@@ -31,6 +38,8 @@ impl AppDirs {
         Self {
             config: root.join("config"),
             state: root.join("state"),
+            data: root.join("data"),
+            cache: root.join("cache"),
         }
     }
 
@@ -52,6 +61,19 @@ impl AppDirs {
     #[must_use]
     pub fn panic_log(&self) -> PathBuf {
         self.state.join("panic.log")
+    }
+
+    /// Installed database providers.
+    #[must_use]
+    pub fn providers_dir(&self) -> PathBuf {
+        self.data.join("providers")
+    }
+
+    /// Providers compiled to machine code, so they start fast. Safe to
+    /// delete.
+    #[must_use]
+    pub fn code_cache_dir(&self) -> PathBuf {
+        self.cache.join("providers")
     }
 
     #[must_use]

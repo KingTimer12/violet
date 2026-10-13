@@ -3,8 +3,11 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use async_trait::async_trait;
+
+use crate::driver::{Driver, DriverInfo};
 use crate::error::Result;
-use crate::profile::{ConnectionId, ConnectionProfile};
+use crate::profile::{ConnectionId, ConnectionProfile, DriverId};
 use crate::query::QueryOutput;
 use crate::secret::Secret;
 
@@ -49,4 +52,47 @@ pub trait ResultCache: Send + Sync + 'static {
     fn put(&self, key: CacheKey, value: CachedOutput);
     /// Forgets everything for `connection`, as after a write.
     fn invalidate(&self, connection: ConnectionId);
+}
+
+/// A database provider Violet can use, installed or not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderListing {
+    pub info: DriverInfo,
+    /// The newest version on offer.
+    pub version: String,
+    pub description: String,
+    /// Download size in bytes.
+    pub size: u64,
+    /// The version installed, if any.
+    pub installed: Option<String>,
+}
+
+impl ProviderListing {
+    /// An update is on offer.
+    #[must_use]
+    pub fn outdated(&self) -> bool {
+        self.installed
+            .as_ref()
+            .is_some_and(|installed| *installed != self.version)
+    }
+}
+
+/// Where database drivers come from.
+///
+/// Violet ships none: each database is a provider installed on demand, the
+/// first time a connection needs it, and kept for next time.
+#[async_trait]
+pub trait ProviderStore: Send + Sync + 'static {
+    /// The providers installed, ready to register. Cheap: nothing is
+    /// compiled until a connection opens.
+    fn installed(&self) -> Result<Vec<Arc<dyn Driver>>>;
+
+    /// Every provider on offer, with what is installed of each.
+    async fn available(&self) -> Result<Vec<ProviderListing>>;
+
+    /// Downloads, verifies and installs the newest version of `id`,
+    /// replacing any installed one.
+    async fn install(&self, id: &DriverId) -> Result<Arc<dyn Driver>>;
+
+    async fn remove(&self, id: &DriverId) -> Result<()>;
 }

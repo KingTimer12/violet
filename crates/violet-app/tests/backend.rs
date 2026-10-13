@@ -1,4 +1,5 @@
-//! The backend's result cache and paging, against a scripted driver.
+//! The backend against a scripted driver: the result cache, paging, and
+//! providers installed on demand.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -7,10 +8,11 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use violet_app::{Backend, CachePolicy, DriverRegistry, Event, ExecOptions};
 use violet_core::driver::AnsiDialect;
+use violet_core::ports::{ProviderListing, ProviderStore};
 use violet_core::{
     Canceller, Capabilities, ColumnInfo, ColumnMeta, ConnectionProfile, Credentials, DbError,
     DbObject, Dialect, Driver, DriverId, DriverInfo, ErrorKind, ExecLimits, Page, QueryOutput,
-    Result, ResultSet, ServerInfo, Session,
+    Result, ResultSet, ServerInfo, Session, SqlDialect,
 };
 use violet_storage::{MemoryResultCache, MemorySecretStore};
 
@@ -25,21 +27,57 @@ struct Server {
 struct FakeDriver(Arc<Server>);
 struct FakeSession(Arc<Server>);
 
+/// A catalogue with one provider, the fake driver, installed on demand.
+struct OnDemand {
+    server: Arc<Server>,
+    installs: AtomicU64,
+}
+
+#[async_trait]
+impl ProviderStore for OnDemand {
+    fn installed(&self) -> Result<Vec<Arc<dyn Driver>>> {
+        Ok(Vec::new())
+    }
+
+    async fn available(&self) -> Result<Vec<ProviderListing>> {
+        Ok(vec![ProviderListing {
+            info: FakeDriver(Arc::clone(&self.server)).info(),
+            version: "1.0.0".into(),
+            description: String::new(),
+            size: 1,
+            installed: None,
+        }])
+    }
+
+    async fn install(&self, id: &DriverId) -> Result<Arc<dyn Driver>> {
+        if id.as_str() != "fake" {
+            return Err(DbError::new(ErrorKind::Provider, "not in the catalogue"));
+        }
+        self.installs.fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(FakeDriver(Arc::clone(&self.server))))
+    }
+
+    async fn remove(&self, _: &DriverId) -> Result<()> {
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl Driver for FakeDriver {
     fn info(&self) -> DriverInfo {
         DriverInfo {
             id: DriverId::new("fake"),
-            name: "Fake",
+            name: "Fake".into(),
             default_port: 1,
-            default_database: "",
-            default_user: "",
+            default_database: String::new(),
+            default_user: String::new(),
             capabilities: Capabilities {
                 databases: false,
                 schemas: true,
                 cancel: false,
                 tls: false,
             },
+            dialect: SqlDialect::ANSI,
         }
     }
 
@@ -139,8 +177,12 @@ impl Harness {
     fn connected() -> Self {
         let server = Arc::new(Server::default());
         let registry = DriverRegistry::new().with(FakeDriver(Arc::clone(&server)));
-        let backend = Backend::start(
+        let backend = Backend::with_registry(
             registry,
+            Arc::new(OnDemand {
+                server: Arc::clone(&server),
+                installs: AtomicU64::new(0),
+            }),
             Arc::new(MemorySecretStore::default()),
             Arc::new(MemoryResultCache::default()),
             || {},
@@ -293,4 +335,70 @@ fn errors_point_at_the_users_text_and_counts_parse() {
             ..
         }
     ));
+}
+
+#[test]
+fn a_missing_provider_is_installed_when_a_connection_needs_it() {
+    let server = Arc::new(Server::default());
+    let store = Arc::new(OnDemand {
+        server: Arc::clone(&server),
+        installs: AtomicU64::new(0),
+    });
+    let backend = Backend::start(
+        Arc::clone(&store) as Arc<dyn ProviderStore>,
+        Arc::new(MemorySecretStore::default()),
+        Arc::new(MemoryResultCache::default()),
+        || {},
+    )
+    .expect("runtime");
+    assert!(
+        backend.registry().infos().is_empty(),
+        "nothing installed yet"
+    );
+
+    let mut profile = ConnectionProfile::new(DriverId::new("fake"), 1);
+    profile.save_password = false;
+    backend.connect(profile.clone(), None);
+    let mut seen = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !seen.iter().any(|e| matches!(e, Event::Connected { .. })) {
+        assert!(Instant::now() < deadline, "never connected: {seen:?}");
+        seen.extend(backend.drain());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(matches!(seen[0], Event::ProviderInstalling { .. }));
+    assert!(matches!(
+        seen[1],
+        Event::ProviderInstalled { result: Ok(_), .. }
+    ));
+    assert_eq!(backend.registry().infos().len(), 1);
+
+    // Installed once; the next connection reuses it.
+    backend.connect(profile, None);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let events = backend.drain();
+        if events.iter().any(|e| matches!(e, Event::Connected { .. })) {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(store.installs.load(Ordering::SeqCst), 1);
+
+    // A provider nobody offers fails the connection with the reason.
+    backend.connect(ConnectionProfile::new(DriverId::new("nope"), 1), None);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let failed = backend.drain().into_iter().find_map(|e| match e {
+            Event::ConnectFailed { error, .. } => Some(error),
+            _ => None,
+        });
+        if let Some(error) = failed {
+            assert_eq!(error.kind, ErrorKind::Provider);
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }

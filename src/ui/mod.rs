@@ -9,6 +9,7 @@ mod connection_form;
 mod devtools;
 mod editor;
 pub mod icons;
+mod providers;
 mod results;
 mod shortcuts;
 mod sidebar;
@@ -18,6 +19,7 @@ mod toasts;
 mod widgets;
 mod workspace;
 
+use std::path::PathBuf;
 use std::time::Instant;
 
 use egui::{Frame, Id, Panel, Stroke};
@@ -39,6 +41,8 @@ pub struct Services {
     pub backend: Backend,
     pub profiles: ProfileService,
     pub settings: JsonFile<Settings>,
+    /// Where providers are installed, to show in their dialog.
+    pub providers_dir: PathBuf,
 }
 
 pub struct VioletApp {
@@ -50,6 +54,8 @@ pub struct VioletApp {
     workspace: Workspace,
     toasts: Toasts,
     form: Option<ConnectionForm>,
+    providers: providers::Providers,
+    providers_dir: PathBuf,
     prompt: Option<PasswordPrompt>,
     confirm_delete: Option<ConnectionId>,
     /// Runs waiting for their tab's connection to open.
@@ -75,6 +81,8 @@ impl VioletApp {
             workspace: Workspace::default(),
             toasts: Toasts::default(),
             form: None,
+            providers: providers::Providers::default(),
+            providers_dir: services.providers_dir,
             prompt: None,
             confirm_delete: None,
             queued: Vec::new(),
@@ -85,7 +93,25 @@ impl VioletApp {
         for toast in startup_errors {
             app.toasts.push(ctx, toast);
         }
+        app.load_providers();
         app
+    }
+
+    fn load_providers(&mut self) {
+        if !matches!(self.providers.listing, providers::Listing::Loading) {
+            self.providers.listing = providers::Listing::Loading;
+            self.backend.load_providers();
+        }
+    }
+
+    /// Opens the connection form on the first database on offer.
+    fn new_connection(&mut self) -> bool {
+        let choices = self.providers.choices(self.backend.registry().infos());
+        let Some(choice) = choices.first() else {
+            return false;
+        };
+        self.form = Some(ConnectionForm::create(&choice.info));
+        true
     }
 
     fn save_settings(&mut self, ctx: &egui::Context) {
@@ -291,6 +317,69 @@ impl VioletApp {
                         Err(error) => Count::Failed(error.message),
                     });
                 }
+            }
+            Event::Providers(result) => {
+                match result {
+                    Ok(listings) => self.providers.listing = providers::Listing::Ready(listings),
+                    Err(error) => {
+                        if self.providers.awaiting_new_connection {
+                            self.toasts.push(
+                                ctx,
+                                Toast::error(
+                                    "Could not load the database providers",
+                                    error.message.clone(),
+                                ),
+                            );
+                        }
+                        self.providers.listing = providers::Listing::Failed(error.message);
+                    }
+                }
+                if std::mem::take(&mut self.providers.awaiting_new_connection) {
+                    self.new_connection();
+                }
+            }
+            Event::ProviderInstalling { id } => {
+                self.toasts.push(
+                    ctx,
+                    Toast::info(format!(
+                        "Downloading the {} provider…",
+                        self.providers.name(&id)
+                    )),
+                );
+                self.providers.busy.insert(id);
+            }
+            Event::ProviderInstalled { id, result } => {
+                self.providers.busy.remove(&id);
+                match result {
+                    Ok(info) => {
+                        self.providers.errors.remove(&id);
+                        self.toasts.push(
+                            ctx,
+                            Toast::success(format!("{} provider installed", info.name)),
+                        );
+                    }
+                    // Connections report it too; the dialog keeps it.
+                    Err(error) => {
+                        self.providers.errors.insert(id, error.message);
+                    }
+                }
+                self.load_providers();
+            }
+            Event::ProviderRemoved { id, result } => {
+                self.providers.busy.remove(&id);
+                match result {
+                    Ok(()) => {
+                        self.toasts.push(
+                            ctx,
+                            Toast::info(format!("{} provider removed", self.providers.name(&id))),
+                        );
+                        self.providers.errors.remove(&id);
+                    }
+                    Err(error) => {
+                        self.providers.errors.insert(id, error.message);
+                    }
+                }
+                self.load_providers();
             }
             Event::TestFinished { request, result } => {
                 if let Some(form) = &mut self.form
@@ -570,9 +659,29 @@ impl VioletApp {
     fn apply(&mut self, ctx: &egui::Context, action: Action) {
         match action {
             Action::NewConnection => {
-                if let Some(driver) = self.backend.registry().infos().first() {
-                    self.form = Some(ConnectionForm::create(driver));
+                if !self.new_connection() {
+                    // Nothing installed and no catalogue yet: open once it
+                    // arrives.
+                    self.providers.awaiting_new_connection = true;
+                    if !matches!(self.providers.listing, providers::Listing::Loading) {
+                        self.load_providers();
+                    }
                 }
+            }
+            Action::OpenProviders => {
+                self.providers.open = true;
+                self.load_providers();
+            }
+            Action::RefreshProviders => self.load_providers(),
+            Action::InstallProvider(id) => {
+                self.providers.errors.remove(&id);
+                self.providers.busy.insert(id.clone());
+                self.backend.install_provider(id);
+            }
+            Action::RemoveProvider(id) => {
+                self.providers.errors.remove(&id);
+                self.providers.busy.insert(id.clone());
+                self.backend.remove_provider(id);
             }
             Action::EditConnection(id) => {
                 if let Some(profile) = self.profiles.get(id).cloned() {
@@ -854,10 +963,15 @@ impl VioletApp {
 
     fn modals(&mut self, ctx: &egui::Context) {
         if let Some(form) = &mut self.form {
-            let drivers = self.backend.registry().infos();
+            let drivers = self.providers.choices(self.backend.registry().infos());
             if !connection_form::show(ctx, form, &drivers, &mut self.actions) {
                 self.form = None;
             }
+        }
+        if self.providers.open
+            && !providers::show(ctx, &self.providers, &self.providers_dir, &mut self.actions)
+        {
+            self.providers.open = false;
         }
         if let Some(prompt) = &mut self.prompt
             && !connection_form::show_prompt(ctx, prompt, &mut self.actions)

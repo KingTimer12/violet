@@ -1,6 +1,7 @@
 //! The ports a database driver implements.
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use crate::catalog::{ColumnInfo, DbObject, ServerInfo};
 use crate::error::Result;
@@ -8,7 +9,7 @@ use crate::profile::{ConnectionProfile, Credentials, DriverId};
 use crate::query::{ExecLimits, ResultSet};
 
 /// What a driver can do, so the interface hides what does not apply.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct Capabilities {
     /// The server hosts several databases (listed but opened separately).
@@ -22,15 +23,17 @@ pub struct Capabilities {
 }
 
 /// A driver's description.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DriverInfo {
     pub id: DriverId,
     /// Shown in the connection form, such as `PostgreSQL`.
-    pub name: &'static str,
+    pub name: String,
     pub default_port: u16,
-    pub default_database: &'static str,
-    pub default_user: &'static str,
+    pub default_database: String,
+    pub default_user: String,
     pub capabilities: Capabilities,
+    /// The SQL Violet generates for it.
+    pub dialect: SqlDialect,
 }
 
 /// Opens sessions to one kind of database.
@@ -154,6 +157,69 @@ pub trait Dialect: Send + Sync {
     }
 }
 
+/// How a dialect cuts a query into pages.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Paging {
+    /// `LIMIT n OFFSET m`: PostgreSQL, MySQL, SQLite...
+    #[default]
+    LimitOffset,
+    /// `OFFSET m ROWS FETCH NEXT n ROWS ONLY`: SQL Server, Oracle.
+    OffsetFetch,
+}
+
+/// A dialect described by data, as providers declare theirs: identifier
+/// quotes and a paging style.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SqlDialect {
+    pub quote_open: char,
+    /// Doubled inside a name to escape it.
+    pub quote_close: char,
+    pub paging: Paging,
+}
+
+impl SqlDialect {
+    /// Double quotes and `LIMIT`/`OFFSET`.
+    pub const ANSI: Self = Self {
+        quote_open: '"',
+        quote_close: '"',
+        paging: Paging::LimitOffset,
+    };
+}
+
+impl Default for SqlDialect {
+    fn default() -> Self {
+        Self::ANSI
+    }
+}
+
+impl Dialect for SqlDialect {
+    fn quote_ident(&self, ident: &str) -> String {
+        let close = self.quote_close.to_string();
+        format!(
+            "{}{}{close}",
+            self.quote_open,
+            ident.replace(&close, &close.repeat(2))
+        )
+    }
+
+    fn paged(&self, sql: &str, limit: u64, offset: u64) -> PagedSql {
+        const PREFIX: &str = "SELECT * FROM (\n";
+        let window = match self.paging {
+            Paging::LimitOffset => format!("LIMIT {limit} OFFSET {offset}"),
+            // These need an ORDER BY to page; ordering by a constant keeps
+            // the query's own order.
+            Paging::OffsetFetch => {
+                format!("ORDER BY (SELECT NULL) OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY")
+            }
+        };
+        PagedSql {
+            sql: format!("{PREFIX}{sql}\n) AS violet_page {window}"),
+            shift: PREFIX.chars().count() as u32,
+        }
+    }
+}
+
 /// Standard SQL quoting with double quotes.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AnsiDialect;
@@ -177,6 +243,27 @@ mod tests {
         assert_eq!(
             AnsiDialect.browse("public", "users", None, None),
             r#"SELECT * FROM "public"."users""#
+        );
+    }
+
+    #[test]
+    fn declared_dialects_quote_and_page_their_way() {
+        let brackets = SqlDialect {
+            quote_open: '[',
+            quote_close: ']',
+            paging: Paging::OffsetFetch,
+        };
+        assert_eq!(brackets.quote_ident("a]b"), "[a]]b]");
+        assert!(
+            brackets
+                .paged("SELECT 1", 10, 20)
+                .sql
+                .ends_with("OFFSET 20 ROWS FETCH NEXT 10 ROWS ONLY")
+        );
+        assert_eq!(SqlDialect::ANSI.quote_ident(r#"x"y"#), r#""x""y""#);
+        assert_eq!(
+            SqlDialect::ANSI.paged("SELECT 1", 1, 2),
+            AnsiDialect.paged("SELECT 1", 1, 2)
         );
     }
 

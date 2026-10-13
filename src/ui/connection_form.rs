@@ -7,6 +7,7 @@ use zeroize::Zeroize as _;
 
 use super::action::Action;
 use super::icons::Icon;
+use super::providers::{DriverChoice, format_size};
 use super::theme::{self, Palette};
 use super::widgets::{self, Tone};
 
@@ -40,9 +41,35 @@ impl Drop for ConnectionForm {
 impl ConnectionForm {
     pub fn create(driver: &DriverInfo) -> Self {
         let mut profile = ConnectionProfile::new(driver.id.clone(), driver.default_port);
-        profile.database = driver.default_database.to_owned();
-        profile.username = driver.default_user.to_owned();
+        profile.database.clone_from(&driver.default_database);
+        profile.username.clone_from(&driver.default_user);
         Self::with(profile, false, false)
+    }
+
+    /// Picks another driver, moving fields still at the old one's defaults
+    /// to the new one's.
+    fn switch_driver(&mut self, from: Option<&DriverInfo>, to: &DriverInfo) {
+        self.profile.driver = to.id.clone();
+        let untouched =
+            |value: &str, default: Option<&str>| value.trim().is_empty() || Some(value) == default;
+        if untouched(
+            &self.port,
+            from.map(|f| f.default_port.to_string()).as_deref(),
+        ) {
+            self.port = to.default_port.to_string();
+        }
+        if untouched(
+            &self.profile.database,
+            from.map(|f| f.default_database.as_str()),
+        ) {
+            self.profile.database.clone_from(&to.default_database);
+        }
+        if untouched(
+            &self.profile.username,
+            from.map(|f| f.default_user.as_str()),
+        ) {
+            self.profile.username.clone_from(&to.default_user);
+        }
     }
 
     pub fn edit(profile: ConnectionProfile, has_saved_password: bool) -> Self {
@@ -92,9 +119,12 @@ impl ConnectionForm {
 pub fn show(
     ctx: &egui::Context,
     form: &mut ConnectionForm,
-    drivers: &[DriverInfo],
+    drivers: &[DriverChoice],
     actions: &mut Vec<Action>,
 ) -> bool {
+    let chosen = drivers
+        .iter()
+        .find(|driver| driver.info.id == form.profile.driver);
     let palette = Palette::current(ctx);
     let mut open = true;
     let modal = egui::Modal::new(egui::Id::new("connection-form"))
@@ -128,10 +158,8 @@ pub fn show(
                             .font(theme::semibold(17.0))
                             .color(palette.text),
                     );
-                    let driver = drivers
-                        .iter()
-                        .find(|driver| driver.id == form.profile.driver)
-                        .map_or("Unknown driver", |driver| driver.name);
+                    let driver =
+                        chosen.map_or("Unknown driver", |driver| driver.info.name.as_str());
                     ui.label(RichText::new(driver).color(palette.secondary));
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
@@ -145,17 +173,25 @@ pub fn show(
             if drivers.len() > 1 && !form.editing {
                 ui.horizontal_wrapped(|ui| {
                     for driver in drivers {
-                        let selected = driver.id == form.profile.driver;
+                        let selected = driver.info.id == form.profile.driver;
                         let tone = if selected {
                             Tone::Primary
                         } else {
                             Tone::Secondary
                         };
-                        if widgets::button(ui, tone, Some(Icon::Database), driver.name).clicked()
-                            && !selected
-                        {
-                            form.profile.driver = driver.id.clone();
-                            form.port = driver.default_port.to_string();
+                        let icon = if driver.installed {
+                            Icon::Database
+                        } else {
+                            Icon::Download
+                        };
+                        let response = widgets::button(ui, tone, Some(icon), &driver.info.name);
+                        let response = if driver.installed {
+                            response
+                        } else {
+                            response.on_hover_text("Downloaded when you connect")
+                        };
+                        if response.clicked() && !selected {
+                            form.switch_driver(chosen.map(|c| &c.info), &driver.info);
                         }
                     }
                 });
@@ -215,10 +251,7 @@ pub fn show(
                 );
             });
 
-            let tls = drivers
-                .iter()
-                .find(|driver| driver.id == form.profile.driver)
-                .is_some_and(|driver| driver.capabilities.tls);
+            let tls = chosen.is_some_and(|driver| driver.info.capabilities.tls);
             ui.horizontal(|ui| {
                 if tls {
                     ui.vertical(|ui| {
@@ -262,13 +295,32 @@ pub fn show(
                 );
             }
 
+            if let Some(driver) = chosen.filter(|driver| !driver.installed && !driver.installing) {
+                notice(
+                    ui,
+                    &palette,
+                    Icon::Download,
+                    palette.accent,
+                    &format!(
+                        "The {} provider ({}) is downloaded the first time you connect. \
+                         It runs sandboxed and can only reach the server above.",
+                        driver.info.name,
+                        format_size(driver.size)
+                    ),
+                );
+            }
+
             // Test result or validation error.
             match &form.test {
                 TestState::Idle => {}
                 TestState::Running(_) => {
+                    let text = match chosen.filter(|driver| driver.installing) {
+                        Some(driver) => format!("Downloading the {} provider…", driver.info.name),
+                        None => "Testing connection…".to_owned(),
+                    };
                     ui.horizontal(|ui| {
                         ui.add(egui::Spinner::new().size(14.0).color(palette.accent));
-                        ui.label(RichText::new("Testing connection…").color(palette.secondary));
+                        ui.label(RichText::new(text).color(palette.secondary));
                     });
                 }
                 TestState::Passed(server) => notice(

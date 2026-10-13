@@ -23,6 +23,8 @@ pub enum ErrorKind {
     Unsupported,
     /// The keychain or the profiles file failed.
     Storage,
+    /// A database provider could not be downloaded, verified or run.
+    Provider,
     Other,
 }
 

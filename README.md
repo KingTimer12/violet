@@ -2,8 +2,9 @@
 
 A modern, fast database client in the spirit of DBeaver, built with
 [egui](https://github.com/emilk/egui) and [fastframe](https://fastframe.dev).
-PostgreSQL is the first driver; the architecture is built so that each new
-database is one new crate.
+Databases come as **providers**: WebAssembly components Violet downloads
+the first time a connection needs one, and runs in a sandbox. PostgreSQL is
+the first; anyone can write another with the [SDK](crates/violet-sdk).
 
 ## Architecture
 
@@ -11,33 +12,62 @@ database is one new crate.
 violet (bin)            composition root + egui interface (src/ui)
   │
   ├── violet-app        application layer: Backend (async runtime, sessions,
-  │                     commands → events), ProfileService, DriverRegistry
+  │                     commands → events, providers installed on demand),
+  │                     ProfileService, DriverRegistry
   │
   ├── violet-core       domain + ports. No I/O, no UI.
   │                     Driver / Session / Canceller / Dialect traits,
-  │                     ProfileRepository / SecretStore / ResultCache traits,
-  │                     ConnectionProfile, ResultSet, DbError, Secret
+  │                     ProfileRepository / SecretStore / ResultCache /
+  │                     ProviderStore traits, ConnectionProfile, ResultSet,
+  │                     DbError, Secret
   │
-  ├── violet-postgres   adapter: tokio-postgres + rustls (implements Driver)
+  ├── violet-providers  adapter: the provider catalogue, download, SHA-256
+  │                     verification and the providers folder (ProviderStore)
+  ├── violet-wasm       adapter: runs provider components on wasmtime, in a
+  │                     sandbox, as Drivers
   └── violet-storage    adapters: JSON profiles on disk, keychain secrets,
                         in-memory key-value result cache
+
+violet-sdk              what providers are built with: wit/provider.wit,
+                        Provider / Session traits, sockets, rows
+violet-provider-cli     `violet-provider`: inspect, install, package
+providers/postgres      the PostgreSQL provider (wasm32-wasip2)
 ```
 
-Dependencies point inward: drivers and storage depend on `violet-core`;
-`violet-app` depends only on `violet-core`; only `src/main.rs` names the
-concrete adapters. The interface never blocks on a database: it calls
+Dependencies point inward: adapters depend on `violet-core`; `violet-app`
+depends only on `violet-core`; only `src/main.rs` names the concrete
+adapters. The interface never blocks on a database: it calls
 `Backend` methods that return at once and drains `Event`s each frame.
 
 Inside the UI, views only read state and push `Action`s; `VioletApp::apply`
 is the single place that mutates state or talks to the backend.
 
+## Providers
+
+DBeaver bundles every driver it might need. Violet starts with none:
+
+1. The connection form lists the databases in the provider catalogue
+   (`providers.json`, by default from the latest GitHub release;
+   `VIOLET_PROVIDER_INDEX` points elsewhere, a URL or a local file).
+2. The first time a connection needs one, Violet downloads its component,
+   checks its SHA-256 against the catalogue, compiles it, asks it to
+   describe itself, and installs it into the `providers` folder (on macOS
+   `~/Library/Application Support/dev.violet.Violet/providers`). Later runs
+   use it straight away, offline included.
+3. The package button in the title bar lists providers, installs updates
+   and removes them.
+
+Each provider runs in its own sandbox, per connection: no files, no
+environment, no network except a socket to the host and port of the
+profile it serves, with TLS done by Violet. Even a hostile provider cannot
+send a password or rows anywhere else.
+
 ### Adding a database
 
-1. `cargo new --lib crates/violet-<db>` and depend on `violet-core`.
-2. Implement `Driver` (connect) and `Session` (catalog, execute, cancel).
-3. Register it in `src/main.rs`: `DriverRegistry::new().with(PostgresDriver).with(MyDriver)`.
-
-The connection form, tree, editor and grid work unchanged.
+Write a provider with [`violet-sdk`](crates/violet-sdk) (the guide walks
+through it), build it for `wasm32-wasip2`, and add it to the catalogue with
+`violet-provider package`. Violet itself does not change: the connection
+form, tree, editor and grid work as they are.
 
 ## Browsing data and the result cache
 
@@ -75,7 +105,16 @@ changed:
 - `Secret` redacts itself in `Debug`/`Display` and is zeroed on drop; form
   buffers are zeroed when dialogs close.
 - Profiles are written atomically with mode `0600`.
-- TLS (`Prefer`/`Require`) verifies the server against the web PKI roots.
+- Providers are sandboxed (see [Providers](#providers)): each connection
+  runs in its own WebAssembly instance, capped at 512 MiB, that can only
+  open a socket to that profile's server. Downloads must match the
+  catalogue's SHA-256; installed components are checked again on every
+  load, so a file changed on disk is refused. Catalogues are fetched over
+  HTTPS (plain HTTP only from this machine) and redirects cannot leave
+  HTTPS.
+- TLS (`Prefer`/`Require`) is done by Violet, not the provider, and verifies
+  the server against the web PKI roots. With `Require`, Violet sends at most
+  a 64-byte preamble in plain text, whatever the provider tries.
   `Prefer` only falls back to plain text on loopback hosts and Unix sockets;
   for any other host it is enforced as `Require`, so a network attacker
   cannot downgrade the connection and read the password.
@@ -86,13 +125,17 @@ changed:
   closes or the connection does.
 - The data filter must be one expression: a `;` or unbalanced bracket is
   refused before anything is sent.
-- `unsafe_code = "forbid"` across the workspace.
+- `unsafe_code = "forbid"` across the workspace (the SDK excepted: the
+  component bindings it generates are `unsafe` by nature).
 
 ## Usage
 
 ```sh
 cargo run --release
 ```
+
+To publish providers, run `scripts/package-providers.sh` and attach the
+files in `dist/` to a GitHub release.
 
 | Shortcut | Action |
 | --- | --- |
@@ -108,10 +151,15 @@ cargo run --release
 ## Development
 
 ```sh
+rustup target add wasm32-wasip2
+# Build the providers and a local catalogue, and run against it:
+scripts/package-providers.sh dist
+VIOLET_PROVIDER_INDEX=$PWD/dist/providers.json cargo run
+
 cargo test --workspace
-# Driver tests against a real server:
+# The PostgreSQL provider against a real server:
 docker run -d --rm -e POSTGRES_PASSWORD=violet -e POSTGRES_USER=violet -p 55499:5432 postgres:17-alpine
-VIOLET_TEST_PG=localhost:55499:violet:violet:violet cargo test -p violet-postgres
+VIOLET_TEST_PG=localhost:55499:violet:violet:violet cargo test -p violet-wasm
 # Debug builds can capture the window (see src/ui/devtools.rs):
 VIOLET_HOME=/tmp/v VIOLET_SNAPSHOT=/tmp/shot.png VIOLET_SCENE=welcome cargo run
 ```

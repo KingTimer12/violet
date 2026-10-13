@@ -1,8 +1,9 @@
 //! Violet: a modern database client.
 //!
-//! This is the composition root. It builds the concrete adapters (drivers,
-//! storage), hands them to the application layer, and starts the interface.
-//! Nothing else in the program names a concrete driver or store.
+//! This is the composition root. It builds the concrete adapters (the
+//! provider store, storage), hands them to the application layer, and
+//! starts the interface. Violet ships no database driver: each database is
+//! a WebAssembly provider installed on demand (`violet-providers`).
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -12,9 +13,9 @@ mod ui;
 
 use std::sync::Arc;
 
-use violet_app::{Backend, DriverRegistry, ProfileService};
-use violet_core::ports::{ProfileRepository, ResultCache, SecretStore};
-use violet_postgres::PostgresDriver;
+use violet_app::{Backend, ProfileService};
+use violet_core::ports::{ProfileRepository, ProviderStore, ResultCache, SecretStore};
+use violet_providers::{DEFAULT_INDEX, Providers, Source};
 use violet_storage::{
     AppDirs, JsonFile, JsonProfileRepository, KeyringSecretStore, MemoryResultCache,
 };
@@ -86,11 +87,29 @@ fn main() -> eframe::Result {
                 ));
             }
 
-            let registry = DriverRegistry::new().with(PostgresDriver);
+            // `VIOLET_PROVIDER_INDEX` points at another catalogue: a local
+            // `providers.json` while developing a provider, or a mirror.
+            let index = std::env::var("VIOLET_PROVIDER_INDEX")
+                .ok()
+                .and_then(|location| match Source::parse(&location) {
+                    Ok(source) => Some(source),
+                    Err(error) => {
+                        startup_errors.push(ui::toast_error(
+                            "VIOLET_PROVIDER_INDEX ignored",
+                            error.to_string(),
+                        ));
+                        None
+                    }
+                })
+                .map_or_else(|| Source::parse(DEFAULT_INDEX), Ok)?;
+            let wasm = violet_wasm::Runtime::new(Some(&dirs.code_cache_dir()))?;
+            let providers_dir = dirs.providers_dir();
+            let providers: Arc<dyn ProviderStore> =
+                Arc::new(Providers::new(providers_dir.clone(), wasm, index));
             let repaint = ctx.clone();
             // Read-only results are kept in memory only, never on disk.
             let cache: Arc<dyn ResultCache> = Arc::new(MemoryResultCache::default());
-            let backend = Backend::start(registry, secrets, cache, move || {
+            let backend = Backend::start(providers, secrets, cache, move || {
                 repaint.request_repaint();
             })?;
 
@@ -98,6 +117,7 @@ fn main() -> eframe::Result {
                 backend,
                 profiles,
                 settings: settings_file,
+                providers_dir,
             };
             Ok(Box::new(VioletApp::new(
                 &ctx,

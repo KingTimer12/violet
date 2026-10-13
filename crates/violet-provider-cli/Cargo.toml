@@ -1,0 +1,22 @@
+[package]
+name = "violet-provider-cli"
+description = "Tooling for Violet provider authors: inspect, package and install providers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "violet-provider"
+path = "src/main.rs"
+
+[dependencies]
+violet-core.workspace = true
+violet-providers.workspace = true
+violet-storage.workspace = true
+violet-wasm.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

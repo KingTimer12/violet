@@ -1,0 +1,22 @@
+[package]
+name = "violet-sdk"
+description = "Build database providers for Violet as WebAssembly components"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+wit-bindgen = "0.62"
+log.workspace = true
+
+# Not the workspace lints: the bindings `wit-bindgen` generates for the
+# component ABI are `unsafe` by nature, so `unsafe_code` cannot be
+# forbidden here. Everything written by hand stays safe.
+[lints.rust]
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+dbg_macro = "warn"

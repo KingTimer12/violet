@@ -7,11 +7,13 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use tokio::runtime::Runtime;
-use violet_core::ports::{CacheKey, CachedOutput, ResultCache, SecretStore};
+use violet_core::ports::{
+    CacheKey, CachedOutput, ProviderListing, ProviderStore, ResultCache, SecretStore,
+};
 use violet_core::{
-    Canceller, ColumnInfo, ConnectionId, ConnectionProfile, Credentials, DbError, DbObject,
-    ErrorKind, ExecLimits, OrderBy, Page, PageInfo, QueryOutput, Result, Secret, ServerInfo,
-    Session,
+    Canceller, ColumnInfo, ConnectionId, ConnectionProfile, Credentials, DbError, DbObject, Driver,
+    DriverId, DriverInfo, ErrorKind, ExecLimits, OrderBy, Page, PageInfo, QueryOutput, Result,
+    Secret, ServerInfo, Session,
 };
 
 use crate::registry::DriverRegistry;
@@ -105,6 +107,21 @@ pub enum Event {
         request: RequestId,
         result: Result<ServerInfo>,
     },
+    /// The provider catalogue, with what is installed.
+    Providers(Result<Vec<ProviderListing>>),
+    /// A connection needs a provider that is not installed; it is being
+    /// downloaded.
+    ProviderInstalling {
+        id: DriverId,
+    },
+    ProviderInstalled {
+        id: DriverId,
+        result: Result<DriverInfo>,
+    },
+    ProviderRemoved {
+        id: DriverId,
+        result: Result<()>,
+    },
 }
 
 type Sessions = HashMap<ConnectionId, Arc<dyn Session>>;
@@ -113,6 +130,7 @@ type Running = HashMap<RequestId, Arc<dyn Canceller>>;
 /// Shared between the backend handle and the tasks it spawns.
 struct Shared {
     registry: DriverRegistry,
+    providers: Arc<dyn ProviderStore>,
     secrets: Arc<dyn SecretStore>,
     cache: Arc<dyn ResultCache>,
     sessions: Mutex<Sessions>,
@@ -169,15 +187,32 @@ impl Shared {
         Ok(Credentials { password })
     }
 
+    /// The driver for `id`, installing its provider first if needed.
+    async fn driver(&self, id: &DriverId) -> Result<Arc<dyn Driver>> {
+        if let Some(driver) = self.registry.get(id) {
+            return Ok(driver);
+        }
+        self.emit(Event::ProviderInstalling { id: id.clone() });
+        let result = self.providers.install(id).await;
+        if let Ok(driver) = &result {
+            self.registry.add(Arc::clone(driver));
+        }
+        self.emit(Event::ProviderInstalled {
+            id: id.clone(),
+            result: result
+                .as_ref()
+                .map(|driver| driver.info())
+                .map_err(Clone::clone),
+        });
+        result
+    }
+
     async fn open(
         self: &Arc<Self>,
         profile: &ConnectionProfile,
         typed: Option<Secret>,
     ) -> Result<(Box<dyn Session>, ServerInfo)> {
-        let driver = self
-            .registry
-            .get(&profile.driver)
-            .ok_or_else(|| DbError::unsupported(format!("No driver for \"{}\"", profile.driver)))?;
+        let driver = self.driver(&profile.driver).await?;
         let credentials = self.credentials(profile, typed).await?;
         let session = driver.connect(profile, &credentials).await?;
         let server = session.server_info().await?;
@@ -298,10 +333,30 @@ pub struct Backend {
 }
 
 impl Backend {
-    /// Starts the runtime. `notify` is called from worker threads whenever
-    /// an event is queued.
+    /// Starts the runtime with the installed providers registered.
+    /// `notify` is called from worker threads whenever an event is queued.
     pub fn start(
+        providers: Arc<dyn ProviderStore>,
+        secrets: Arc<dyn SecretStore>,
+        cache: Arc<dyn ResultCache>,
+        notify: impl Notify,
+    ) -> std::io::Result<Self> {
+        let registry = DriverRegistry::new();
+        match providers.installed() {
+            Ok(drivers) => {
+                for driver in drivers {
+                    registry.add(driver);
+                }
+            }
+            Err(error) => log::error!("installed providers: {error}"),
+        }
+        Self::with_registry(registry, providers, secrets, cache, notify)
+    }
+
+    /// Starts the runtime with `registry` as it is, as tests do.
+    pub fn with_registry(
         registry: DriverRegistry,
+        providers: Arc<dyn ProviderStore>,
         secrets: Arc<dyn SecretStore>,
         cache: Arc<dyn ResultCache>,
         notify: impl Notify,
@@ -316,6 +371,7 @@ impl Backend {
             runtime,
             shared: Arc::new(Shared {
                 registry,
+                providers,
                 secrets,
                 cache,
                 sessions: Mutex::default(),
@@ -492,6 +548,40 @@ impl Backend {
             shared.emit(Event::Counted { request, result });
         });
         request
+    }
+
+    /// Fetches the provider catalogue.
+    pub fn load_providers(&self) {
+        let shared = Arc::clone(&self.shared);
+        self.runtime.spawn(async move {
+            let result = shared.providers.available().await;
+            shared.emit(Event::Providers(result));
+        });
+    }
+
+    /// Installs or updates a provider. Sessions already open keep the
+    /// version they started with.
+    pub fn install_provider(&self, id: DriverId) {
+        let shared = Arc::clone(&self.shared);
+        self.runtime.spawn(async move {
+            let result = shared.providers.install(&id).await;
+            if let Ok(driver) = &result {
+                shared.registry.add(Arc::clone(driver));
+            }
+            let result = result.map(|driver| driver.info());
+            shared.emit(Event::ProviderInstalled { id, result });
+        });
+    }
+
+    pub fn remove_provider(&self, id: DriverId) {
+        let shared = Arc::clone(&self.shared);
+        self.runtime.spawn(async move {
+            let result = shared.providers.remove(&id).await;
+            if result.is_ok() {
+                shared.registry.remove(&id);
+            }
+            shared.emit(Event::ProviderRemoved { id, result });
+        });
     }
 
     /// Asks the server to stop a running query. Its `QueryFinished` then

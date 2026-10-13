@@ -141,6 +141,42 @@ impl Rows {
         }
     }
 
+    /// A grid from one text and the end of each cell in it, as providers
+    /// send results: an end with bit 31 set is `NULL`.
+    ///
+    /// The parts come from outside the process, so they are checked:
+    /// `None` unless `ends` fills whole rows, never goes back or past the
+    /// text, and only ends cells between characters.
+    #[must_use]
+    pub fn from_text(width: usize, text: String, ends: &[u32]) -> Option<Self> {
+        const WIRE_NULL: u32 = 1 << 31;
+        if width == 0 {
+            return (ends.is_empty() && text.is_empty()).then(Self::default);
+        }
+        if !ends.len().is_multiple_of(width) {
+            return None;
+        }
+        let mut previous = 0;
+        let mut converted = Vec::with_capacity(ends.len());
+        for &end in ends {
+            let offset = (end & !WIRE_NULL) as usize;
+            if offset < previous || offset > text.len() || !text.is_char_boundary(offset) {
+                return None;
+            }
+            previous = offset;
+            converted.push(if end & WIRE_NULL == 0 {
+                offset
+            } else {
+                offset | NULL
+            });
+        }
+        (previous == text.len()).then_some(Self {
+            width,
+            text,
+            ends: converted,
+        })
+    }
+
     /// Appends `other`'s rows, as when the next page of a result arrives.
     /// Rows of another width are squared to this one's.
     pub fn append(&mut self, other: &Self) {
@@ -325,6 +361,26 @@ mod tests {
         let mut empty = Rows::default();
         empty.append(&next);
         assert_eq!((empty.width(), empty.len()), (2, 2));
+    }
+
+    #[test]
+    fn rows_from_text_are_checked() {
+        const N: u32 = 1 << 31;
+        let rows = Rows::from_text(2, "abé".into(), &[2, 2 | N, 4, 4 | N]).expect("valid");
+        assert_eq!(rows.get(0, 0), Some(Some("ab")));
+        assert_eq!(rows.get(0, 1), Some(None));
+        assert_eq!(rows.get(1, 0), Some(Some("é")));
+        assert_eq!(rows.len(), 2);
+
+        // Partial rows, offsets going back or past the end, a cell ending
+        // inside a character, and text no cell owns are all refused.
+        assert!(Rows::from_text(2, "ab".into(), &[2]).is_none());
+        assert!(Rows::from_text(2, "ab".into(), &[2, 1]).is_none());
+        assert!(Rows::from_text(1, "ab".into(), &[3]).is_none());
+        assert!(Rows::from_text(1, "é".into(), &[1]).is_none());
+        assert!(Rows::from_text(1, "ab".into(), &[1]).is_none());
+        assert!(Rows::from_text(0, String::new(), &[]).is_some());
+        assert!(Rows::from_text(0, "x".into(), &[]).is_none());
     }
 
     #[test]

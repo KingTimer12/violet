@@ -1,0 +1,265 @@
+/// The contract between Violet and a database provider.
+///
+/// A provider is a WebAssembly component that exports `provider` and may
+/// import only what is listed in the `provider` world below. It has no
+/// file system, no environment and no sockets of its own: the one network
+/// connection it can open goes to the host and port of the profile it was
+/// asked to connect to, through `network`.
+package violet:provider@0.1.0;
+
+/// Shapes shared by Violet and providers.
+interface types {
+    /// Transport encryption.
+    enum ssl-mode {
+        /// Plain text.
+        disable,
+        /// TLS when the server offers it, plain text otherwise. Violet
+        /// only passes this for loopback hosts and sockets; for any other
+        /// host it is already turned into `require`.
+        prefer,
+        /// TLS or fail.
+        require,
+    }
+
+    /// Everything needed to open a connection.
+    record connect-params {
+        host: string,
+        port: u16,
+        /// Empty for the server's default.
+        database: string,
+        username: string,
+        password: option<string>,
+        /// The mode to use; never `prefer` for a remote host.
+        ssl: ssl-mode,
+        /// Provider specific settings, as the profile stores them.
+        options: list<tuple<string, string>>,
+    }
+
+    enum error-kind {
+        /// The server could not be reached, or the connection dropped.
+        connection,
+        /// Wrong user or password.
+        authentication,
+        /// TLS could not be set up or the certificate was rejected.
+        tls,
+        /// The server rejected a statement.
+        query,
+        /// The user cancelled the statement.
+        cancelled,
+        /// The provider does not support what was asked.
+        unsupported,
+        other,
+    }
+
+    record db-error {
+        kind: error-kind,
+        message: string,
+        /// The SQLSTATE or the database's own code.
+        code: option<string>,
+        detail: option<string>,
+        hint: option<string>,
+        /// 1-based character offset into the statement.
+        position: option<u32>,
+    }
+
+    /// What a provider can do, so the interface hides what does not apply.
+    record capabilities {
+        /// The server hosts several databases.
+        databases: bool,
+        /// Objects are grouped in schemas.
+        schemas: bool,
+        /// Running statements can be cancelled (see `cancel-ticket`).
+        cancel: bool,
+        /// The connection form shows TLS settings.
+        tls: bool,
+    }
+
+    /// How a query is cut into pages.
+    enum paging {
+        /// `LIMIT n OFFSET m`: PostgreSQL, MySQL, SQLite...
+        limit-offset,
+        /// `OFFSET m ROWS FETCH NEXT n ROWS ONLY`: SQL Server, Oracle.
+        offset-fetch,
+    }
+
+    /// The SQL Violet generates for data views.
+    record dialect {
+        /// Opening and closing identifier quotes: `"` and `"`, or `` ` ``,
+        /// or `[` and `]`. A closing quote inside a name is doubled.
+        quote-open: char,
+        quote-close: char,
+        paging: paging,
+    }
+
+    record provider-info {
+        /// Stable id profiles name the provider by, such as `postgres`:
+        /// lowercase letters, digits and `-`.
+        id: string,
+        /// Shown in the interface, such as `PostgreSQL`.
+        name: string,
+        /// The provider's own version. `export_provider!` fills it from
+        /// the crate's when left empty.
+        version: string,
+        /// One line on what it connects to.
+        description: string,
+        default-port: u16,
+        default-database: string,
+        default-user: string,
+        capabilities: capabilities,
+        dialect: dialect,
+    }
+
+    record server-info {
+        /// Product and version, such as `PostgreSQL 17.2`.
+        version: string,
+        database: string,
+        user: string,
+    }
+
+    enum object-kind {
+        table,
+        view,
+        materialized-view,
+        foreign-table,
+        function,
+        sequence,
+    }
+
+    record db-object {
+        name: string,
+        kind: object-kind,
+        comment: option<string>,
+        /// Estimated rows for relations, when the server keeps statistics.
+        estimated-rows: option<s64>,
+    }
+
+    record column-info {
+        name: string,
+        data-type: string,
+        nullable: bool,
+        default: option<string>,
+        primary-key: bool,
+        comment: option<string>,
+    }
+
+    record column-meta {
+        name: string,
+        /// The database's name for the type (`int4`, `text`...).
+        type-name: option<string>,
+        /// Numbers are right aligned in the grid.
+        numeric: bool,
+    }
+
+    /// Cells row-major, as one text and the end of each cell in it.
+    ///
+    /// `ends` has rows × columns entries. Cell `i` is
+    /// `text[ends[i - 1] .. ends[i]]` (from 0 for the first); an end with
+    /// bit 31 set is SQL `NULL`, its low bits still giving the offset.
+    record rows {
+        text: string,
+        ends: list<u32>,
+    }
+
+    record result-set {
+        /// Empty for a command that returns no rows.
+        columns: list<column-meta>,
+        rows: rows,
+        /// Rows a command inserted, updated or deleted, or a query
+        /// returned.
+        affected: option<u64>,
+        /// The command tag, such as `SELECT` or `CREATE TABLE`.
+        command: option<string>,
+        /// More rows existed than `max-rows` allowed.
+        truncated: bool,
+    }
+}
+
+/// The one network connection a provider may open.
+interface network {
+    use types.{db-error};
+
+    /// A byte stream to the database server.
+    resource socket {
+        /// Reads up to `max` bytes, waiting for at least one. Empty at the
+        /// end of the stream.
+        read: func(max: u32) -> result<list<u8>, db-error>;
+        /// Writes all of `bytes`.
+        write: func(bytes: list<u8>) -> result<_, db-error>;
+        /// Upgrades the socket to TLS. The server certificate is verified
+        /// against the web PKI roots for the profile's host name.
+        ///
+        /// When the profile requires TLS, the host refuses to send more
+        /// than a short preamble (such as PostgreSQL's `SSLRequest` or
+        /// MySQL's SSL packet) before this is called.
+        start-tls: func() -> result<_, db-error>;
+        is-tls: func() -> bool;
+    }
+
+    /// Opens a TCP connection to the profile's host and port.
+    connect: func() -> result<socket, db-error>;
+
+    /// When the profile's host is a socket directory (an absolute path),
+    /// opens the socket file `name` inside it, such as `.s.PGSQL.5432`.
+    connect-local: func(name: string) -> result<socket, db-error>;
+}
+
+/// Messages for Violet's log.
+interface logging {
+    enum level {
+        error,
+        warn,
+        info,
+        debug,
+    }
+
+    log: func(level: level, message: string);
+}
+
+/// What a provider exports.
+interface provider {
+    use types.{
+        provider-info, connect-params, db-error, server-info, db-object,
+        column-info, result-set,
+    };
+
+    /// Describes the provider. Called without a connection: `network`
+    /// refuses to connect here.
+    info: func() -> provider-info;
+
+    /// An open connection. Each session runs in its own instance, so one
+    /// call at a time reaches it.
+    resource session {
+        server-info: func() -> result<server-info, db-error>;
+        /// Other databases on the same server, when the provider lists
+        /// them.
+        databases: func() -> result<list<string>, db-error>;
+        schemas: func() -> result<list<string>, db-error>;
+        objects: func(schema: string) -> result<list<db-object>, db-error>;
+        columns: func(schema: string, relation: string) -> result<list<column-info>, db-error>;
+        /// Runs one or more statements; one set per statement. Keeps at
+        /// most `max-rows` rows of each, setting `truncated` when more
+        /// existed.
+        execute: func(sql: string, max-rows: u32) -> result<list<result-set>, db-error>;
+        /// A value that changes whenever data or schema may have changed,
+        /// so cached results can be checked cheaply. `none` when the
+        /// database offers no such signal.
+        change-token: func() -> result<option<string>, db-error>;
+        /// What `cancel` needs to stop the statement this session runs.
+        /// Asked once, after connecting; `none` when it cannot be done.
+        cancel-ticket: func() -> option<list<u8>>;
+    }
+
+    /// Opens a session.
+    connect: func(params: connect-params) -> result<session, db-error>;
+
+    /// Stops the statement a session is running, from a separate instance
+    /// while that session's is busy. `params` is the session's, without
+    /// the password.
+    cancel: func(params: connect-params, ticket: list<u8>) -> result<_, db-error>;
+}
+
+world provider-world {
+    import network;
+    import logging;
+    export provider;
+}

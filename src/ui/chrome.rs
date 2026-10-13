@@ -80,6 +80,9 @@ pub fn title_bar(
                     sql: String::new(),
                 });
             }
+            if widgets::icon_button(ui, Icon::Package, "Database providers").clicked() {
+                actions.push(Action::OpenProviders);
+            }
             let (icon, next, tip) = match theme_preference {
                 egui::ThemePreference::System => {
                     (Icon::Monitor, egui::ThemePreference::Light, "Theme: system")

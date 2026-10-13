@@ -9,8 +9,8 @@
 //! a table and its data), `error` (run a broken statement), `form` (the
 //! connection dialog), `data` (a table's data tab, filtered and sorted),
 //! `menu` (the data tab with a connection's context menu open), `page`
-//! (a data tab after fetching the next page and counting). Add
-//! `VIOLET_THEME=light` for the light theme.
+//! (a data tab after fetching the next page and counting), `providers`
+//! (the providers dialog). Add `VIOLET_THEME=light` for the light theme.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -108,6 +108,14 @@ impl VioletApp {
                 self.actions.push(Action::NewConnection);
                 snapshot.step += 1;
                 false
+            }
+            ("providers", 0) => {
+                self.actions.push(Action::OpenProviders);
+                snapshot.step += 1;
+                false
+            }
+            ("providers", _) => {
+                settle && matches!(self.providers.listing, super::providers::Listing::Ready(_))
             }
             ("browse" | "error" | "data" | "menu" | "page", 0) => {
                 if let Some(id) = first {

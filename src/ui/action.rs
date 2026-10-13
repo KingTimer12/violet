@@ -1,7 +1,7 @@
 //! What views ask the app to do. Views only read state and return actions;
 //! the app applies them in one place, after drawing.
 
-use violet_core::{ConnectionId, ConnectionProfile, Secret};
+use violet_core::{ConnectionId, ConnectionProfile, DriverId, Secret};
 
 use super::workspace::TabId;
 
@@ -63,6 +63,12 @@ pub enum Action {
     SelectTab(TabId),
     SetTabConnection(TabId, Option<ConnectionId>),
     SetTheme(egui::ThemePreference),
+    OpenProviders,
+    /// Fetches the provider catalogue again.
+    RefreshProviders,
+    /// Installs or updates a provider.
+    InstallProvider(DriverId),
+    RemoveProvider(DriverId),
     ToggleSidebar,
     Copy(String),
 }

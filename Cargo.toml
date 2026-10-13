@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = [".", "crates/*"]
+# Providers build on their own, for wasm32-wasip2.
+exclude = ["providers"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,8 +13,10 @@ license = "MIT"
 [workspace.dependencies]
 violet-core = { path = "crates/violet-core" }
 violet-app = { path = "crates/violet-app" }
-violet-postgres = { path = "crates/violet-postgres" }
+violet-providers = { path = "crates/violet-providers" }
+violet-sdk = { path = "crates/violet-sdk" }
 violet-storage = { path = "crates/violet-storage" }
+violet-wasm = { path = "crates/violet-wasm" }
 
 async-trait = "0.1"
 directories = "6"
@@ -45,7 +49,8 @@ license.workspace = true
 [dependencies]
 violet-core.workspace = true
 violet-app.workspace = true
-violet-postgres.workspace = true
+violet-providers.workspace = true
+violet-wasm.workspace = true
 violet-storage.workspace = true
 log.workspace = true
 serde.workspace = true
@@ -67,7 +72,7 @@ fastframe-macos = { git = "https://github.com/crmne/fastframe", tag = "v0.2.3" }
 workspace = true
 
 [profile.release]
-# Whole-program LTO lets LLVM inline across crates (egui, tokio-postgres,
+# Whole-program LTO lets LLVM inline across crates (egui, wasmtime,
 # the domain crates); one codegen unit gives it the whole picture.
 lto = "fat"
 codegen-units = 1

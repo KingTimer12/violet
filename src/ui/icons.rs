@@ -30,6 +30,8 @@ fastframe_icons::icons! {
         ArrowDown => "arrow-down",
         Funnel => "funnel",
         ChevronsDown => "chevrons-down",
+        Package => "package",
+        Download => "download",
         View => lucide "eye",
         Check => lucide "check",
         CircleAlert => lucide "circle-alert",

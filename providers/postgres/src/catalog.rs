@@ -1,5 +1,5 @@
-//! Catalog queries. Every value from the user travels as a bind parameter,
-//! never spliced into the SQL.
+//! Catalog queries. Every value from the user travels as a bind parameter
+//! (extended protocol), never spliced into the SQL.
 
 pub(crate) const SERVER_INFO: &str = "SELECT current_setting('server_version'), \
      current_database()::text, current_user::text";
@@ -49,7 +49,7 @@ pub(crate) const COLUMNS: &str = "SELECT a.attname::text, \
 /// - the transaction ids of `pg_class` rows, which DDL, `TRUNCATE` and
 ///   `ALTER` rewrite;
 /// - the number of relations, for `CREATE` and `DROP`.
-pub const CHANGE_TOKEN: &str = "SELECT concat_ws('/', \
+pub(crate) const CHANGE_TOKEN: &str = "SELECT concat_ws('/', \
      (SELECT coalesce(sum(n_tup_ins + n_tup_upd + n_tup_del), 0) \
       FROM pg_catalog.pg_stat_all_tables), \
      (SELECT coalesce(sum(xmin::text::bigint), 0) FROM pg_catalog.pg_class), \
