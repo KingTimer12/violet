@@ -40,7 +40,7 @@ fn highlight(text: &str, palette: &Palette, error_at: Option<usize>) -> LayoutJo
     let syntax = palette.syntax;
     let font = theme::mono(FONT_SIZE);
     let mut job = LayoutJob::default();
-    for token in sql::tokenize(text) {
+    for token in sql::tokens(text) {
         let color = match token.kind {
             TokenKind::Keyword => syntax.keyword,
             TokenKind::Type => syntax.kind,

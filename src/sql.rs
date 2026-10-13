@@ -193,20 +193,53 @@ const TYPES: &[&str] = &[
     "XML",
 ];
 
-fn is_word(word: &str, list: &[&str]) -> bool {
-    word.len() <= 20 && {
-        let upper = word.to_ascii_uppercase();
-        list.binary_search(&upper.as_str()).is_ok()
+/// The longest word in [`KEYWORDS`] and [`TYPES`] fits this buffer.
+const LONGEST_WORD: usize = 20;
+
+/// Keyword, type or plain identifier. Upper-cases into a stack buffer, so
+/// the lexer allocates nothing per word.
+fn word_kind(word: &str) -> TokenKind {
+    let mut buffer = [0u8; LONGEST_WORD];
+    let Some(upper) = buffer.get_mut(..word.len()) else {
+        return TokenKind::Identifier;
+    };
+    upper.copy_from_slice(word.as_bytes());
+    upper.make_ascii_uppercase();
+    // The lists are ASCII, so a word that is not cannot be in them.
+    let Ok(upper) = std::str::from_utf8(upper) else {
+        return TokenKind::Identifier;
+    };
+    if KEYWORDS.binary_search(&upper).is_ok() {
+        TokenKind::Keyword
+    } else if TYPES.binary_search(&upper).is_ok() {
+        TokenKind::Type
+    } else {
+        TokenKind::Identifier
     }
 }
 
-/// Splits `source` into tokens that cover it end to end.
+/// Lazily splits `source` into tokens that cover it end to end, without
+/// collecting them.
 #[must_use]
-pub fn tokenize(source: &str) -> Vec<Token> {
-    let bytes = source.as_bytes();
-    let mut tokens = Vec::new();
-    let mut at = 0;
-    while at < bytes.len() {
+pub fn tokens(source: &str) -> Tokens<'_> {
+    Tokens { source, at: 0 }
+}
+
+pub struct Tokens<'a> {
+    source: &'a str,
+    at: usize,
+}
+
+impl Iterator for Tokens<'_> {
+    type Item = Token;
+
+    fn next(&mut self) -> Option<Token> {
+        let source = self.source;
+        let bytes = source.as_bytes();
+        let mut at = self.at;
+        if at >= bytes.len() {
+            return None;
+        }
         let start = at;
         let byte = bytes[at];
         let next = bytes.get(at + 1).copied();
@@ -258,14 +291,7 @@ pub fn tokenize(source: &str) -> Vec<Token> {
                     at = quoted_end(bytes, at, b'\'');
                     TokenKind::String
                 } else {
-                    let word = &source[start..at];
-                    if is_word(word, KEYWORDS) {
-                        TokenKind::Keyword
-                    } else if is_word(word, TYPES) {
-                        TokenKind::Type
-                    } else {
-                        TokenKind::Identifier
-                    }
+                    word_kind(&source[start..at])
                 }
             }
             b'(' | b')' | b',' | b';' | b'.' | b'[' | b']' => {
@@ -278,13 +304,12 @@ pub fn tokenize(source: &str) -> Vec<Token> {
             }
         };
         let end = at.min(bytes.len()).max(start + 1);
-        at = end;
-        tokens.push(Token {
+        self.at = end;
+        Some(Token {
             kind,
             range: start..end,
-        });
+        })
     }
-    tokens
 }
 
 fn utf8_len(first: u8) -> usize {
@@ -385,29 +410,31 @@ fn number_end(bytes: &[u8], at: usize) -> usize {
 pub fn statements(source: &str) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
     let mut start = 0;
-    for token in tokenize(source) {
-        if token.kind == TokenKind::Punctuation && &source[token.range.clone()] == ";" {
-            push_trimmed(source, start..token.range.end, &mut ranges);
+    // A run of only comments is no statement.
+    let mut meaningful = false;
+    for token in tokens(source) {
+        let semicolon = token.kind == TokenKind::Punctuation && &source[token.range.clone()] == ";";
+        if semicolon {
+            if meaningful {
+                push_trimmed(source, start..token.range.end, &mut ranges);
+            }
             start = token.range.end;
+            meaningful = false;
+        } else if !matches!(token.kind, TokenKind::Whitespace | TokenKind::Comment) {
+            meaningful = true;
         }
     }
-    push_trimmed(source, start..source.len(), &mut ranges);
+    if meaningful {
+        push_trimmed(source, start..source.len(), &mut ranges);
+    }
     ranges
 }
 
 fn push_trimmed(source: &str, range: Range<usize>, ranges: &mut Vec<Range<usize>>) {
     let text = &source[range.clone()];
     let leading = text.len() - text.trim_start().len();
-    let trimmed = text.trim();
-    // A run of only comments is no statement.
-    let meaningful = tokenize(trimmed).iter().any(|t| {
-        !matches!(t.kind, TokenKind::Whitespace | TokenKind::Comment)
-            && &trimmed[t.range.clone()] != ";"
-    });
-    if meaningful {
-        let start = range.start + leading;
-        ranges.push(start..start + trimmed.len());
-    }
+    let start = range.start + leading;
+    ranges.push(start..start + text.trim().len());
 }
 
 /// The statement the cursor (a byte offset) is in or just after, as DBeaver
@@ -444,8 +471,7 @@ mod tests {
     use super::*;
 
     fn kinds(source: &str) -> Vec<(TokenKind, &str)> {
-        tokenize(source)
-            .into_iter()
+        tokens(source)
             .filter(|t| t.kind != TokenKind::Whitespace)
             .map(|t| (t.kind, &source[t.range]))
             .collect()
@@ -455,14 +481,19 @@ mod tests {
     fn keyword_lists_are_sorted_for_binary_search() {
         assert!(KEYWORDS.windows(2).all(|w| w[0] < w[1]));
         assert!(TYPES.windows(2).all(|w| w[0] < w[1]));
+        assert!(
+            KEYWORDS
+                .iter()
+                .chain(TYPES)
+                .all(|w| w.len() <= LONGEST_WORD && w.is_ascii())
+        );
     }
 
     #[test]
     fn tokens_cover_the_source() {
         let source = "SELECT 'a''b', \"Q\"\"x\", 1.5e3, $1 -- hi\n/* a /* b */ c */ FROM t;é";
-        let tokens = tokenize(source);
         let mut at = 0;
-        for token in &tokens {
+        for token in tokens(source) {
             assert_eq!(token.range.start, at);
             at = token.range.end;
         }
@@ -488,6 +519,13 @@ mod tests {
                 (TokenKind::Comment, "-- c"),
             ]
         );
+        // Longer than any keyword, or not ASCII: plain identifiers.
+        assert_eq!(
+            word_kind("a_very_long_identifier_name"),
+            TokenKind::Identifier
+        );
+        assert_eq!(word_kind("sélect"), TokenKind::Identifier);
+        assert_eq!(word_kind("TimestampTZ"), TokenKind::Type);
     }
 
     #[test]
