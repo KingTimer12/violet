@@ -1,6 +1,7 @@
 //! What the interface remembers about connections and their catalogs.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use violet_core::{ColumnInfo, ConnectionId, DbObject, ObjectKind, ServerInfo};
 
@@ -19,9 +20,9 @@ impl<T> Loadable<T> {
         matches!(self, Self::Loading)
     }
 
-    pub fn from_result(result: violet_core::Result<T>) -> Self {
+    pub fn from_result<U: Into<T>>(result: violet_core::Result<U>) -> Self {
         match result {
-            Ok(value) => Self::Ready(value),
+            Ok(value) => Self::Ready(value.into()),
             Err(error) => Self::Failed(error.to_string()),
         }
     }
@@ -52,13 +53,20 @@ pub enum NodeKey {
     Object(ConnectionId, String, String),
 }
 
+/// A relation: connection, schema and name.
+pub type RelationKey = (ConnectionId, String, String);
+
 /// Catalogs fetched so far, and the tree's expansion.
+///
+/// Lists are shared slices: the tree takes a handle each frame while it
+/// mutates expansion, and cloning an `Arc` is a counter bump where cloning
+/// a schema's thousand objects would be a thousand allocations.
 #[derive(Default)]
 pub struct Explorer {
     pub links: HashMap<ConnectionId, Link>,
-    pub schemas: HashMap<ConnectionId, Loadable<Vec<String>>>,
-    pub objects: HashMap<(ConnectionId, String), Loadable<Vec<DbObject>>>,
-    pub columns: HashMap<(ConnectionId, String, String), Loadable<Vec<ColumnInfo>>>,
+    pub schemas: HashMap<ConnectionId, Loadable<Arc<[String]>>>,
+    pub objects: HashMap<(ConnectionId, String), Loadable<Arc<[DbObject]>>>,
+    pub columns: HashMap<RelationKey, Loadable<Arc<[ColumnInfo]>>>,
     pub expanded: HashSet<NodeKey>,
     pub selected: Option<NodeKey>,
     pub filter: String,

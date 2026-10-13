@@ -309,7 +309,7 @@ fn connection(
         Loadable::Idle | Loadable::Loading => loading_row(ui, 1),
         Loadable::Failed(error) => error_row(ui, 1, &error),
         Loadable::Ready(schemas) => {
-            for schema in &schemas {
+            for schema in schemas.iter() {
                 schema_node(ui, id, schema, explorer, actions);
             }
         }
@@ -337,7 +337,7 @@ fn schema_node(
         && let Loadable::Ready(objects) = &objects
         && !objects
             .iter()
-            .any(|object| object.name.to_lowercase().contains(&filter))
+            .any(|object| matches_filter(&object.name, &filter))
     {
         return;
     }
@@ -374,14 +374,18 @@ fn schema_node(
         Loadable::Idle | Loadable::Loading => loading_row(ui, 2),
         Loadable::Failed(error) => error_row(ui, 2, &error),
         Loadable::Ready(objects) => {
-            for kind in ObjectKind::ALL {
-                let members: Vec<&DbObject> = objects
-                    .iter()
-                    .filter(|object| object.kind == kind)
-                    .filter(|object| {
-                        filter.is_empty() || object.name.to_lowercase().contains(&filter)
-                    })
-                    .collect();
+            // One pass sorts the objects into their groups.
+            let mut groups: [Vec<&DbObject>; ObjectKind::ALL.len()] = Default::default();
+            for object in objects.iter() {
+                if filter.is_empty() || matches_filter(&object.name, &filter) {
+                    let group = ObjectKind::ALL
+                        .iter()
+                        .position(|kind| *kind == object.kind)
+                        .unwrap_or_default();
+                    groups[group].push(object);
+                }
+            }
+            for (kind, members) in ObjectKind::ALL.into_iter().zip(&groups) {
                 if members.is_empty() {
                     continue;
                 }
@@ -390,7 +394,7 @@ fn schema_node(
                     id,
                     schema,
                     kind,
-                    &members,
+                    members,
                     explorer,
                     actions,
                     !filter.is_empty(),
@@ -438,12 +442,15 @@ fn object_node(
     let key = NodeKey::Object(id, object.schema.clone(), object.name.clone());
     let relation = object.kind.is_relation();
     let expanded = relation && explorer.is_expanded(&key);
-    let columns_key = (id, object.schema.clone(), object.name.clone());
-    let columns = explorer
-        .columns
-        .get(&columns_key)
-        .cloned()
-        .unwrap_or_default();
+    let columns = if relation {
+        explorer
+            .columns
+            .get(&(id, object.schema.clone(), object.name.clone()))
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        Loadable::Idle
+    };
     let detail = object
         .estimated_rows
         .filter(|_| relation)
@@ -519,7 +526,7 @@ fn object_node(
         Loadable::Idle | Loadable::Loading => loading_row(ui, 4),
         Loadable::Failed(error) => error_row(ui, 4, &error),
         Loadable::Ready(columns) => {
-            for column in &columns {
+            for column in columns.iter() {
                 let palette = Palette::current(ui.ctx());
                 let icon = if column.primary_key {
                     Icon::Key
@@ -531,17 +538,20 @@ fn object_node(
                 if column.primary_key {
                     row.icon_tint = Some(palette.warning);
                 }
-                let mut tip = format!("{} {}", column.name, column.data_type);
-                if !column.nullable {
-                    tip.push_str(" NOT NULL");
-                }
-                if let Some(default) = &column.default {
-                    tip.push_str(&format!("\nDEFAULT {default}"));
-                }
-                if let Some(comment) = &column.comment {
-                    tip.push_str(&format!("\n\n{comment}"));
-                }
-                let response = row.show(ui).on_hover_text(tip);
+                // The tooltip text is built only while it shows.
+                let response = row.show(ui).on_hover_ui(|ui| {
+                    let mut tip = format!("{} {}", column.name, column.data_type);
+                    if !column.nullable {
+                        tip.push_str(" NOT NULL");
+                    }
+                    if let Some(default) = &column.default {
+                        tip.push_str(&format!("\nDEFAULT {default}"));
+                    }
+                    if let Some(comment) = &column.comment {
+                        tip.push_str(&format!("\n\n{comment}"));
+                    }
+                    ui.label(tip);
+                });
                 response.context_menu(|ui| {
                     if menu_item(ui, Icon::Copy, "Copy name") {
                         actions.push(Action::Copy(column.name.clone()));
@@ -575,6 +585,21 @@ pub fn menu_item(ui: &mut Ui, icon: Icon, label: &str) -> bool {
             .min_size(Vec2::new(ui.available_width(), 26.0)),
     )
     .clicked()
+}
+
+/// Whether `name` contains `filter` (already lower case), ignoring case.
+/// ASCII filters, the usual kind, compare in place without allocating.
+fn matches_filter(name: &str, filter: &str) -> bool {
+    if filter.is_ascii() {
+        let needle = filter.as_bytes();
+        needle.is_empty()
+            || name
+                .as_bytes()
+                .windows(needle.len())
+                .any(|window| window.eq_ignore_ascii_case(needle))
+    } else {
+        name.to_lowercase().contains(filter)
+    }
 }
 
 fn quote(ident: &str) -> String {
@@ -615,6 +640,14 @@ mod tests {
         assert_eq!(quote("my table"), "\"my table\"");
         assert_eq!(quote("1st"), "\"1st\"");
         assert_eq!(quote("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn filters_ignore_case() {
+        assert!(matches_filter("UserAccounts", "account"));
+        assert!(matches_filter("anything", ""));
+        assert!(!matches_filter("orders", "user"));
+        assert!(matches_filter("Ação", "açã"));
     }
 
     #[test]
