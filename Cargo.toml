@@ -1,0 +1,87 @@
+[workspace]
+resolver = "3"
+members = [".", "crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+
+[workspace.dependencies]
+violet-core = { path = "crates/violet-core" }
+violet-app = { path = "crates/violet-app" }
+violet-postgres = { path = "crates/violet-postgres" }
+violet-storage = { path = "crates/violet-storage" }
+
+async-trait = "0.1"
+directories = "6"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+zeroize = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+dbg_macro = "warn"
+
+[package]
+name = "violet"
+description = "A modern, multi-database client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+violet-core.workspace = true
+violet-app.workspace = true
+violet-postgres.workspace = true
+violet-storage.workspace = true
+log.workspace = true
+serde.workspace = true
+zeroize.workspace = true
+# Debug-only screenshots (src/ui/devtools.rs). Already in the tree via arboard.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+eframe = "0.36.1"
+egui = "0.36.1"
+egui_extras = { version = "0.36.1", features = ["svg"] }
+
+fastframe-text = { git = "https://github.com/crmne/fastframe", tag = "v0.2.3" }
+fastframe-fonts = { git = "https://github.com/crmne/fastframe", tag = "v0.2.3" }
+fastframe-icons = { git = "https://github.com/crmne/fastframe", tag = "v0.2.3" }
+fastframe-log = { git = "https://github.com/crmne/fastframe", tag = "v0.2.3" }
+fastframe-macos = { git = "https://github.com/crmne/fastframe", tag = "v0.2.3" }
+
+[lints]
+workspace = true
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# fastframe builds against forks of egui and winit with fixes not yet
+# released upstream. Patches only apply at the root, so they live here.
+[patch.crates-io]
+ecolor = { git = "https://github.com/crmne/egui", rev = "ba6790fe7cf46e58e8d27ce1524cbfdee745e938" }
+eframe = { git = "https://github.com/crmne/egui", rev = "ba6790fe7cf46e58e8d27ce1524cbfdee745e938" }
+egui = { git = "https://github.com/crmne/egui", rev = "ba6790fe7cf46e58e8d27ce1524cbfdee745e938" }
+egui-wgpu = { git = "https://github.com/crmne/egui", rev = "ba6790fe7cf46e58e8d27ce1524cbfdee745e938" }
+egui-winit = { git = "https://github.com/crmne/egui", rev = "ba6790fe7cf46e58e8d27ce1524cbfdee745e938" }
+egui_extras = { git = "https://github.com/crmne/egui", rev = "ba6790fe7cf46e58e8d27ce1524cbfdee745e938" }
+egui_glow = { git = "https://github.com/crmne/egui", rev = "ba6790fe7cf46e58e8d27ce1524cbfdee745e938" }
+emath = { git = "https://github.com/crmne/egui", rev = "ba6790fe7cf46e58e8d27ce1524cbfdee745e938" }
+epaint = { git = "https://github.com/crmne/egui", rev = "ba6790fe7cf46e58e8d27ce1524cbfdee745e938" }
+epaint_default_fonts = { git = "https://github.com/crmne/egui", rev = "ba6790fe7cf46e58e8d27ce1524cbfdee745e938" }
+winit = { git = "https://github.com/crmne/winit", rev = "ed7caa9023f10b397f5b6ec8284a840cbd8a6f65" }

@@ -1,0 +1,15 @@
+[package]
+name = "violet-app"
+description = "Application services for Violet: sessions, commands and events between UI and drivers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+violet-core.workspace = true
+log.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

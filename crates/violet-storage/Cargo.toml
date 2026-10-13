@@ -1,0 +1,21 @@
+[package]
+name = "violet-storage"
+description = "Persistence adapters for Violet: profiles on disk, secrets in the OS keychain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+violet-core.workspace = true
+directories.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
