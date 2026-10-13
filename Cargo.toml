@@ -67,9 +67,19 @@ fastframe-macos = { git = "https://github.com/crmne/fastframe", tag = "v0.2.3" }
 workspace = true
 
 [profile.release]
-lto = "thin"
+# Whole-program LTO lets LLVM inline across crates (egui, tokio-postgres,
+# the domain crates); one codegen unit gives it the whole picture.
+lto = "fat"
 codegen-units = 1
 strip = true
+# `panic = "abort"` is left out on purpose: database work runs on tokio
+# worker threads, and unwinding keeps a panicking driver task from taking
+# the window (and unsaved SQL) down with it.
+
+# Dependencies are built optimised even in debug, so the UI stays smooth
+# while iterating; Violet's own crates keep fast incremental builds.
+[profile.dev.package."*"]
+opt-level = 2
 
 # fastframe builds against forks of egui and winit with fixes not yet
 # released upstream. Patches only apply at the root, so they live here.
