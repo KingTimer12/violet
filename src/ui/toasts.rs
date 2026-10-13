@@ -79,7 +79,9 @@ impl Toasts {
         let now = ctx.input(|input| input.time);
         let palette = Palette::current(ctx);
         let mut dismissed = Vec::new();
-        let mut offset = 16.0 + 26.0;
+        // Above the status bar and a result's paging footer, whose buttons
+        // would otherwise sit under the newest notice.
+        let mut offset = 12.0 + 26.0 + 34.0;
         for shown in self.shown.iter().rev() {
             let age = now - shown.born;
             let hovered_id = Id::new(("toast-hover", shown.id));

@@ -38,6 +38,16 @@ is the single place that mutates state or talks to the backend.
 
 The connection form, tree, editor and grid work unchanged.
 
+## Browsing data
+
+Clicking a table or view in the tree opens its data tab, as in DBeaver
+(the chevron still lists its columns). Rows arrive 200 at a time; the
+footer fetches the next page, fetches everything up to the row cap, or
+counts the rows. Type a `WHERE` condition in the filter bar and press
+Enter; click a column header to sort by it (ascending, descending, off).
+Sorting and filtering run on the server. A single `SELECT` run from an
+editor is paged the same way.
+
 ## Security
 
 - Passwords live in the OS keychain (Keychain / Credential Manager /
@@ -53,6 +63,8 @@ The connection form, tree, editor and grid work unchanged.
 - Catalog queries use bind parameters; generated SQL quotes identifiers.
 - Result sets are capped (10 000 rows) so a stray `SELECT *` cannot exhaust
   memory; running queries can be cancelled server-side.
+- The data filter must be one expression: a `;` or unbalanced bracket is
+  refused before anything is sent.
 - `unsafe_code = "forbid"` across the workspace.
 
 ## Usage

@@ -10,7 +10,8 @@ use tokio::runtime::Runtime;
 use violet_core::ports::SecretStore;
 use violet_core::{
     Canceller, ColumnInfo, ConnectionId, ConnectionProfile, Credentials, DbError, DbObject,
-    ErrorKind, ExecLimits, QueryOutput, Result, Secret, ServerInfo, Session,
+    ErrorKind, ExecLimits, OrderBy, Page, PageInfo, QueryOutput, Result, Secret, ServerInfo,
+    Session,
 };
 
 use crate::registry::DriverRegistry;
@@ -25,6 +26,19 @@ impl<F: Fn() + Send + Sync + 'static> Notify for F {
     fn notify(&self) {
         self();
     }
+}
+
+/// How to run a query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecOptions {
+    /// Read only this window of the rows. The query must be a single
+    /// read-only statement.
+    pub page: Option<Page>,
+}
+
+impl ExecOptions {
+    /// Every row at once.
+    pub const WHOLE: Self = Self { page: None };
 }
 
 /// Identifies one query or connection test, to match its result and to
@@ -64,6 +78,10 @@ pub enum Event {
     QueryFinished {
         request: RequestId,
         result: Result<QueryOutput>,
+    },
+    Counted {
+        request: RequestId,
+        result: Result<u64>,
     },
     TestFinished {
         request: RequestId,
@@ -146,6 +164,70 @@ impl Shared {
         let server = session.server_info().await?;
         Ok((session, server))
     }
+
+    /// Runs `sql` on `id`'s session as `options` say.
+    async fn query(
+        &self,
+        request: RequestId,
+        id: ConnectionId,
+        sql: String,
+        options: ExecOptions,
+        limits: ExecLimits,
+    ) -> Result<QueryOutput> {
+        let session = self.session(id)?;
+        // A page may ask for more than the usual cap ("fetch all"); its own
+        // limit bounds it.
+        let limits = options.page.map_or(limits, |page| ExecLimits {
+            max_rows: limits
+                .max_rows
+                .max(usize::try_from(page.limit.saturating_add(1)).unwrap_or(usize::MAX)),
+        });
+        let (sent, shift) = match options.page {
+            Some(page) => {
+                // One row more than asked tells whether another page follows.
+                let paged =
+                    session
+                        .dialect()
+                        .paged(&sql, page.limit.saturating_add(1), page.offset);
+                (paged.sql, paged.shift)
+            }
+            None => (sql, 0),
+        };
+        if let Some(canceller) = session.canceller() {
+            self.running().insert(request, Arc::from(canceller));
+        }
+        let started = Instant::now();
+        let result = session.execute(&sent, limits).await;
+        self.running().remove(&request);
+        let mut sets = result.map_err(|mut error| {
+            // Point at the user's text, not the paging wrapper around it.
+            error.position = error
+                .position
+                .and_then(|at| at.checked_sub(shift))
+                .filter(|at| *at > 0);
+            error
+        })?;
+
+        let page = options.page.map(|page| {
+            let limit = usize::try_from(page.limit).unwrap_or(usize::MAX);
+            let has_more = sets.first().is_some_and(|set| set.rows.len() > limit);
+            if let Some(set) = sets.first_mut() {
+                set.rows.truncate(limit);
+                set.truncated = false;
+            }
+            PageInfo {
+                offset: page.offset,
+                limit: page.limit,
+                has_more,
+            }
+        });
+        let output = QueryOutput {
+            sets,
+            elapsed: started.elapsed(),
+            page,
+        };
+        Ok(output)
+    }
 }
 
 /// The interface's handle on everything that talks to databases.
@@ -202,20 +284,24 @@ impl Backend {
         self.shared.sessions().contains_key(&id)
     }
 
-    /// How a relation's rows are read, in the session's dialect.
+    /// How a data view reads a relation, in the session's dialect.
     #[must_use]
-    pub fn select_rows_sql(
+    pub fn browse_sql(
         &self,
         id: ConnectionId,
         schema: &str,
         relation: &str,
+        filter: Option<&str>,
+        order: Option<&OrderBy>,
     ) -> Option<String> {
         let session = self.shared.session(id).ok()?;
-        Some(
-            session
-                .dialect()
-                .select_rows(schema, relation, self.limits.max_rows.min(1_000)),
-        )
+        Some(session.dialect().browse(schema, relation, filter, order))
+    }
+
+    /// The most rows one result may hold.
+    #[must_use]
+    pub fn max_rows(&self) -> usize {
+        self.limits.max_rows
     }
 
     fn request(&self) -> RequestId {
@@ -307,27 +393,37 @@ impl Backend {
     }
 
     /// Runs `sql` on the open session for `id`.
-    pub fn execute(&self, id: ConnectionId, sql: String) -> RequestId {
+    pub fn execute(&self, id: ConnectionId, sql: String, options: ExecOptions) -> RequestId {
         let request = self.request();
         let shared = Arc::clone(&self.shared);
         let limits = self.limits;
         self.runtime.spawn(async move {
-            let result = match shared.session(id) {
-                Ok(session) => {
-                    if let Some(canceller) = session.canceller() {
-                        shared.running().insert(request, Arc::from(canceller));
-                    }
-                    let started = Instant::now();
-                    let sets = session.execute(&sql, limits).await;
-                    shared.running().remove(&request);
-                    sets.map(|sets| QueryOutput {
-                        sets,
-                        elapsed: started.elapsed(),
-                    })
-                }
-                Err(error) => Err(error),
-            };
+            let result = shared.query(request, id, sql, options, limits).await;
             shared.emit(Event::QueryFinished { request, result });
+        });
+        request
+    }
+
+    /// Counts the rows a single read-only statement returns.
+    pub fn count(&self, id: ConnectionId, sql: String) -> RequestId {
+        let request = self.request();
+        let shared = Arc::clone(&self.shared);
+        let limits = self.limits;
+        self.runtime.spawn(async move {
+            let result = async {
+                let count = shared.session(id)?.dialect().count(&sql);
+                let output = shared
+                    .query(request, id, count, ExecOptions::WHOLE, limits)
+                    .await?;
+                output
+                    .sets
+                    .first()
+                    .and_then(|set| set.rows.get(0, 0).flatten())
+                    .and_then(|count| count.parse().ok())
+                    .ok_or_else(|| DbError::new(ErrorKind::Other, "The count returned no number"))
+            }
+            .await;
+            shared.emit(Event::Counted { request, result });
         });
         request
     }

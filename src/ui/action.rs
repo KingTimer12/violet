@@ -12,6 +12,8 @@ pub enum RunScope {
     Statement,
     /// Every statement in the editor.
     Script,
+    /// A data tab's rows, read again from the first page.
+    Data,
 }
 
 #[derive(Debug)]
@@ -46,6 +48,16 @@ pub enum Action {
         relation: String,
     },
     Run(TabId, RunScope),
+    /// Reads the shown result again.
+    RefreshTab(TabId),
+    /// Applies a data tab's filter box.
+    ApplyFilter(TabId),
+    ClearFilter(TabId),
+    /// Sorts a data tab by a column, cycling the direction.
+    Sort(TabId, String),
+    FetchMore(TabId),
+    FetchAll(TabId),
+    CountRows(TabId),
     Cancel(TabId),
     CloseTab(TabId),
     SelectTab(TabId),

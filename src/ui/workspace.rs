@@ -3,8 +3,8 @@
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
-use violet_app::RequestId;
-use violet_core::{ConnectionId, DbError, QueryOutput};
+use violet_app::{ExecOptions, RequestId};
+use violet_core::{ConnectionId, DbError, OrderBy, QueryOutput};
 
 use super::editor::Highlighter;
 
@@ -24,6 +24,75 @@ pub struct Running {
     pub started: Instant,
     pub executed: Executed,
     pub cancelling: bool,
+    /// Fetching the next page: rows are added to the ones shown, which
+    /// stay on screen meanwhile.
+    pub append: bool,
+}
+
+/// What a tab is for.
+#[derive(Debug)]
+pub enum TabKind {
+    /// A SQL editor.
+    Script,
+    /// A relation's rows, as DBeaver's data editor shows them.
+    Data(DataView),
+}
+
+/// A data tab's relation and how it is filtered and sorted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DataView {
+    pub schema: String,
+    pub relation: String,
+    /// The filter box as typed.
+    pub filter: String,
+    /// The filter the rows shown were read with.
+    pub applied: String,
+    pub order: Option<OrderBy>,
+}
+
+impl DataView {
+    pub fn new(schema: String, relation: String) -> Self {
+        Self {
+            schema,
+            relation,
+            filter: String::new(),
+            applied: String::new(),
+            order: None,
+        }
+    }
+
+    /// Sorting by `column` cycles ascending, descending, unsorted.
+    pub fn cycle_order(&mut self, column: &str) {
+        self.order = match &self.order {
+            Some(order) if order.column == column && !order.descending => Some(OrderBy {
+                column: column.to_owned(),
+                descending: true,
+            }),
+            Some(order) if order.column == column => None,
+            _ => Some(OrderBy {
+                column: column.to_owned(),
+                descending: false,
+            }),
+        };
+    }
+}
+
+/// A result read a page at a time.
+#[derive(Debug)]
+pub struct Paging {
+    /// The single statement being paged, as the user wrote it.
+    pub base: String,
+    pub loaded: u64,
+    pub has_more: bool,
+    pub total: Option<Count>,
+}
+
+/// A `count(*)` of a paged result.
+#[derive(Debug)]
+pub enum Count {
+    Running(RequestId),
+    Done(u64),
+    Failed(String),
 }
 
 #[derive(Debug)]
@@ -45,12 +114,29 @@ pub struct QueryTab {
     pub outcome: Option<Outcome>,
     pub active_set: usize,
     pub selected_cell: Option<(usize, usize)>,
-    /// Opened from the tree to browse a relation: the editor starts small.
-    pub data_view: bool,
+    pub kind: TabKind,
+    /// Set while the shown result is read a page at a time.
+    pub paging: Option<Paging>,
+    /// The last run, for refreshing it.
+    pub last_run: Option<(Executed, ExecOptions)>,
     pub highlighter: Highlighter,
 }
 
 impl QueryTab {
+    pub fn data(&self) -> Option<&DataView> {
+        match &self.kind {
+            TabKind::Data(view) => Some(view),
+            TabKind::Script => None,
+        }
+    }
+
+    pub fn data_mut(&mut self) -> Option<&mut DataView> {
+        match &mut self.kind {
+            TabKind::Data(view) => Some(view),
+            TabKind::Script => None,
+        }
+    }
+
     /// Where the last error points in the editor, as a byte offset.
     pub fn error_offset(&self) -> Option<usize> {
         let Some(Outcome::Failed { error, executed }) = &self.outcome else {
@@ -79,7 +165,7 @@ impl Workspace {
         title: String,
         connection: Option<ConnectionId>,
         sql: String,
-        data_view: bool,
+        kind: TabKind,
     ) -> TabId {
         self.next += 1;
         let id = self.next;
@@ -93,7 +179,9 @@ impl Workspace {
             outcome: None,
             active_set: 0,
             selected_cell: None,
-            data_view,
+            kind,
+            paging: None,
+            last_run: None,
             highlighter: Highlighter::default(),
         });
         self.active = Some(id);
@@ -102,8 +190,16 @@ impl Workspace {
 
     /// A title for a new editor: `Script 3`.
     pub fn next_script_title(&self) -> String {
-        let used = self.tabs.iter().filter(|tab| !tab.data_view).count();
+        let used = self
+            .tabs
+            .iter()
+            .filter(|tab| matches!(tab.kind, TabKind::Script))
+            .count();
         format!("Script {}", used + 1)
+    }
+
+    pub fn get(&self, id: TabId) -> Option<&QueryTab> {
+        self.tabs.iter().find(|tab| tab.id == id)
     }
 
     pub fn get_mut(&mut self, id: TabId) -> Option<&mut QueryTab> {
@@ -127,6 +223,33 @@ impl Workspace {
                 .map(|tab| tab.id);
         }
         Some(tab)
+    }
+
+    /// The data tab already showing `schema.relation` on `connection`.
+    pub fn data_tab(
+        &self,
+        connection: ConnectionId,
+        schema: &str,
+        relation: &str,
+    ) -> Option<TabId> {
+        self.tabs
+            .iter()
+            .find(|tab| {
+                tab.connection == Some(connection)
+                    && tab
+                        .data()
+                        .is_some_and(|view| view.schema == schema && view.relation == relation)
+            })
+            .map(|tab| tab.id)
+    }
+
+    pub fn by_count(&mut self, request: RequestId) -> Option<&mut QueryTab> {
+        self.tabs.iter_mut().find(|tab| {
+            matches!(
+                tab.paging.as_ref().and_then(|paging| paging.total.as_ref()),
+                Some(Count::Running(running)) if *running == request
+            )
+        })
     }
 
     pub fn by_request(&mut self, request: RequestId) -> Option<&mut QueryTab> {
@@ -171,9 +294,9 @@ mod tests {
     #[test]
     fn closing_the_active_tab_activates_a_neighbour() {
         let mut workspace = Workspace::default();
-        let a = workspace.open("A".into(), None, String::new(), false);
-        let b = workspace.open("B".into(), None, String::new(), false);
-        let c = workspace.open("C".into(), None, String::new(), false);
+        let a = workspace.open("A".into(), None, String::new(), TabKind::Script);
+        let b = workspace.open("B".into(), None, String::new(), TabKind::Script);
+        let c = workspace.open("C".into(), None, String::new(), TabKind::Script);
         workspace.active = Some(b);
         workspace.close(b);
         assert_eq!(workspace.active, Some(c));
@@ -181,6 +304,30 @@ mod tests {
         assert_eq!(workspace.active, Some(a));
         workspace.close(a);
         assert_eq!(workspace.active, None);
+    }
+
+    #[test]
+    fn sorting_cycles_through_both_directions() {
+        let mut view = DataView::new("s".into(), "t".into());
+        view.cycle_order("a");
+        assert_eq!(
+            view.order
+                .as_ref()
+                .map(|o| (o.column.as_str(), o.descending)),
+            Some(("a", false))
+        );
+        view.cycle_order("a");
+        assert_eq!(view.order.as_ref().map(|o| o.descending), Some(true));
+        view.cycle_order("a");
+        assert_eq!(view.order, None);
+        view.cycle_order("a");
+        view.cycle_order("b");
+        assert_eq!(
+            view.order
+                .as_ref()
+                .map(|o| (o.column.as_str(), o.descending)),
+            Some(("b", false))
+        );
     }
 
     #[test]
@@ -195,7 +342,12 @@ mod tests {
     #[test]
     fn error_positions_map_into_the_editor() {
         let mut workspace = Workspace::default();
-        let id = workspace.open("A".into(), None, "SELECT 1;\nSELEC 2".into(), false);
+        let id = workspace.open(
+            "A".into(),
+            None,
+            "SELECT 1;\nSELEC 2".into(),
+            TabKind::Script,
+        );
         let tab = workspace.get_mut(id).expect("tab");
         tab.outcome = Some(Outcome::Failed {
             error: DbError {

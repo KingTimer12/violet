@@ -10,7 +10,7 @@ use super::shortcuts;
 use super::state::{Explorer, Link};
 use super::theme::{self, Palette};
 use super::widgets::{self, Tone};
-use super::workspace::{QueryTab, Workspace, format_duration, thousands};
+use super::workspace::{DataView, QueryTab, Workspace, format_duration, thousands};
 
 pub const TITLE_BAR_HEIGHT: f32 = 44.0;
 
@@ -175,7 +175,7 @@ fn tab_button(
 
     let center = rect.center().y;
     let mut x = rect.left() + 14.0;
-    let icon = if tab.data_view {
+    let icon = if tab.data().is_some() {
         Icon::Table
     } else {
         Icon::FileCode
@@ -234,6 +234,10 @@ pub fn toolbar(
     actions: &mut Vec<Action>,
 ) {
     let palette = Palette::current(ui.ctx());
+    if let Some(view) = tab.data() {
+        data_toolbar(ui, tab, view, profiles, actions);
+        return;
+    }
     ui.horizontal_centered(|ui| {
         ui.add_space(10.0);
         let running = tab.running.is_some();
@@ -276,6 +280,116 @@ pub fn toolbar(
             ui.add_space(10.0);
             connection_picker(ui, tab, profiles, explorer, actions);
             ui.label(RichText::new("Connection").color(palette.dim));
+        });
+    });
+}
+
+/// A data tab's bar: refresh, stop, and what is being browsed.
+fn data_toolbar(
+    ui: &mut Ui,
+    tab: &QueryTab,
+    view: &DataView,
+    profiles: &[ConnectionProfile],
+    actions: &mut Vec<Action>,
+) {
+    let palette = Palette::current(ui.ctx());
+    ui.horizontal_centered(|ui| {
+        ui.add_space(10.0);
+        let running = tab.running.is_some();
+        let refresh = ui
+            .add_enabled_ui(!running, |ui| {
+                widgets::button(ui, Tone::Primary, Some(Icon::Refresh), "Refresh")
+            })
+            .inner;
+        if refresh
+            .on_hover_text("Read the rows again from the server")
+            .clicked()
+        {
+            actions.push(Action::RefreshTab(tab.id));
+        }
+        let cancel_tip = format!("Cancel ({})", ui.ctx().format_shortcut(&shortcuts::CANCEL));
+        if ui
+            .add_enabled_ui(running, |ui| {
+                widgets::icon_button(ui, Icon::Stop, &cancel_tip)
+            })
+            .inner
+            .clicked()
+        {
+            actions.push(Action::Cancel(tab.id));
+        }
+        if widgets::icon_button(ui, Icon::Terminal, "Open this query in a SQL editor").clicked() {
+            actions.push(Action::OpenEditor {
+                connection: tab.connection,
+                sql: format!("{};\n", tab.sql),
+            });
+        }
+
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.add_space(12.0);
+            let connection = tab
+                .connection
+                .and_then(|id| profiles.iter().find(|p| p.id == id))
+                .map(ConnectionProfile::display_name)
+                .unwrap_or_default();
+            ui.label(RichText::new(connection).color(palette.dim));
+            ui.label(
+                RichText::new(format!("{}.{}", view.schema, view.relation))
+                    .font(theme::mono(12.5))
+                    .color(palette.secondary),
+            );
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
+            widgets::paint_icon(ui, Icon::Table, rect, palette.accent);
+        });
+    });
+}
+
+/// DBeaver's filter box: a `WHERE` condition applied on Enter.
+pub fn filter_bar(ui: &mut Ui, tab: &mut QueryTab, actions: &mut Vec<Action>) {
+    let palette = Palette::current(ui.ctx());
+    let id = tab.id;
+    let Some(view) = tab.data_mut() else {
+        return;
+    };
+    ui.horizontal_centered(|ui| {
+        ui.add_space(12.0);
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
+        let active = !view.applied.is_empty();
+        widgets::paint_icon(
+            ui,
+            Icon::Funnel,
+            rect,
+            if active { palette.accent } else { palette.dim },
+        );
+        ui.label(
+            RichText::new("WHERE")
+                .font(theme::mono(12.0))
+                .color(palette.syntax.keyword),
+        );
+        let changed = view.filter.trim() != view.applied;
+        let width = (ui.available_width() - 120.0).max(120.0);
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut view.filter)
+                .id_salt(("filter", id))
+                .hint_text("Filter rows, e.g. id > 10 AND name ILIKE 'a%'  —  press Enter")
+                .font(theme::mono(12.5))
+                .frame(egui::Frame::NONE)
+                .desired_width(width),
+        );
+        if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+            actions.push(Action::ApplyFilter(id));
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.add_space(10.0);
+            if (active || !view.filter.is_empty())
+                && widgets::icon_button(ui, Icon::Close, "Clear the filter").clicked()
+            {
+                actions.push(Action::ClearFilter(id));
+            }
+            if changed
+                && widgets::icon_button(ui, Icon::Check, "Apply the filter (Enter)").clicked()
+            {
+                actions.push(Action::ApplyFilter(id));
+            }
         });
     });
 }

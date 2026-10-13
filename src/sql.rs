@@ -472,6 +472,99 @@ pub fn statement_at(source: &str, cursor: usize) -> Option<Range<usize>> {
         .cloned()
 }
 
+/// Statements that only read, by their first word.
+const READ_STARTS: &[&str] = &["EXPLAIN", "SELECT", "SHOW", "TABLE", "VALUES", "WITH"];
+
+/// Words that make a reading statement write or lock: data-modifying CTEs,
+/// `SELECT INTO`, `EXPLAIN ANALYZE` (which runs the statement), and
+/// `FOR UPDATE` style locks.
+const WRITING_WORDS: &[&str] = &["ANALYZE", "DELETE", "INSERT", "INTO", "MERGE", "UPDATE"];
+
+/// A statement's words, upper-cased, each with whether a `(` follows it.
+fn words(text: &str) -> Vec<(String, bool)> {
+    let mut words: Vec<(String, bool)> = Vec::new();
+    let mut after_word = false;
+    for token in tokens(text) {
+        match token.kind {
+            TokenKind::Whitespace | TokenKind::Comment => {}
+            TokenKind::Keyword | TokenKind::Type | TokenKind::Identifier => {
+                words.push((text[token.range].to_ascii_uppercase(), false));
+                after_word = true;
+            }
+            _ => {
+                if after_word
+                    && &text[token.range] == "("
+                    && let Some(last) = words.last_mut()
+                {
+                    last.1 = true;
+                }
+                after_word = false;
+            }
+        }
+    }
+    words
+}
+
+/// What the app may do with a piece of SQL besides running it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Plan {
+    /// A single read-only query that can be read a page at a time: its text
+    /// without the trailing `;`.
+    pub pageable: Option<String>,
+}
+
+/// Decides whether `source` may be paged. It errs on the side of running:
+/// anything unclear is not.
+#[must_use]
+pub fn plan(source: &str) -> Plan {
+    let ranges = statements(source);
+    let [range] = ranges.as_slice() else {
+        return Plan::default();
+    };
+    let words = words(&source[range.clone()]);
+    let first = words.first().map(|(word, _)| word.as_str());
+    let reads = first.is_some_and(|word| READ_STARTS.contains(&word))
+        && !matches!(first, Some("EXPLAIN" | "SHOW"));
+    let writes = words.iter().enumerate().any(|(index, (word, _))| {
+        WRITING_WORDS.contains(&word.as_str())
+            || (word == "FOR"
+                && words.get(index + 1).is_some_and(|(next, _)| {
+                    matches!(next.as_str(), "UPDATE" | "SHARE" | "NO" | "KEY")
+                }))
+    });
+    Plan {
+        pageable: (reads && !writes).then(|| {
+            let text = &source[range.clone()];
+            text.trim_end().trim_end_matches(';').trim_end().to_owned()
+        }),
+    }
+}
+
+/// Whether `filter` is one expression, safe to place in `WHERE (...)`: no
+/// statement separator outside strings and comments, and brackets that
+/// balance so it cannot close the `WHERE` early.
+#[must_use]
+pub fn is_single_expression(filter: &str) -> bool {
+    let mut depth = 0i32;
+    for token in tokens(filter) {
+        if token.kind != TokenKind::Punctuation {
+            continue;
+        }
+        match &filter[token.range] {
+            ";" => return false,
+            "(" => depth += 1,
+            ")" => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
 /// 1-based line and column of a character offset (as servers report error
 /// positions) within `source`.
 #[must_use]
@@ -510,6 +603,9 @@ mod tests {
                 .chain(TYPES)
                 .all(|w| w.len() <= LONGEST_WORD && w.is_ascii())
         );
+        for list in [READ_STARTS, WRITING_WORDS] {
+            assert!(list.windows(2).all(|w| w[0] < w[1]), "{list:?}");
+        }
     }
 
     #[test]
@@ -598,6 +694,38 @@ mod tests {
             "SELECT 2 ;"
         );
         assert_eq!(statements(source).len(), 2);
+    }
+
+    #[test]
+    fn only_single_plain_reads_are_paged() {
+        let read = plan("select * from users where id > 1;  -- done");
+        assert_eq!(
+            read.pageable.as_deref(),
+            Some("select * from users where id > 1")
+        );
+        assert!(plan("SELECT 1; SELECT 2;").pageable.is_none());
+        for not_paged in [
+            "UPDATE t SET a = 1",
+            "WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x",
+            "SELECT * INTO copy FROM t",
+            "SELECT * FROM t FOR UPDATE",
+            "EXPLAIN SELECT 1",
+            "SHOW search_path",
+        ] {
+            assert!(plan(not_paged).pageable.is_none(), "{not_paged}");
+        }
+        assert_eq!(plan("-- nothing"), Plan::default());
+        // Semicolons inside strings do not split.
+        assert!(plan("SELECT ';' AS semi").pageable.is_some());
+    }
+
+    #[test]
+    fn filters_must_be_one_expression() {
+        assert!(is_single_expression("id > 1 AND (name ILIKE 'a;b%')"));
+        assert!(is_single_expression("note = ')' -- )"));
+        assert!(!is_single_expression("1 = 1; DROP TABLE t"));
+        assert!(!is_single_expression("1 = 1) OR (1 = 1"));
+        assert!(!is_single_expression("(id = 1"));
     }
 
     #[test]

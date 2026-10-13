@@ -46,11 +46,24 @@ impl<'a> Row<'a> {
     }
 
     fn show(self, ui: &mut Ui) -> Response {
+        self.show_with_toggle(ui).0
+    }
+
+    /// Draws the row; the flag is set when the click landed on the chevron,
+    /// so a row can expand from there and do something else when clicked
+    /// anywhere else.
+    fn show_with_toggle(self, ui: &mut Ui) -> (Response, bool) {
         let palette = Palette::current(ui.ctx());
         let (rect, response) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_HEIGHT), Sense::click());
+        let chevron_end = rect.left() + 6.0 + 6.0 + self.depth as f32 * INDENT + 18.0;
+        let toggled = self.expanded.is_some()
+            && response.clicked()
+            && response
+                .interact_pointer_pos()
+                .is_some_and(|pos| pos.x <= chevron_end);
         if !ui.is_rect_visible(rect) {
-            return response;
+            return (response, toggled);
         }
         let painter = ui.painter();
         let row = rect.shrink2(Vec2::new(6.0, 1.0));
@@ -128,7 +141,7 @@ impl<'a> Row<'a> {
             palette.text.gamma_multiply(0.92)
         };
         widgets::paint_text(ui, label_rect, Align2::LEFT_CENTER, self.label, font, color);
-        response
+        (response, toggled)
     }
 }
 
@@ -460,30 +473,32 @@ fn object_node(
     row.selected = explorer.selected.as_ref() == Some(&key);
     row.loading = columns.is_loading();
     row.detail = detail.as_deref();
-    let mut response = row.show(ui);
+    let (mut response, toggled) = row.show_with_toggle(ui);
     if let Some(comment) = &object.comment {
         response = response.on_hover_text(comment);
     }
 
+    // As in DBeaver: clicking a table opens its data; the chevron shows
+    // its columns.
     if response.clicked() {
         explorer.selected = Some(key.clone());
-        if relation
-            && explorer.toggle(key.clone())
-            && matches!(columns, Loadable::Idle | Loadable::Failed(_))
-        {
-            actions.push(Action::LoadColumns(
-                id,
-                object.schema.clone(),
-                object.name.clone(),
-            ));
+        if toggled {
+            if explorer.toggle(key.clone())
+                && matches!(columns, Loadable::Idle | Loadable::Failed(_))
+            {
+                actions.push(Action::LoadColumns(
+                    id,
+                    object.schema.clone(),
+                    object.name.clone(),
+                ));
+            }
+        } else if relation {
+            actions.push(Action::OpenData {
+                connection: id,
+                schema: object.schema.clone(),
+                relation: object.name.clone(),
+            });
         }
-    }
-    if response.double_clicked() && relation {
-        actions.push(Action::OpenData {
-            connection: id,
-            schema: object.schema.clone(),
-            relation: object.name.clone(),
-        });
     }
     response.context_menu(|ui| {
         if relation {

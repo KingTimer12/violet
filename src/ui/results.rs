@@ -5,13 +5,15 @@ use std::borrow::Cow;
 
 use egui::{Align, CornerRadius, Layout, RichText, Sense, Stroke, Ui, Vec2};
 use egui_extras::{Column, TableBuilder};
-use violet_core::{DbError, ResultSet};
+use violet_core::{DbError, OrderBy, ResultSet};
 
 use super::action::Action;
 use super::icons::Icon;
 use super::theme::{self, Palette};
 use super::widgets::{self, Tone};
-use super::workspace::{Executed, Outcome, QueryTab, format_duration, thousands};
+use super::workspace::{
+    Count, Executed, Outcome, Paging, QueryTab, TabKind, format_duration, thousands,
+};
 use crate::sql;
 
 const ROW_HEIGHT: f32 = 26.0;
@@ -20,7 +22,10 @@ const CELL_PREVIEW: usize = 300;
 
 pub fn show(ui: &mut Ui, tab: &mut QueryTab, actions: &mut Vec<Action>) {
     let palette = Palette::current(ui.ctx());
-    if let Some(running) = &tab.running {
+    // Fetching another page keeps the rows on screen; the footer shows it.
+    if let Some(running) = &tab.running
+        && !running.append
+    {
         let elapsed = running.started.elapsed();
         ui.vertical_centered(|ui| {
             ui.add_space((ui.available_height() / 2.0 - 50.0).max(10.0));
@@ -111,11 +116,26 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, actions: &mut Vec<Action>) {
                             {
                                 actions.push(Action::Copy(to_delimited(set, ',')));
                             }
+                            if tab.last_run.is_some()
+                                && widgets::icon_button(
+                                    ui,
+                                    Icon::Refresh,
+                                    "Read again from the server",
+                                )
+                                .clicked()
+                            {
+                                actions.push(Action::RefreshTab(tab.id));
+                            }
                             ui.label(RichText::new(format_duration(elapsed)).color(palette.dim));
                             if set.has_rows() {
+                                let more = tab.paging.as_ref().is_some_and(|p| p.has_more);
                                 widgets::pill(
                                     ui,
-                                    &format!("{} rows", thousands(set.rows.len())),
+                                    &format!(
+                                        "{}{} rows",
+                                        thousands(set.rows.len()),
+                                        if more { "+" } else { "" }
+                                    ),
                                     palette.accent,
                                     palette.accent_soft,
                                 );
@@ -141,7 +161,23 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, actions: &mut Vec<Action>) {
             );
 
             if set.has_rows() {
-                grid(ui, tab.id, set, &mut tab.selected_cell, actions);
+                if let Some(paging) = &tab.paging {
+                    let fetching = tab.running.as_ref().is_some_and(|r| r.append);
+                    egui::Panel::bottom(egui::Id::new(("paging", tab.id)))
+                        .exact_size(34.0)
+                        .frame(
+                            egui::Frame::NONE
+                                .fill(palette.panel)
+                                .stroke(Stroke::new(1.0, palette.outline)),
+                        )
+                        .show_separator_line(false)
+                        .show(ui, |ui| paging_bar(ui, tab.id, paging, fetching, actions));
+                }
+                let sort = match &tab.kind {
+                    TabKind::Data(view) => Some(view.order.as_ref()),
+                    TabKind::Script => None,
+                };
+                grid(ui, tab.id, set, sort, &mut tab.selected_cell, actions);
             } else {
                 let affected = set.affected.unwrap_or(0);
                 widgets::empty_state(
@@ -158,10 +194,82 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, actions: &mut Vec<Action>) {
     }
 }
 
+/// DBeaver's result footer: how much is loaded, and buttons to read more
+/// or count the rest.
+fn paging_bar(ui: &mut Ui, tab: u64, paging: &Paging, fetching: bool, actions: &mut Vec<Action>) {
+    let palette = Palette::current(ui.ctx());
+    ui.horizontal_centered(|ui| {
+        ui.add_space(10.0);
+        let loaded = usize::try_from(paging.loaded).unwrap_or(usize::MAX);
+        let fetched = if paging.has_more {
+            format!("{} rows fetched", thousands(loaded))
+        } else {
+            format!("All {} rows fetched", thousands(loaded))
+        };
+        ui.label(RichText::new(fetched).color(palette.secondary));
+        match &paging.total {
+            Some(Count::Done(total)) => {
+                let total = usize::try_from(*total).unwrap_or(usize::MAX);
+                ui.label(RichText::new(format!("of {}", thousands(total))).color(palette.dim));
+            }
+            Some(Count::Running(_)) => {
+                ui.add(egui::Spinner::new().size(12.0).color(palette.accent));
+            }
+            Some(Count::Failed(error)) => {
+                ui.label(RichText::new("count failed").color(palette.danger))
+                    .on_hover_text(error);
+            }
+            None => {}
+        }
+        if fetching {
+            ui.add(egui::Spinner::new().size(12.0).color(palette.accent));
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.add_space(8.0);
+            let idle = !fetching;
+            let count_idle = !matches!(paging.total, Some(Count::Running(_)));
+            if ui
+                .add_enabled_ui(count_idle, |ui| {
+                    widgets::icon_button(ui, Icon::Sequence, "Count all rows")
+                })
+                .inner
+                .clicked()
+            {
+                actions.push(Action::CountRows(tab));
+            }
+            if ui
+                .add_enabled_ui(idle && paging.has_more, |ui| {
+                    widgets::icon_button(
+                        ui,
+                        Icon::ChevronsDown,
+                        "Fetch all rows (up to the row limit)",
+                    )
+                })
+                .inner
+                .clicked()
+            {
+                actions.push(Action::FetchAll(tab));
+            }
+            let next = format!("Next {}", violet_core::Page::SIZE);
+            if ui
+                .add_enabled_ui(idle && paging.has_more, |ui| {
+                    widgets::button(ui, Tone::Secondary, Some(Icon::ChevronDown), &next)
+                })
+                .inner
+                .on_hover_text("Fetch the next page of rows")
+                .clicked()
+            {
+                actions.push(Action::FetchMore(tab));
+            }
+        });
+    });
+}
+
 fn grid(
     ui: &mut Ui,
     tab: u64,
     set: &ResultSet,
+    sort: Option<Option<&OrderBy>>,
     selected: &mut Option<(usize, usize)>,
     actions: &mut Vec<Action>,
 ) {
@@ -209,7 +317,7 @@ fn grid(
                         ui.painter().rect_filled(ui.max_rect(), 0.0, palette.panel);
                     });
                     for column in &set.columns {
-                        header.col(|ui| {
+                        let (_, response) = header.col(|ui| {
                             ui.painter().rect_filled(ui.max_rect(), 0.0, palette.panel);
                             ui.add_space(6.0);
                             ui.label(
@@ -217,6 +325,22 @@ fn grid(
                                     .font(theme::semibold(12.5))
                                     .color(palette.text),
                             );
+                            // The sort arrow sits by the name, where narrow
+                            // columns still show it.
+                            let direction = sort
+                                .flatten()
+                                .filter(|order| order.column == column.name)
+                                .map(|order| order.descending);
+                            if let Some(descending) = direction {
+                                let icon = if descending {
+                                    Icon::ArrowDown
+                                } else {
+                                    Icon::ArrowUp
+                                };
+                                let (rect, _) =
+                                    ui.allocate_exact_size(Vec2::splat(13.0), Sense::hover());
+                                widgets::paint_icon(ui, icon, rect, palette.accent);
+                            }
                             if let Some(kind) = &column.type_name {
                                 ui.label(
                                     RichText::new(kind)
@@ -225,6 +349,16 @@ fn grid(
                                 );
                             }
                         });
+                        // Data tabs sort on the server by clicking a header.
+                        if sort.is_some() {
+                            let response = response
+                                .interact(Sense::click())
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .on_hover_text("Sort by this column");
+                            if response.clicked() {
+                                actions.push(Action::Sort(tab, column.name.clone()));
+                            }
+                        }
                     }
                 })
                 .body(|body| {

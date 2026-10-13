@@ -126,6 +126,37 @@ impl Rows {
         self.text.len()
     }
 
+    /// Keeps the first `rows` rows.
+    pub fn truncate(&mut self, rows: usize) {
+        let cells = rows.saturating_mul(self.width);
+        if cells < self.ends.len() {
+            self.text.truncate(self.cell_start(cells));
+            self.ends.truncate(cells);
+        }
+    }
+
+    /// Appends `other`'s rows, as when the next page of a result arrives.
+    /// Rows of another width are squared to this one's.
+    pub fn append(&mut self, other: &Self) {
+        if self.width == other.width || self.is_empty() {
+            if self.is_empty() {
+                self.width = other.width;
+            }
+            let base = self.text.len();
+            self.text.push_str(&other.text);
+            self.ends.extend(
+                other
+                    .ends
+                    .iter()
+                    .map(|end| ((end & !NULL) + base) | (end & NULL)),
+            );
+        } else {
+            for row in other.iter() {
+                self.push(row.iter());
+            }
+        }
+    }
+
     fn cell_start(&self, cell: usize) -> usize {
         cell.checked_sub(1)
             .map_or(0, |previous| self.ends[previous] & !NULL)
@@ -179,6 +210,37 @@ impl<'a> Row<'a> {
 pub struct QueryOutput {
     pub sets: Vec<ResultSet>,
     pub elapsed: Duration,
+    /// Set when the run read one page of a longer result.
+    pub page: Option<PageInfo>,
+}
+
+/// A window of a query's rows, as a data view fetches them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Page {
+    pub offset: u64,
+    pub limit: u64,
+}
+
+impl Page {
+    /// Rows fetched at a time, as DBeaver's default fetch size.
+    pub const SIZE: u64 = 200;
+
+    #[must_use]
+    pub const fn first() -> Self {
+        Self {
+            offset: 0,
+            limit: Self::SIZE,
+        }
+    }
+}
+
+/// Where a fetched page sits in its result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageInfo {
+    pub offset: u64,
+    pub limit: u64,
+    /// More rows follow this page.
+    pub has_more: bool,
 }
 
 /// Bounds on what a run may bring back, so a careless `SELECT *` on a huge
@@ -227,6 +289,33 @@ mod tests {
         assert_eq!(rows.get(1, 1), Some(Some("c")));
         assert_eq!(rows.get(2, 0), Some(Some("d")));
         assert_eq!(rows.text_len(), 4);
+    }
+
+    #[test]
+    fn rows_truncate_and_append_by_whole_rows() {
+        let mut rows = Rows::new(2);
+        rows.push([Some("a"), None]);
+        rows.push([Some("bb"), Some("c")]);
+        rows.push([Some("d"), Some("e")]);
+        rows.truncate(2);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.text_len(), 4);
+        rows.truncate(5);
+        assert_eq!(rows.len(), 2);
+
+        let mut next = Rows::new(2);
+        next.push([None, Some("f")]);
+        next.push([Some("g"), Some("h")]);
+        rows.append(&next);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows.get(1, 0), Some(Some("bb")));
+        assert_eq!(rows.get(2, 0), Some(None));
+        assert_eq!(rows.get(2, 1), Some(Some("f")));
+        assert_eq!(rows.get(3, 1), Some(Some("h")));
+
+        let mut empty = Rows::default();
+        empty.append(&next);
+        assert_eq!((empty.width(), empty.len()), (2, 2));
     }
 
     #[test]

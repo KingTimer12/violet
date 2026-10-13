@@ -7,7 +7,10 @@
 //!
 //! Scenes: `welcome` (default), `browse` (connect the first profile, open
 //! a table and its data), `error` (run a broken statement), `form` (the
-//! connection dialog). Add `VIOLET_THEME=light` for the light theme.
+//! connection dialog), `data` (a table's data tab, filtered and sorted),
+//! `menu` (the data tab with a connection's context menu open), `page`
+//! (a data tab after fetching the next page and counting). Add
+//! `VIOLET_THEME=light` for the light theme.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -17,7 +20,7 @@ use violet_core::ObjectKind;
 use super::VioletApp;
 use super::action::{Action, RunScope};
 use super::state::{Link, NodeKey};
-use super::workspace::Outcome;
+use super::workspace::{Outcome, TabKind};
 
 pub struct Snapshot {
     path: PathBuf,
@@ -25,6 +28,8 @@ pub struct Snapshot {
     started: Instant,
     step: usize,
     requested: bool,
+    /// Input to feed the next frame, as if the user did it.
+    events: Vec<egui::Event>,
 }
 
 impl Snapshot {
@@ -36,7 +41,23 @@ impl Snapshot {
             started: Instant::now(),
             step: 0,
             requested: false,
+            events: Vec::new(),
         })
+    }
+
+    /// Hands queued input to the frame about to start.
+    pub fn inject(&mut self, raw: &mut egui::RawInput) {
+        raw.events.append(&mut self.events);
+    }
+}
+
+/// A right click at `pos`, pressed or released.
+fn secondary(pos: egui::Pos2, pressed: bool) -> egui::Event {
+    egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Secondary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
     }
 }
 
@@ -88,7 +109,7 @@ impl VioletApp {
                 snapshot.step += 1;
                 false
             }
-            ("browse" | "error", 0) => {
+            ("browse" | "error" | "data" | "menu" | "page", 0) => {
                 if let Some(id) = first {
                     self.explorer.expanded.insert(NodeKey::Connection(id));
                     self.actions.push(Action::Connect(id));
@@ -133,6 +154,112 @@ impl VioletApp {
                 snapshot.step += 1;
                 false
             }
+            ("data" | "menu" | "page", 1) => {
+                let Some(id) = first else { return true };
+                let loaded = self
+                    .explorer
+                    .objects
+                    .contains_key(&(id, "public".to_owned()));
+                if loaded && self.explorer.link(id).is_online() {
+                    self.explorer.expanded.insert(NodeKey::Group(
+                        id,
+                        "public".into(),
+                        ObjectKind::Table,
+                    ));
+                    self.actions.push(Action::OpenData {
+                        connection: id,
+                        schema: "public".into(),
+                        relation: "customers".into(),
+                    });
+                    snapshot.step += 1;
+                }
+                false
+            }
+            ("data" | "menu", 2) => {
+                // Filter and sort once the first page is in.
+                let Some(tab) = self.workspace.active else {
+                    return false;
+                };
+                let loaded = self.workspace.get(tab).is_some_and(|tab| {
+                    tab.running.is_none() && matches!(tab.outcome, Some(Outcome::Done { .. }))
+                });
+                if loaded {
+                    if let Some(tab) = self.workspace.get_mut(tab)
+                        && let TabKind::Data(view) = &mut tab.kind
+                    {
+                        view.filter = "country IN ('BR', 'PT')".into();
+                        view.cycle_order("credit");
+                        view.cycle_order("credit");
+                    }
+                    self.actions.push(Action::ApplyFilter(tab));
+                    snapshot.step += 1;
+                }
+                false
+            }
+            ("page", 2) => {
+                let Some(tab) = self.workspace.active else {
+                    return false;
+                };
+                let loaded = self.workspace.get(tab).is_some_and(|tab| {
+                    tab.running.is_none() && matches!(tab.outcome, Some(Outcome::Done { .. }))
+                });
+                if loaded {
+                    self.actions.push(Action::FetchMore(tab));
+                    self.actions.push(Action::CountRows(tab));
+                    snapshot.step = 10;
+                    snapshot.started = Instant::now();
+                }
+                false
+            }
+            ("page", _) => {
+                let ready = self.workspace.active().is_some_and(|tab| {
+                    tab.running.is_none()
+                        && tab.paging.as_ref().is_some_and(|p| {
+                            matches!(p.total, Some(super::workspace::Count::Done(_)))
+                        })
+                });
+                ready && elapsed > Duration::from_millis(5_000)
+            }
+            ("data", 3) => {
+                // Back to the unfiltered first page.
+                let Some(tab) = self.workspace.active else {
+                    return false;
+                };
+                let done = self.workspace.get(tab).is_some_and(|tab| {
+                    tab.running.is_none() && matches!(tab.outcome, Some(Outcome::Done { .. }))
+                });
+                if done {
+                    if let Some(tab) = self.workspace.get_mut(tab)
+                        && let TabKind::Data(view) = &mut tab.kind
+                    {
+                        view.order = None;
+                    }
+                    self.actions.push(Action::ClearFilter(tab));
+                    snapshot.step += 1;
+                }
+                false
+            }
+            ("menu", 3) => {
+                let done = self.workspace.active().is_some_and(|tab| {
+                    tab.running.is_none() && matches!(tab.outcome, Some(Outcome::Done { .. }))
+                });
+                if done {
+                    // Right-click the connection, the first row of the tree.
+                    let pos = egui::pos2(120.0, 152.0);
+                    snapshot.events.push(egui::Event::PointerMoved(pos));
+                    snapshot.events.push(secondary(pos, true));
+                    snapshot.step += 1;
+                }
+                false
+            }
+            ("menu", 4) => {
+                snapshot
+                    .events
+                    .push(secondary(egui::pos2(120.0, 152.0), false));
+                snapshot.step = 10;
+                snapshot.started = Instant::now() - Duration::from_millis(1_000);
+                false
+            }
             ("error", 1) => {
                 let Some(id) = first else { return true };
                 if matches!(self.explorer.link(id), Link::Online(_)) {
@@ -151,7 +278,7 @@ impl VioletApp {
                 snapshot.step += 1;
                 false
             }
-            ("browse" | "error", _) => {
+            ("browse" | "error" | "data", _) => {
                 let done = self.workspace.active().is_some_and(|tab| {
                     tab.running.is_none()
                         && matches!(
@@ -165,6 +292,7 @@ impl VioletApp {
                 }
                 snapshot.step >= 10 && settle
             }
+            ("menu", _) => snapshot.step >= 10 && settle,
             _ => settle,
         }
     }

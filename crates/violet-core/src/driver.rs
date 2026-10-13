@@ -81,18 +81,68 @@ pub trait Canceller: Send + Sync + 'static {
     async fn cancel(&self) -> Result<()>;
 }
 
+/// A column to sort a data view by.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct OrderBy {
+    pub column: String,
+    pub descending: bool,
+}
+
+/// A query wrapped to read one page, and how far the original text moved so
+/// error positions can be mapped back to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PagedSql {
+    pub sql: String,
+    /// Characters added before the original statement.
+    pub shift: u32,
+}
+
 /// The SQL a driver needs generated for it.
 pub trait Dialect: Send + Sync {
     /// Quotes an identifier, doubling quotes inside it.
     fn quote_ident(&self, ident: &str) -> String;
 
-    /// A statement that reads the first `limit` rows of a relation.
-    fn select_rows(&self, schema: &str, relation: &str, limit: usize) -> String {
-        format!(
-            "SELECT * FROM {}.{} LIMIT {limit}",
+    /// Reads a relation for a data view. `filter` is a condition the user
+    /// typed, as DBeaver's filter box takes it; the caller checks it is a
+    /// single expression.
+    fn browse(
+        &self,
+        schema: &str,
+        relation: &str,
+        filter: Option<&str>,
+        order: Option<&OrderBy>,
+    ) -> String {
+        let mut sql = format!(
+            "SELECT * FROM {}.{}",
             self.quote_ident(schema),
             self.quote_ident(relation)
-        )
+        );
+        if let Some(filter) = filter.map(str::trim).filter(|f| !f.is_empty()) {
+            sql.push_str(&format!("\nWHERE ({filter}\n)"));
+        }
+        if let Some(order) = order {
+            let direction = if order.descending { "DESC" } else { "ASC" };
+            sql.push_str(&format!(
+                "\nORDER BY {} {direction}",
+                self.quote_ident(&order.column)
+            ));
+        }
+        sql
+    }
+
+    /// Wraps a single read-only statement to read `limit` rows from
+    /// `offset`.
+    fn paged(&self, sql: &str, limit: u64, offset: u64) -> PagedSql {
+        const PREFIX: &str = "SELECT * FROM (\n";
+        PagedSql {
+            sql: format!("{PREFIX}{sql}\n) AS violet_page LIMIT {limit} OFFSET {offset}"),
+            shift: PREFIX.chars().count() as u32,
+        }
+    }
+
+    /// Counts the rows a single read-only statement returns.
+    fn count(&self, sql: &str) -> String {
+        format!("SELECT count(*) FROM (\n{sql}\n) AS violet_count")
     }
 }
 
@@ -117,8 +167,44 @@ mod tests {
             r#""a""; drop table x; --""#
         );
         assert_eq!(
-            AnsiDialect.select_rows("public", "users", 200),
-            r#"SELECT * FROM "public"."users" LIMIT 200"#
+            AnsiDialect.browse("public", "users", None, None),
+            r#"SELECT * FROM "public"."users""#
+        );
+    }
+
+    #[test]
+    fn data_views_filter_sort_and_page() {
+        let order = OrderBy {
+            column: "Name".into(),
+            descending: true,
+        };
+        let sql = AnsiDialect.browse("s", "t", Some(" id > 1 "), Some(&order));
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"s\".\"t\"\nWHERE (id > 1\n)\nORDER BY \"Name\" DESC"
+        );
+        // A blank filter is no filter, and a trailing comment stays inside
+        // its own line.
+        assert!(
+            !AnsiDialect
+                .browse("s", "t", Some("  "), None)
+                .contains("WHERE")
+        );
+        assert!(
+            AnsiDialect
+                .browse("s", "t", Some("a = 1 -- x"), None)
+                .contains("-- x\n)")
+        );
+
+        let paged = AnsiDialect.paged("SELECT 1 -- c", 201, 400);
+        assert_eq!(
+            paged.sql,
+            "SELECT * FROM (\nSELECT 1 -- c\n) AS violet_page LIMIT 201 OFFSET 400"
+        );
+        assert_eq!(&paged.sql[paged.shift as usize..][..8], "SELECT 1");
+        assert_eq!(
+            AnsiDialect.count("SELECT 1"),
+            "SELECT count(*) FROM (\nSELECT 1\n) AS violet_count"
         );
     }
 }

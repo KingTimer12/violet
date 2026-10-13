@@ -16,8 +16,10 @@ pub mod query;
 pub mod secret;
 
 pub use catalog::{ColumnInfo, DbObject, ObjectKind, ServerInfo};
-pub use driver::{Canceller, Capabilities, Dialect, Driver, DriverInfo, Session};
+pub use driver::{
+    Canceller, Capabilities, Dialect, Driver, DriverInfo, OrderBy, PagedSql, Session,
+};
 pub use error::{DbError, ErrorKind, Result};
 pub use profile::{ConnectionId, ConnectionProfile, Credentials, DriverId, SslMode, is_loopback};
-pub use query::{ColumnMeta, ExecLimits, QueryOutput, ResultSet, Row, Rows};
+pub use query::{ColumnMeta, ExecLimits, Page, PageInfo, QueryOutput, ResultSet, Row, Rows};
 pub use secret::Secret;

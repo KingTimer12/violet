@@ -21,8 +21,8 @@ mod workspace;
 use std::time::Instant;
 
 use egui::{Frame, Id, Panel, Stroke};
-use violet_app::{Backend, Event, ProfileService};
-use violet_core::{ConnectionId, ErrorKind};
+use violet_app::{Backend, Event, ExecOptions, ProfileService};
+use violet_core::{ConnectionId, ErrorKind, Page};
 use violet_storage::JsonFile;
 
 use crate::settings::Settings;
@@ -32,7 +32,7 @@ use connection_form::{ConnectionForm, PasswordPrompt, TestState};
 use state::{Explorer, Link, Loadable, NodeKey};
 use theme::Palette;
 use toasts::{Toast, Toasts};
-use workspace::{Executed, Outcome, Running, TabId, Workspace};
+use workspace::{Count, DataView, Executed, Outcome, Paging, Running, TabId, TabKind, Workspace};
 
 /// Everything the interface needs from the rest of the app.
 pub struct Services {
@@ -232,8 +232,29 @@ impl VioletApp {
                     return;
                 };
                 let connection = tab.connection;
-                tab.active_set = 0;
-                tab.selected_cell = None;
+                if let Ok(output) = &result
+                    && let Some(page) = output.page
+                    && let Some(paging) = &mut tab.paging
+                {
+                    let fetched = output.sets.first().map_or(0, |set| set.rows.len());
+                    paging.loaded = page.offset + fetched as u64;
+                    paging.has_more = page.has_more;
+                }
+                // The next page joins the rows already shown.
+                if running.append
+                    && let Ok(output) = &result
+                    && let Some(Outcome::Done { output: shown }) = &mut tab.outcome
+                    && let (Some(set), Some(next)) = (shown.sets.first_mut(), output.sets.first())
+                {
+                    set.rows.append(&next.rows);
+                    shown.page = output.page;
+                    shown.elapsed = output.elapsed;
+                    return;
+                }
+                if !running.append {
+                    tab.active_set = 0;
+                    tab.selected_cell = None;
+                }
                 tab.outcome = Some(match result {
                     Ok(output) => {
                         // Show the last set with rows: usually what was asked for.
@@ -257,6 +278,18 @@ impl VioletApp {
                         }
                     }
                 });
+            }
+            Event::Counted { request, result } => {
+                if let Some(paging) = self
+                    .workspace
+                    .by_count(request)
+                    .and_then(|tab| tab.paging.as_mut())
+                {
+                    paging.total = Some(match result {
+                        Ok(count) => Count::Done(count),
+                        Err(error) => Count::Failed(error.message),
+                    });
+                }
             }
             Event::TestFinished { request, result } => {
                 if let Some(form) = &mut self.form
@@ -299,6 +332,14 @@ impl VioletApp {
     // ---- running queries ------------------------------------------------
 
     fn run(&mut self, ctx: &egui::Context, tab_id: TabId, scope: RunScope) {
+        let is_data = self
+            .workspace
+            .get(tab_id)
+            .is_some_and(|tab| tab.data().is_some());
+        if scope == RunScope::Data || is_data {
+            self.run_data(ctx, tab_id);
+            return;
+        }
         let Some(tab) = self.workspace.get_mut(tab_id) else {
             return;
         };
@@ -306,7 +347,7 @@ impl VioletApp {
             return;
         }
         let range = match scope {
-            RunScope::Script => 0..tab.sql.len(),
+            RunScope::Script | RunScope::Data => 0..tab.sql.len(),
             RunScope::Statement if !tab.selection.is_empty() => tab.selection.clone(),
             RunScope::Statement => match sql::statement_at(&tab.sql, tab.selection.start) {
                 Some(range) => range,
@@ -337,13 +378,167 @@ impl VioletApp {
         }
         let offset = range.start
             + (tab.sql[range.clone()].len() - tab.sql[range.clone()].trim_start().len());
-        let request = self.backend.execute(connection, text.clone());
+        // A single query is read a page at a time, as DBeaver does.
+        let (text, page) = match sql::plan(&text).pageable {
+            Some(single) => (single, Some(Page::first())),
+            None => (text, None),
+        };
+        let options = ExecOptions { page };
+        let executed = Executed { offset, sql: text };
+        self.start(tab_id, connection, executed, options, false);
+    }
+
+    /// Sends a run and marks its tab busy.
+    fn start(
+        &mut self,
+        tab_id: TabId,
+        connection: ConnectionId,
+        executed: Executed,
+        options: ExecOptions,
+        append: bool,
+    ) {
+        let Some(tab) = self.workspace.get_mut(tab_id) else {
+            return;
+        };
+        let request = self
+            .backend
+            .execute(connection, executed.sql.clone(), options);
+        if !append {
+            tab.paging = options.page.map(|_| Paging {
+                base: executed.sql.clone(),
+                loaded: 0,
+                has_more: false,
+                total: None,
+            });
+            tab.last_run = Some((executed.clone(), options));
+        }
         tab.running = Some(Running {
             request,
             started: Instant::now(),
-            executed: Executed { offset, sql: text },
+            executed,
             cancelling: false,
+            append,
         });
+    }
+
+    /// Reads a data tab's first page with its filter and sort.
+    fn run_data(&mut self, ctx: &egui::Context, tab_id: TabId) {
+        let Some(tab) = self.workspace.get_mut(tab_id) else {
+            return;
+        };
+        let (Some(connection), Some(view)) = (tab.connection, tab.data()) else {
+            return;
+        };
+        if tab.running.is_some() {
+            return;
+        }
+        if !self.backend.is_connected(connection) {
+            self.queued.push((tab_id, RunScope::Data));
+            self.connect(connection, None);
+            return;
+        }
+        let filter = view.filter.trim().to_owned();
+        if !sql::is_single_expression(&filter) {
+            self.toasts.push(
+                ctx,
+                Toast::error(
+                    "The filter must be one condition",
+                    "Use a WHERE expression such as id > 10 AND name ILIKE 'a%', without ';' or unbalanced brackets.",
+                ),
+            );
+            return;
+        }
+        let Some(sql) = self.backend.browse_sql(
+            connection,
+            &view.schema,
+            &view.relation,
+            Some(&filter),
+            view.order.as_ref(),
+        ) else {
+            return;
+        };
+        if let Some(view) = tab.data_mut() {
+            view.applied = filter;
+        }
+        tab.sql.clone_from(&sql);
+        let executed = Executed { offset: 0, sql };
+        let options = ExecOptions {
+            page: Some(Page::first()),
+        };
+        self.start(tab_id, connection, executed, options, false);
+    }
+
+    /// Reads the next page of a paged result, or all that remains up to the
+    /// row cap.
+    fn fetch_more(&mut self, tab_id: TabId, all: bool) {
+        let max_rows = self.backend.max_rows() as u64;
+        let Some(tab) = self.workspace.get_mut(tab_id) else {
+            return;
+        };
+        let (Some(connection), Some(paging)) = (tab.connection, &tab.paging) else {
+            return;
+        };
+        if tab.running.is_some() || !paging.has_more {
+            return;
+        }
+        let limit = if all {
+            max_rows.saturating_sub(paging.loaded)
+        } else {
+            Page::SIZE.min(max_rows.saturating_sub(paging.loaded))
+        };
+        if limit == 0 {
+            return;
+        }
+        let options = ExecOptions {
+            page: Some(Page {
+                offset: paging.loaded,
+                limit,
+            }),
+        };
+        let executed = tab.last_run.as_ref().map_or_else(
+            || Executed {
+                offset: 0,
+                sql: paging.base.clone(),
+            },
+            |(executed, _)| executed.clone(),
+        );
+        self.start(tab_id, connection, executed, options, true);
+    }
+
+    /// Runs the shown result again.
+    fn refresh(&mut self, ctx: &egui::Context, tab_id: TabId) {
+        let Some(tab) = self.workspace.get(tab_id) else {
+            return;
+        };
+        if tab.data().is_some() {
+            self.run_data(ctx, tab_id);
+            return;
+        }
+        let (Some(connection), Some((executed, options))) = (tab.connection, tab.last_run.clone())
+        else {
+            return;
+        };
+        if tab.running.is_some() || !self.backend.is_connected(connection) {
+            return;
+        }
+        let options = ExecOptions {
+            page: options.page.map(|_| Page::first()),
+        };
+        self.start(tab_id, connection, executed, options, false);
+    }
+
+    fn count_rows(&mut self, tab_id: TabId) {
+        let Some(tab) = self.workspace.get_mut(tab_id) else {
+            return;
+        };
+        let (Some(connection), Some(paging)) = (tab.connection, &mut tab.paging) else {
+            return;
+        };
+        if matches!(paging.total, Some(Count::Running(_))) {
+            return;
+        }
+        let request = self.backend.count(connection, paging.base.clone());
+        paging.total = Some(Count::Running(request));
     }
 
     // ---- actions ----------------------------------------------------------
@@ -446,29 +641,44 @@ impl VioletApp {
                 let title = self.workspace.next_script_title();
                 let connection =
                     connection.or_else(|| self.workspace.active().and_then(|tab| tab.connection));
-                self.workspace.open(title, connection, sql, false);
+                self.workspace.open(title, connection, sql, TabKind::Script);
             }
             Action::OpenData {
                 connection,
                 schema,
                 relation,
             } => {
-                let existing = self.workspace.tabs.iter().find(|tab| {
-                    tab.data_view && tab.connection == Some(connection) && tab.title == relation
-                });
-                if let Some(tab) = existing {
-                    self.workspace.active = Some(tab.id);
+                if let Some(tab) = self.workspace.data_tab(connection, &schema, &relation) {
+                    self.workspace.active = Some(tab);
                     return;
                 }
-                let Some(sql) = self.backend.select_rows_sql(connection, &schema, &relation) else {
-                    return;
-                };
-                let tab = self
-                    .workspace
-                    .open(relation, Some(connection), format!("{sql};"), true);
-                self.run(ctx, tab, RunScope::Script);
+                let view = DataView::new(schema, relation.clone());
+                let tab = self.workspace.open(
+                    relation,
+                    Some(connection),
+                    String::new(),
+                    TabKind::Data(view),
+                );
+                self.run_data(ctx, tab);
             }
             Action::Run(tab, scope) => self.run(ctx, tab, scope),
+            Action::RefreshTab(tab) => self.refresh(ctx, tab),
+            Action::ApplyFilter(tab) => self.run_data(ctx, tab),
+            Action::ClearFilter(tab) => {
+                if let Some(view) = self.workspace.get_mut(tab).and_then(|t| t.data_mut()) {
+                    view.filter.clear();
+                }
+                self.run_data(ctx, tab);
+            }
+            Action::Sort(tab, column) => {
+                if let Some(view) = self.workspace.get_mut(tab).and_then(|t| t.data_mut()) {
+                    view.cycle_order(&column);
+                }
+                self.run_data(ctx, tab);
+            }
+            Action::FetchMore(tab) => self.fetch_more(tab, false),
+            Action::FetchAll(tab) => self.fetch_more(tab, true),
+            Action::CountRows(tab) => self.count_rows(tab),
             Action::Cancel(tab_id) => {
                 if let Some(tab) = self.workspace.get_mut(tab_id)
                     && let Some(running) = &mut tab.running
@@ -591,12 +801,25 @@ impl VioletApp {
                 chrome::toolbar(ui, tab, profiles, explorer, actions)
             });
 
+        // A data tab is all grid, under its filter bar.
+        if tab.data().is_some() {
+            Panel::top(Id::new(("filter", tab.id)))
+                .exact_size(40.0)
+                .frame(
+                    Frame::NONE
+                        .fill(palette.window)
+                        .stroke(Stroke::new(1.0, palette.outline)),
+                )
+                .show_separator_line(false)
+                .show(ui, |ui| chrome::filter_bar(ui, tab, actions));
+            egui::CentralPanel::default()
+                .frame(Frame::NONE.fill(palette.window))
+                .show(ui, |ui| results::show(ui, tab, actions));
+            return;
+        }
+
         let total = ui.available_height();
-        let results_height = if tab.data_view {
-            total * 0.78
-        } else {
-            total * 0.5
-        };
+        let results_height = total * 0.5;
         Panel::bottom(Id::new(("results", tab.id)))
             .resizable(true)
             .default_size(results_height)
@@ -640,6 +863,13 @@ impl VioletApp {
 }
 
 impl eframe::App for VioletApp {
+    #[cfg(debug_assertions)]
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if let Some(snapshot) = &mut self.snapshot {
+            snapshot.inject(raw_input);
+        }
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_events(ctx);
         self.shortcuts(ctx);
