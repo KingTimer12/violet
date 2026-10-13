@@ -10,8 +10,8 @@
 use std::time::Duration;
 
 use violet_core::{
-    ConnectionProfile, Credentials, Driver, DriverId, ErrorKind, ExecLimits, ObjectKind, Secret,
-    SslMode,
+    ConnectionProfile, Credentials, Driver, DriverId, ErrorKind, ExecLimits, ObjectKind, Row,
+    Secret, SslMode,
 };
 use violet_postgres::PostgresDriver;
 
@@ -111,14 +111,14 @@ async fn browses_queries_and_cancels() {
     assert_eq!(set.columns[0].type_name.as_deref(), Some("int4"));
     assert!(set.columns[0].numeric && !set.columns[1].numeric);
     assert_eq!(
-        set.rows[0],
-        vec![
+        set.rows.row(0).map(Row::to_vec),
+        Some(vec![
             Some("1".into()),
             Some("Ada".into()),
             Some("1815-12-10".into())
-        ]
+        ])
     );
-    assert_eq!(set.rows[1][2], None);
+    assert_eq!(set.rows.get(1, 2), Some(None));
 
     // Several statements: one set each, commands with counts.
     let sets = session
@@ -130,7 +130,10 @@ async fn browses_queries_and_cancels() {
         .expect("script");
     assert_eq!(sets.len(), 3);
     assert!(!sets[0].has_rows() && sets[0].affected == Some(2));
-    assert_eq!(sets[1].rows, vec![vec![Some("1".into())]]);
+    assert_eq!(
+        sets[1].rows.iter().map(Row::to_vec).collect::<Vec<_>>(),
+        vec![vec![Some("1".into())]]
+    );
     assert!(sets[2].has_rows() && sets[2].rows.is_empty());
 
     // Row limit.

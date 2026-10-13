@@ -1,6 +1,8 @@
 //! The results pane: a grid per result set, command summaries, errors, and
 //! the progress of a running query.
 
+use std::borrow::Cow;
+
 use egui::{Align, CornerRadius, Layout, RichText, Sense, Stroke, Ui, Vec2};
 use egui_extras::{Column, TableBuilder};
 use violet_core::{DbError, ResultSet};
@@ -176,9 +178,9 @@ fn grid(
     if copy
         && !ui.ctx().egui_wants_keyboard_input()
         && let Some((row, column)) = *selected
-        && let Some(value) = set.rows.get(row).and_then(|r| r.get(column))
+        && let Some(value) = set.rows.get(row, column)
     {
-        actions.push(Action::Copy(value.clone().unwrap_or_default()));
+        actions.push(Action::Copy(value.unwrap_or_default().to_owned()));
     }
 
     egui::ScrollArea::horizontal()
@@ -239,7 +241,10 @@ fn grid(
                                 );
                             });
                         });
-                        for (column, value) in set.rows[index].iter().enumerate() {
+                        let Some(cells) = set.rows.row(index) else {
+                            return;
+                        };
+                        for (column, value) in cells.iter().enumerate() {
                             let meta = &set.columns[column];
                             let (_, response) = row.col(|ui| {
                                 let is_selected = *selected == Some((index, column));
@@ -289,8 +294,10 @@ fn grid(
                             if response.clicked() {
                                 *selected = Some((index, column));
                             }
-                            if let Some(text) = value.as_deref()
-                                && (text.chars().count() > 40 || text.contains('\n'))
+                            // Long values get a tooltip; only measured when hovered.
+                            if response.hovered()
+                                && let Some(text) = value
+                                && (text.len() > 40 || text.contains('\n'))
                             {
                                 response.clone().on_hover_ui(|ui| {
                                     ui.set_max_width(480.0);
@@ -300,10 +307,13 @@ fn grid(
                             response.context_menu(|ui| {
                                 *selected = Some((index, column));
                                 if super::sidebar::menu_item(ui, Icon::Copy, "Copy value") {
-                                    actions.push(Action::Copy(value.clone().unwrap_or_default()));
+                                    actions
+                                        .push(Action::Copy(value.unwrap_or_default().to_owned()));
                                 }
                                 if super::sidebar::menu_item(ui, Icon::Rows, "Copy row") {
-                                    actions.push(Action::Copy(row_text(&set.rows[index], '\t')));
+                                    let mut text = String::new();
+                                    write_row(&mut text, cells.iter(), '\t');
+                                    actions.push(Action::Copy(text));
                                 }
                                 if super::sidebar::menu_item(ui, Icon::Columns, "Copy column name")
                                 {
@@ -316,13 +326,19 @@ fn grid(
         });
 }
 
-fn preview(text: &str) -> String {
+/// The first line, at most [`CELL_PREVIEW`] characters. Borrowed in the
+/// common case, so drawing a cell allocates nothing.
+fn preview(text: &str) -> Cow<'_, str> {
     let line = text.lines().next().unwrap_or_default();
-    let mut preview: String = line.chars().take(CELL_PREVIEW).collect();
-    if preview.len() < text.len() {
-        preview.push('…');
+    let end = line
+        .char_indices()
+        .nth(CELL_PREVIEW)
+        .map_or(line.len(), |(at, _)| at);
+    if end == text.len() {
+        Cow::Borrowed(text)
+    } else {
+        Cow::Owned(format!("{}…", &line[..end]))
     }
-    preview
 }
 
 /// A starting width from the header and the first rows' lengths.
@@ -331,7 +347,7 @@ fn column_width(set: &ResultSet, index: usize, name: &str) -> f32 {
         .rows
         .iter()
         .take(64)
-        .filter_map(|row| row.get(index).and_then(|value| value.as_deref()))
+        .filter_map(|row| row.get(index).flatten())
         .map(|value| value.lines().next().unwrap_or_default().chars().count())
         .max()
         .unwrap_or(4)
@@ -412,38 +428,49 @@ fn error_card(ui: &mut Ui, error: &DbError, executed: &Executed, editor: &str) {
         });
 }
 
-fn row_text(row: &[Option<String>], separator: char) -> String {
-    row.iter()
-        .map(|value| escape(value.as_deref().unwrap_or_default(), separator))
-        .collect::<Vec<_>>()
-        .join(&separator.to_string())
-}
-
-/// Quotes a field when it holds the separator, a quote or a line break.
-fn escape(value: &str, separator: char) -> String {
-    if value.contains(separator)
-        || value.contains('"')
-        || value.contains('\n')
-        || value.contains('\r')
-    {
-        format!("\"{}\"", value.replace('"', "\"\""))
-    } else {
-        value.to_owned()
+/// Appends one delimited line of `cells` to `out`; `NULL` is empty.
+fn write_row<'a>(out: &mut String, cells: impl Iterator<Item = Option<&'a str>>, separator: char) {
+    for (index, value) in cells.enumerate() {
+        if index > 0 {
+            out.push(separator);
+        }
+        write_field(out, value.unwrap_or_default(), separator);
     }
 }
 
-/// The set as CSV (or TSV), header first.
+/// Appends a field, quoted when it holds the separator, a quote or a line
+/// break.
+fn write_field(out: &mut String, value: &str, separator: char) {
+    let quote = value
+        .chars()
+        .any(|c| c == separator || matches!(c, '"' | '\n' | '\r'));
+    if quote {
+        out.push('"');
+        for (index, part) in value.split('"').enumerate() {
+            if index > 0 {
+                out.push_str("\"\"");
+            }
+            out.push_str(part);
+        }
+        out.push('"');
+    } else {
+        out.push_str(value);
+    }
+}
+
+/// The set as CSV (or TSV), header first, built in one buffer sized up
+/// front.
 pub fn to_delimited(set: &ResultSet, separator: char) -> String {
-    let mut out = String::new();
-    let header: Vec<String> = set
-        .columns
-        .iter()
-        .map(|c| escape(&c.name, separator))
-        .collect();
-    out.push_str(&header.join(&separator.to_string()));
-    for row in &set.rows {
+    let cells = set.rows.len() * set.columns.len();
+    let mut out = String::with_capacity(set.rows.text_len() + cells + 64);
+    write_row(
+        &mut out,
+        set.columns.iter().map(|c| Some(c.name.as_str())),
+        separator,
+    );
+    for row in set.rows.iter() {
         out.push('\n');
-        out.push_str(&row_text(row, separator));
+        write_row(&mut out, row.iter(), separator);
     }
     out
 }
@@ -456,7 +483,7 @@ mod tests {
 
     #[test]
     fn csv_quotes_only_what_needs_it() {
-        let set = ResultSet {
+        let mut set = ResultSet {
             columns: vec![
                 ColumnMeta {
                     name: "id".into(),
@@ -469,13 +496,11 @@ mod tests {
                     numeric: false,
                 },
             ],
-            rows: vec![
-                vec![Some("1".into()), Some("plain".into())],
-                vec![Some("2".into()), Some("a, \"b\"\nc".into())],
-                vec![Some("3".into()), None],
-            ],
             ..ResultSet::default()
         };
+        set.rows.push([Some("1"), Some("plain")]);
+        set.rows.push([Some("2"), Some("a, \"b\"\nc")]);
+        set.rows.push([Some("3"), None]);
         assert_eq!(
             to_delimited(&set, ','),
             "id,note\n1,plain\n2,\"a, \"\"b\"\"\nc\"\n3,"
@@ -486,5 +511,8 @@ mod tests {
     fn previews_show_the_first_line() {
         assert_eq!(preview("one\ntwo"), "one…");
         assert_eq!(preview("short"), "short");
+        assert!(matches!(preview("short"), Cow::Borrowed(_)));
+        let long = "x".repeat(CELL_PREVIEW + 5);
+        assert_eq!(preview(&long).chars().count(), CELL_PREVIEW + 1);
     }
 }

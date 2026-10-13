@@ -10,7 +10,7 @@ use tokio_postgres::{CancelToken, Client, Config, NoTls, SimpleQueryMessage};
 use violet_core::driver::AnsiDialect;
 use violet_core::{
     Canceller, ColumnInfo, ColumnMeta, ConnectionProfile, Credentials, DbObject, Dialect,
-    ExecLimits, ObjectKind, Result, ResultSet, ServerInfo, Session, SslMode,
+    ExecLimits, ObjectKind, Result, ResultSet, Rows, ServerInfo, Session, SslMode,
 };
 
 use crate::{catalog, error, tls};
@@ -220,6 +220,7 @@ impl Session for PgSession {
                         .as_ref()
                         .filter(|types| sets.is_empty() && types.len() == columns.len());
                     current = Some(ResultSet {
+                        rows: Rows::new(columns.len()),
                         columns: columns
                             .iter()
                             .enumerate()
@@ -238,11 +239,7 @@ impl Session for PgSession {
                 SimpleQueryMessage::Row(row) => {
                     let set = current.get_or_insert_with(ResultSet::default);
                     if set.rows.len() < limits.max_rows {
-                        set.rows.push(
-                            (0..row.len())
-                                .map(|i| row.get(i).map(str::to_owned))
-                                .collect(),
-                        );
+                        set.rows.push((0..row.len()).map(|i| row.get(i)));
                     } else {
                         // Keep reading so later statements still run, but
                         // hold no more rows in memory.
