@@ -272,7 +272,6 @@ fn connection(
         });
     }
     response.context_menu(|ui| {
-        ui.set_min_width(190.0);
         if link.is_online() {
             if menu_item(ui, Icon::Terminal, "New SQL editor") {
                 actions.push(Action::OpenEditor {
@@ -487,7 +486,6 @@ fn object_node(
         });
     }
     response.context_menu(|ui| {
-        ui.set_min_width(190.0);
         if relation {
             if menu_item(ui, Icon::Rows, "View data") {
                 actions.push(Action::OpenData {
@@ -576,16 +574,22 @@ fn error_row(ui: &mut Ui, depth: usize, error: &str) {
 }
 
 /// A menu entry with an icon. Returns whether it was chosen.
+///
+/// Menus lay entries out justified, so each one spans the widest entry; the
+/// menu is as wide as its longest label, not as wide as the window.
 pub fn menu_item(ui: &mut Ui, icon: Icon, label: &str) -> bool {
     let palette = Palette::current(ui.ctx());
     let image = icon.image(palette.secondary, 14.0);
     ui.add(
         egui::Button::image_and_text(image, label)
             .frame(false)
-            .min_size(Vec2::new(ui.available_width(), 26.0)),
+            .min_size(Vec2::new(MENU_MIN_WIDTH, 26.0)),
     )
     .clicked()
 }
+
+/// Narrowest a context menu gets, so short menus do not look cramped.
+const MENU_MIN_WIDTH: f32 = 150.0;
 
 /// Whether `name` contains `filter` (already lower case), ignoring case.
 /// ASCII filters, the usual kind, compare in place without allocating.
