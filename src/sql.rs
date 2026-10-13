@@ -286,9 +286,17 @@ impl Iterator for Tokens<'_> {
                 at = skip_while(bytes, at, |b| {
                     b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80
                 });
-                // `E'...'` and friends are strings with a prefix.
+                // `E'...'` and friends are strings with a prefix. Only `E`
+                // strings treat a backslash as an escape: `E'\''` is one
+                // string, and reading it as `E'\'` then `'` would let a `;`
+                // inside the literal split the statement differently from
+                // the server.
                 if at - start == 1 && bytes.get(at) == Some(&b'\'') {
-                    at = quoted_end(bytes, at, b'\'');
+                    at = if bytes[start].eq_ignore_ascii_case(&b'e') {
+                        escaped_quoted_end(bytes, at)
+                    } else {
+                        quoted_end(bytes, at, b'\'')
+                    };
                     TokenKind::String
                 } else {
                     word_kind(&source[start..at])
@@ -367,6 +375,21 @@ fn quoted_end(bytes: &[u8], mut at: usize, quote: u8) -> usize {
             return at + 1;
         }
         at += 1;
+    }
+    bytes.len()
+}
+
+/// The end of an `E'...'` body opening at `at`, where a backslash escapes
+/// the next character as well as a doubled quote ending nothing.
+fn escaped_quoted_end(bytes: &[u8], mut at: usize) -> usize {
+    at += 1;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' => at += 2,
+            b'\'' if bytes.get(at + 1) == Some(&b'\'') => at += 2,
+            b'\'' => return at + 1,
+            _ => at += 1,
+        }
     }
     bytes.len()
 }
@@ -526,6 +549,27 @@ mod tests {
         );
         assert_eq!(word_kind("sélect"), TokenKind::Identifier);
         assert_eq!(word_kind("TimestampTZ"), TokenKind::Type);
+    }
+
+    #[test]
+    fn escape_strings_hide_semicolons() {
+        // The server reads one literal; splitting at the `;` inside it would
+        // run `DROP TABLE x` on its own from the statement under the cursor.
+        let source = "SELECT E'\\'; DROP TABLE x; --'";
+        assert_eq!(statements(source), vec![0..source.len()]);
+        assert_eq!(
+            kinds("e'a\\\\' x E'it''s\\n'"),
+            vec![
+                (TokenKind::String, "e'a\\\\'"),
+                (TokenKind::Identifier, "x"),
+                (TokenKind::String, "E'it''s\\n'"),
+            ]
+        );
+        // Only `E` strings escape: in a standard string a backslash is text.
+        let plain = "SELECT '\\'; SELECT 2";
+        assert_eq!(statements(plain).len(), 2);
+        // A trailing backslash cannot read past the end.
+        assert_eq!(kinds("E'\\"), vec![(TokenKind::String, "E'\\")]);
     }
 
     #[test]
