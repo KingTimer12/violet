@@ -57,6 +57,7 @@ fn main() -> eframe::Result {
                 log::warn!("settings: {error}");
                 None
             });
+            #[cfg_attr(not(debug_assertions), allow(unused_mut))]
             let mut settings: Settings = settings.unwrap_or_default();
             #[cfg(debug_assertions)]
             if let Ok(theme) = std::env::var("VIOLET_THEME") {
