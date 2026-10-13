@@ -48,7 +48,7 @@ pub enum Action {
         relation: String,
     },
     Run(TabId, RunScope),
-    /// Reads the shown result again.
+    /// Reads the shown result again, skipping the cache.
     RefreshTab(TabId),
     /// Applies a data tab's filter box.
     ApplyFilter(TabId),

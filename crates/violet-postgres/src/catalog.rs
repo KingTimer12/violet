@@ -42,3 +42,15 @@ pub(crate) const COLUMNS: &str = "SELECT a.attname::text, \
      LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
      WHERE n.nspname = $1 AND c.relname = $2 AND a.attnum > 0 AND NOT a.attisdropped \
      ORDER BY a.attnum";
+
+/// Changes whenever rows may have been written or the schema changed:
+/// - the write counters of every table (inserts, updates, deletes), which
+///   the server publishes when a transaction ends, within about a second;
+/// - the transaction ids of `pg_class` rows, which DDL, `TRUNCATE` and
+///   `ALTER` rewrite;
+/// - the number of relations, for `CREATE` and `DROP`.
+pub const CHANGE_TOKEN: &str = "SELECT concat_ws('/', \
+     (SELECT coalesce(sum(n_tup_ins + n_tup_upd + n_tup_del), 0) \
+      FROM pg_catalog.pg_stat_all_tables), \
+     (SELECT coalesce(sum(xmin::text::bigint), 0) FROM pg_catalog.pg_class), \
+     (SELECT count(*) FROM pg_catalog.pg_class))";

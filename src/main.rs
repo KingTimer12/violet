@@ -13,9 +13,11 @@ mod ui;
 use std::sync::Arc;
 
 use violet_app::{Backend, DriverRegistry, ProfileService};
-use violet_core::ports::{ProfileRepository, SecretStore};
+use violet_core::ports::{ProfileRepository, ResultCache, SecretStore};
 use violet_postgres::PostgresDriver;
-use violet_storage::{AppDirs, JsonFile, JsonProfileRepository, KeyringSecretStore};
+use violet_storage::{
+    AppDirs, JsonFile, JsonProfileRepository, KeyringSecretStore, MemoryResultCache,
+};
 
 use settings::Settings;
 use ui::{Services, VioletApp};
@@ -86,7 +88,11 @@ fn main() -> eframe::Result {
 
             let registry = DriverRegistry::new().with(PostgresDriver);
             let repaint = ctx.clone();
-            let backend = Backend::start(registry, secrets, move || repaint.request_repaint())?;
+            // Read-only results are kept in memory only, never on disk.
+            let cache: Arc<dyn ResultCache> = Arc::new(MemoryResultCache::default());
+            let backend = Backend::start(registry, secrets, cache, move || {
+                repaint.request_repaint();
+            })?;
 
             let services = Services {
                 backend,

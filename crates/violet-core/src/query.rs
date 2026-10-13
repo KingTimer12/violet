@@ -126,6 +126,12 @@ impl Rows {
         self.text.len()
     }
 
+    /// Roughly the heap the grid holds, for cache budgets.
+    #[must_use]
+    pub fn heap_size(&self) -> usize {
+        self.text.capacity() + self.ends.capacity() * std::mem::size_of::<usize>()
+    }
+
     /// Keeps the first `rows` rows.
     pub fn truncate(&mut self, rows: usize) {
         let cells = rows.saturating_mul(self.width);
@@ -212,6 +218,9 @@ pub struct QueryOutput {
     pub elapsed: Duration,
     /// Set when the run read one page of a longer result.
     pub page: Option<PageInfo>,
+    /// How old the result was when it came from the cache instead of the
+    /// server.
+    pub cached: Option<Duration>,
 }
 
 /// A window of a query's rows, as a data view fetches them.

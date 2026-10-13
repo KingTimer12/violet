@@ -480,6 +480,55 @@ const READ_STARTS: &[&str] = &["EXPLAIN", "SELECT", "SHOW", "TABLE", "VALUES", "
 /// `FOR UPDATE` style locks.
 const WRITING_WORDS: &[&str] = &["ANALYZE", "DELETE", "INSERT", "INTO", "MERGE", "UPDATE"];
 
+/// Functions whose result changes without any data changing, or that have
+/// side effects. A query calling them is never cached.
+const VOLATILE_FUNCTIONS: &[&str] = &[
+    "CLOCK_TIMESTAMP",
+    "CURRVAL",
+    "DBLINK",
+    "DBLINK_EXEC",
+    "GEN_RANDOM_UUID",
+    "LASTVAL",
+    "LO_EXPORT",
+    "LO_IMPORT",
+    "NEXTVAL",
+    "NOW",
+    "PG_ADVISORY_LOCK",
+    "PG_ADVISORY_XACT_LOCK",
+    "PG_BACKEND_PID",
+    "PG_CANCEL_BACKEND",
+    "PG_CURRENT_XACT_ID",
+    "PG_NOTIFY",
+    "PG_READ_FILE",
+    "PG_SLEEP",
+    "PG_TERMINATE_BACKEND",
+    "PG_TRY_ADVISORY_LOCK",
+    "RANDOM",
+    "SETSEED",
+    "SETVAL",
+    "SET_CONFIG",
+    "STATEMENT_TIMESTAMP",
+    "TIMEOFDAY",
+    "TRANSACTION_TIMESTAMP",
+    "TXID_CURRENT",
+    "UUID_GENERATE_V1",
+    "UUID_GENERATE_V4",
+];
+
+/// Values and views that move on their own: the clock, and live server
+/// state. `pg_stat*` views are matched by prefix.
+const VOLATILE_NAMES: &[&str] = &[
+    "CURRENT_DATE",
+    "CURRENT_TIME",
+    "CURRENT_TIMESTAMP",
+    "LOCALTIME",
+    "LOCALTIMESTAMP",
+    "PG_CURSORS",
+    "PG_LOCKS",
+    "PG_PREPARED_XACTS",
+    "PG_REPLICATION_SLOTS",
+];
+
 /// A statement's words, upper-cased, each with whether a `(` follows it.
 fn words(text: &str) -> Vec<(String, bool)> {
     let mut words: Vec<(String, bool)> = Vec::new();
@@ -508,35 +557,51 @@ fn words(text: &str) -> Vec<(String, bool)> {
 /// What the app may do with a piece of SQL besides running it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Plan {
-    /// A single read-only query that can be read a page at a time: its text
-    /// without the trailing `;`.
+    /// Every statement only reads, and gives the same rows for the same
+    /// data: its result may be cached.
+    pub cacheable: bool,
+    /// A single query that can be read a page at a time: its text without
+    /// the trailing `;`.
     pub pageable: Option<String>,
 }
 
-/// Decides whether `source` may be paged. It errs on the side of running:
-/// anything unclear is not.
+/// Decides whether `source` may be cached and paged. It errs on the side of
+/// running: anything unclear is neither.
 #[must_use]
 pub fn plan(source: &str) -> Plan {
     let ranges = statements(source);
-    let [range] = ranges.as_slice() else {
+    if ranges.is_empty() {
         return Plan::default();
-    };
-    let words = words(&source[range.clone()]);
-    let first = words.first().map(|(word, _)| word.as_str());
-    let reads = first.is_some_and(|word| READ_STARTS.contains(&word))
-        && !matches!(first, Some("EXPLAIN" | "SHOW"));
-    let writes = words.iter().enumerate().any(|(index, (word, _))| {
-        WRITING_WORDS.contains(&word.as_str())
-            || (word == "FOR"
-                && words.get(index + 1).is_some_and(|(next, _)| {
-                    matches!(next.as_str(), "UPDATE" | "SHARE" | "NO" | "KEY")
-                }))
+    }
+    let mut cacheable = true;
+    let mut pageable = ranges.len() == 1;
+    for range in &ranges {
+        let words = words(&source[range.clone()]);
+        let first = words.first().map(|(word, _)| word.as_str());
+        let reads = first.is_some_and(|word| READ_STARTS.contains(&word));
+        pageable &= first.is_some_and(|word| !matches!(word, "EXPLAIN" | "SHOW"));
+        let writes = words.iter().enumerate().any(|(index, (word, _))| {
+            WRITING_WORDS.contains(&word.as_str())
+                || (word == "FOR"
+                    && words.get(index + 1).is_some_and(|(next, _)| {
+                        matches!(next.as_str(), "UPDATE" | "SHARE" | "NO" | "KEY")
+                    }))
+        });
+        let volatile = words.iter().any(|(word, called)| {
+            word.starts_with("PG_STAT")
+                || VOLATILE_NAMES.binary_search(&word.as_str()).is_ok()
+                || (*called && VOLATILE_FUNCTIONS.binary_search(&word.as_str()).is_ok())
+        });
+        cacheable &= reads && !writes && !volatile;
+        pageable &= reads && !writes;
+    }
+    let pageable = pageable.then(|| {
+        let text = &source[ranges[0].clone()];
+        text.trim_end().trim_end_matches(';').trim_end().to_owned()
     });
     Plan {
-        pageable: (reads && !writes).then(|| {
-            let text = &source[range.clone()];
-            text.trim_end().trim_end_matches(';').trim_end().to_owned()
-        }),
+        cacheable,
+        pageable,
     }
 }
 
@@ -603,7 +668,12 @@ mod tests {
                 .chain(TYPES)
                 .all(|w| w.len() <= LONGEST_WORD && w.is_ascii())
         );
-        for list in [READ_STARTS, WRITING_WORDS] {
+        for list in [
+            READ_STARTS,
+            WRITING_WORDS,
+            VOLATILE_FUNCTIONS,
+            VOLATILE_NAMES,
+        ] {
             assert!(list.windows(2).all(|w| w[0] < w[1]), "{list:?}");
         }
     }
@@ -697,23 +767,49 @@ mod tests {
     }
 
     #[test]
-    fn only_single_plain_reads_are_paged() {
+    fn only_plain_reads_are_cached_and_paged() {
         let read = plan("select * from users where id > 1;  -- done");
+        assert!(read.cacheable);
         assert_eq!(
             read.pageable.as_deref(),
             Some("select * from users where id > 1")
         );
-        assert!(plan("SELECT 1; SELECT 2;").pageable.is_none());
-        for not_paged in [
+
+        // Several reads: cached, not paged.
+        let script = plan("SELECT 1; SELECT 2;");
+        assert!(script.cacheable && script.pageable.is_none());
+
+        for writes in [
             "UPDATE t SET a = 1",
             "WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x",
             "SELECT * INTO copy FROM t",
             "SELECT * FROM t FOR UPDATE",
-            "EXPLAIN SELECT 1",
-            "SHOW search_path",
+            "EXPLAIN ANALYZE SELECT 1",
+            "SELECT 1; DROP TABLE t",
+            "SET search_path TO x",
         ] {
-            assert!(plan(not_paged).pageable.is_none(), "{not_paged}");
+            let plan = plan(writes);
+            assert!(!plan.cacheable, "{writes}");
+            assert!(plan.pageable.is_none(), "{writes}");
         }
+
+        // Same data, different answer: never cached, still paged.
+        for volatile in [
+            "SELECT now()",
+            "SELECT random()",
+            "SELECT nextval('s')",
+            "SELECT current_timestamp",
+            "SELECT * FROM pg_stat_activity",
+            "SELECT * FROM pg_locks",
+        ] {
+            assert!(!plan(volatile).cacheable, "{volatile}");
+        }
+        // A column merely named like a function is fine.
+        assert!(plan("SELECT now_playing, random_id FROM t").cacheable);
+
+        // Read-only but not a row source to wrap.
+        let explain = plan("EXPLAIN SELECT 1");
+        assert!(explain.cacheable && explain.pageable.is_none());
         assert_eq!(plan("-- nothing"), Plan::default());
         // Semicolons inside strings do not split.
         assert!(plan("SELECT ';' AS semi").pageable.is_some());

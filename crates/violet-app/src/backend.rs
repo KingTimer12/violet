@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use tokio::runtime::Runtime;
-use violet_core::ports::SecretStore;
+use violet_core::ports::{CacheKey, CachedOutput, ResultCache, SecretStore};
 use violet_core::{
     Canceller, ColumnInfo, ConnectionId, ConnectionProfile, Credentials, DbError, DbObject,
     ErrorKind, ExecLimits, OrderBy, Page, PageInfo, QueryOutput, Result, Secret, ServerInfo,
@@ -28,17 +28,35 @@ impl<F: Fn() + Send + Sync + 'static> Notify for F {
     }
 }
 
+/// Whether a run may use the result cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CachePolicy {
+    /// A read-only query: answer from the cache when nothing changed since,
+    /// else run it and keep the result.
+    Use,
+    /// A read-only query the user asked to refresh: run it and keep the
+    /// result.
+    Refresh,
+    /// Anything else. It runs, and every result cached for the connection
+    /// is dropped afterwards, since it may have written.
+    Off,
+}
+
 /// How to run a query.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExecOptions {
+    pub cache: CachePolicy,
     /// Read only this window of the rows. The query must be a single
     /// read-only statement.
     pub page: Option<Page>,
 }
 
 impl ExecOptions {
-    /// Every row at once.
-    pub const WHOLE: Self = Self { page: None };
+    /// A statement that may write: no cache, no paging.
+    pub const WRITE: Self = Self {
+        cache: CachePolicy::Off,
+        page: None,
+    };
 }
 
 /// Identifies one query or connection test, to match its result and to
@@ -96,6 +114,7 @@ type Running = HashMap<RequestId, Arc<dyn Canceller>>;
 struct Shared {
     registry: DriverRegistry,
     secrets: Arc<dyn SecretStore>,
+    cache: Arc<dyn ResultCache>,
     sessions: Mutex<Sessions>,
     running: Mutex<Running>,
     events: Mutex<Sender<Event>>,
@@ -165,7 +184,7 @@ impl Shared {
         Ok((session, server))
     }
 
-    /// Runs `sql` on `id`'s session as `options` say.
+    /// Runs `sql` on `id`'s session as `options` say, through the cache.
     async fn query(
         &self,
         request: RequestId,
@@ -193,12 +212,40 @@ impl Shared {
             }
             None => (sql, 0),
         };
+        let cacheable = options.cache != CachePolicy::Off;
+        let key = CacheKey {
+            connection: id,
+            sql: sent,
+        };
+
+        // The token is read before the query, so a change racing it makes
+        // the stored token stale rather than the stored rows.
+        let token = if cacheable {
+            session.change_token().await.unwrap_or_else(|error| {
+                log::debug!("change token unavailable: {error}");
+                None
+            })
+        } else {
+            None
+        };
+        if options.cache == CachePolicy::Use
+            && let Some(hit) = self.cache.get(&key)
+            && hit.token == token
+        {
+            let mut output = (*hit.output).clone();
+            output.cached = Some(hit.stored.elapsed());
+            return Ok(output);
+        }
+
         if let Some(canceller) = session.canceller() {
             self.running().insert(request, Arc::from(canceller));
         }
         let started = Instant::now();
-        let result = session.execute(&sent, limits).await;
+        let result = session.execute(&key.sql, limits).await;
         self.running().remove(&request);
+        if !cacheable {
+            self.cache.invalidate(id);
+        }
         let mut sets = result.map_err(|mut error| {
             // Point at the user's text, not the paging wrapper around it.
             error.position = error
@@ -225,7 +272,18 @@ impl Shared {
             sets,
             elapsed: started.elapsed(),
             page,
+            cached: None,
         };
+        if cacheable {
+            self.cache.put(
+                key,
+                CachedOutput {
+                    output: Arc::new(output.clone()),
+                    token,
+                    stored: Instant::now(),
+                },
+            );
+        }
         Ok(output)
     }
 }
@@ -245,6 +303,7 @@ impl Backend {
     pub fn start(
         registry: DriverRegistry,
         secrets: Arc<dyn SecretStore>,
+        cache: Arc<dyn ResultCache>,
         notify: impl Notify,
     ) -> std::io::Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -258,6 +317,7 @@ impl Backend {
             shared: Arc::new(Shared {
                 registry,
                 secrets,
+                cache,
                 sessions: Mutex::default(),
                 running: Mutex::default(),
                 events: Mutex::new(sender),
@@ -315,6 +375,9 @@ impl Backend {
             let id = profile.id;
             match shared.open(&profile, password).await {
                 Ok((session, server)) => {
+                    // A new session may see other data (another database,
+                    // another user): nothing cached carries over.
+                    shared.cache.invalidate(id);
                     let previous = shared.sessions().insert(id, Arc::from(session));
                     if let Some(previous) = previous {
                         previous.close().await;
@@ -344,6 +407,7 @@ impl Backend {
     }
 
     pub fn disconnect(&self, id: ConnectionId) {
+        self.shared.cache.invalidate(id);
         let session = self.shared.sessions().remove(&id);
         let shared = Arc::clone(&self.shared);
         self.runtime.spawn(async move {
@@ -412,9 +476,11 @@ impl Backend {
         self.runtime.spawn(async move {
             let result = async {
                 let count = shared.session(id)?.dialect().count(&sql);
-                let output = shared
-                    .query(request, id, count, ExecOptions::WHOLE, limits)
-                    .await?;
+                let options = ExecOptions {
+                    cache: CachePolicy::Use,
+                    page: None,
+                };
+                let output = shared.query(request, id, count, options, limits).await?;
                 output
                     .sets
                     .first()

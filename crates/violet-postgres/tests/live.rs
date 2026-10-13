@@ -188,3 +188,85 @@ async fn a_wrong_password_is_an_authentication_error() {
         .expect("rejected");
     assert_eq!(error.kind, ErrorKind::Authentication, "{error:?}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn change_tokens_track_writes_ddl_and_paging_sql_runs() {
+    let Some((profile, credentials)) = target() else {
+        return;
+    };
+    let reader = PostgresDriver
+        .connect(&profile, &credentials)
+        .await
+        .expect("connect reader");
+    let writer = PostgresDriver
+        .connect(&profile, &credentials)
+        .await
+        .expect("connect writer");
+    let run = |sql: &'static str| {
+        let writer = &writer;
+        async move { writer.execute(sql, ExecLimits::default()).await.expect(sql) }
+    };
+    run(
+        "DROP SCHEMA IF EXISTS violet_cache CASCADE; CREATE SCHEMA violet_cache;
+         CREATE TABLE violet_cache.t AS SELECT g AS n FROM generate_series(1, 450) g",
+    )
+    .await;
+
+    // Statistics reach other sessions when the writer goes idle; give them
+    // a moment, as the cache would in real use.
+    async fn settled(session: &dyn violet_core::Session) -> Option<String> {
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        session.change_token().await.expect("token")
+    }
+    let before = settled(reader.as_ref()).await;
+    assert!(before.is_some());
+    assert_eq!(settled(reader.as_ref()).await, before, "stable while idle");
+
+    run("UPDATE violet_cache.t SET n = n WHERE n = 1").await;
+    let after_write = settled(reader.as_ref()).await;
+    assert_ne!(after_write, before, "a write from another session");
+
+    run("ALTER TABLE violet_cache.t ADD COLUMN note text").await;
+    let after_ddl = settled(reader.as_ref()).await;
+    assert_ne!(after_ddl, after_write, "a schema change");
+
+    run("TRUNCATE violet_cache.t").await;
+    assert_ne!(settled(reader.as_ref()).await, after_ddl, "a truncate");
+
+    // The dialect's paging and counting wrappers are valid PostgreSQL.
+    run("INSERT INTO violet_cache.t (n) SELECT g FROM generate_series(1, 450) g").await;
+    let dialect = reader.dialect();
+    let base = "SELECT n FROM violet_cache.t ORDER BY n;";
+    let base = base.trim_end_matches(';');
+    let paged = dialect.paged(base, 201, 400);
+    let sets = reader
+        .execute(&paged.sql, ExecLimits::default())
+        .await
+        .expect("page");
+    assert_eq!(sets[0].rows.len(), 50);
+    assert_eq!(sets[0].rows.get(0, 0), Some(Some("401")));
+    let sets = reader
+        .execute(&dialect.count(base), ExecLimits::default())
+        .await
+        .expect("count");
+    assert_eq!(sets[0].rows.get(0, 0), Some(Some("450")));
+    let browse = dialect.browse(
+        "violet_cache",
+        "t",
+        Some("n > 440 -- trailing comment"),
+        Some(&violet_core::OrderBy {
+            column: "n".into(),
+            descending: true,
+        }),
+    );
+    let sets = reader
+        .execute(&browse, ExecLimits::default())
+        .await
+        .expect("browse");
+    assert_eq!(sets[0].rows.len(), 10);
+    assert_eq!(sets[0].rows.get(0, 0), Some(Some("450")));
+
+    run("DROP SCHEMA violet_cache CASCADE").await;
+    reader.close().await;
+    writer.close().await;
+}

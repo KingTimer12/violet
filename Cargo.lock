@@ -4641,9 +4641,11 @@ dependencies = [
 name = "violet-app"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "log",
  "tokio",
  "violet-core",
+ "violet-storage",
 ]
 
 [[package]]

@@ -15,11 +15,12 @@ violet (bin)            composition root + egui interface (src/ui)
   │
   ├── violet-core       domain + ports. No I/O, no UI.
   │                     Driver / Session / Canceller / Dialect traits,
-  │                     ProfileRepository / SecretStore traits,
+  │                     ProfileRepository / SecretStore / ResultCache traits,
   │                     ConnectionProfile, ResultSet, DbError, Secret
   │
   ├── violet-postgres   adapter: tokio-postgres + rustls (implements Driver)
-  └── violet-storage    adapters: JSON profiles on disk, keychain secrets
+  └── violet-storage    adapters: JSON profiles on disk, keychain secrets,
+                        in-memory key-value result cache
 ```
 
 Dependencies point inward: drivers and storage depend on `violet-core`;
@@ -38,7 +39,7 @@ is the single place that mutates state or talks to the backend.
 
 The connection form, tree, editor and grid work unchanged.
 
-## Browsing data
+## Browsing data and the result cache
 
 Clicking a table or view in the tree opens its data tab, as in DBeaver
 (the chevron still lists its columns). Rows arrive 200 at a time; the
@@ -47,6 +48,24 @@ counts the rows. Type a `WHERE` condition in the filter bar and press
 Enter; click a column header to sort by it (ascending, descending, off).
 Sorting and filtering run on the server. A single `SELECT` run from an
 editor is paged the same way.
+
+Read-only results are kept in a key-value cache (`ResultCache`, an LRU of
+64 MiB in memory) and shown again without a round trip when nothing
+changed:
+
+- Only plain reads are cached: `SELECT`/`WITH`/`VALUES`/`TABLE`/`SHOW`/
+  `EXPLAIN` without data-modifying CTEs, `SELECT INTO`, `FOR UPDATE`,
+  `EXPLAIN ANALYZE`, or functions and views whose answer moves on its own
+  (`now()`, `random()`, `nextval()`, `pg_stat_*`, ...).
+- Before a cached result is reused, the driver's change token is compared.
+  For PostgreSQL it combines every table's write counters with the
+  catalog's transaction ids, so writes, DDL and `TRUNCATE` from any session
+  invalidate it. Write counters reach other sessions about a second after
+  a transaction ends.
+- Anything else run through Violet on that connection, a reconnect, or the
+  Refresh button drops or bypasses the cache; entries also expire after
+  five minutes. Results served from the cache are marked "Cached" with
+  their age.
 
 ## Security
 
@@ -63,6 +82,8 @@ editor is paged the same way.
 - Catalog queries use bind parameters; generated SQL quotes identifiers.
 - Result sets are capped (10 000 rows) so a stray `SELECT *` cannot exhaust
   memory; running queries can be cancelled server-side.
+- Cached results stay in memory only (never on disk) and go when the app
+  closes or the connection does.
 - The data filter must be one expression: a `;` or unbalanced bracket is
   refused before anything is sent.
 - `unsafe_code = "forbid"` across the workspace.

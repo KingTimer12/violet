@@ -21,7 +21,7 @@ mod workspace;
 use std::time::Instant;
 
 use egui::{Frame, Id, Panel, Stroke};
-use violet_app::{Backend, Event, ExecOptions, ProfileService};
+use violet_app::{Backend, CachePolicy, Event, ExecOptions, ProfileService};
 use violet_core::{ConnectionId, ErrorKind, Page};
 use violet_storage::JsonFile;
 
@@ -249,6 +249,7 @@ impl VioletApp {
                     set.rows.append(&next.rows);
                     shown.page = output.page;
                     shown.elapsed = output.elapsed;
+                    shown.cached = output.cached;
                     return;
                 }
                 if !running.append {
@@ -337,7 +338,7 @@ impl VioletApp {
             .get(tab_id)
             .is_some_and(|tab| tab.data().is_some());
         if scope == RunScope::Data || is_data {
-            self.run_data(ctx, tab_id);
+            self.run_data(ctx, tab_id, CachePolicy::Use);
             return;
         }
         let Some(tab) = self.workspace.get_mut(tab_id) else {
@@ -378,12 +379,19 @@ impl VioletApp {
         }
         let offset = range.start
             + (tab.sql[range.clone()].len() - tab.sql[range.clone()].trim_start().len());
-        // A single query is read a page at a time, as DBeaver does.
-        let (text, page) = match sql::plan(&text).pageable {
+        // Reads may come from the cache, and a single query is read a page
+        // at a time, as DBeaver does.
+        let plan = sql::plan(&text);
+        let cache = if plan.cacheable {
+            CachePolicy::Use
+        } else {
+            CachePolicy::Off
+        };
+        let (text, page) = match plan.pageable {
             Some(single) => (single, Some(Page::first())),
             None => (text, None),
         };
-        let options = ExecOptions { page };
+        let options = ExecOptions { cache, page };
         let executed = Executed { offset, sql: text };
         self.start(tab_id, connection, executed, options, false);
     }
@@ -406,6 +414,7 @@ impl VioletApp {
         if !append {
             tab.paging = options.page.map(|_| Paging {
                 base: executed.sql.clone(),
+                options,
                 loaded: 0,
                 has_more: false,
                 total: None,
@@ -422,7 +431,7 @@ impl VioletApp {
     }
 
     /// Reads a data tab's first page with its filter and sort.
-    fn run_data(&mut self, ctx: &egui::Context, tab_id: TabId) {
+    fn run_data(&mut self, ctx: &egui::Context, tab_id: TabId, cache: CachePolicy) {
         let Some(tab) = self.workspace.get_mut(tab_id) else {
             return;
         };
@@ -463,6 +472,7 @@ impl VioletApp {
         tab.sql.clone_from(&sql);
         let executed = Executed { offset: 0, sql };
         let options = ExecOptions {
+            cache,
             page: Some(Page::first()),
         };
         self.start(tab_id, connection, executed, options, false);
@@ -494,6 +504,7 @@ impl VioletApp {
                 offset: paging.loaded,
                 limit,
             }),
+            ..paging.options
         };
         let executed = tab.last_run.as_ref().map_or_else(
             || Executed {
@@ -505,13 +516,13 @@ impl VioletApp {
         self.start(tab_id, connection, executed, options, true);
     }
 
-    /// Runs the shown result again.
+    /// Runs the shown result again, past the cache.
     fn refresh(&mut self, ctx: &egui::Context, tab_id: TabId) {
         let Some(tab) = self.workspace.get(tab_id) else {
             return;
         };
         if tab.data().is_some() {
-            self.run_data(ctx, tab_id);
+            self.run_data(ctx, tab_id, CachePolicy::Refresh);
             return;
         }
         let (Some(connection), Some((executed, options))) = (tab.connection, tab.last_run.clone())
@@ -521,7 +532,12 @@ impl VioletApp {
         if tab.running.is_some() || !self.backend.is_connected(connection) {
             return;
         }
+        let cache = match options.cache {
+            CachePolicy::Off => CachePolicy::Off,
+            CachePolicy::Use | CachePolicy::Refresh => CachePolicy::Refresh,
+        };
         let options = ExecOptions {
+            cache,
             page: options.page.map(|_| Page::first()),
         };
         self.start(tab_id, connection, executed, options, false);
@@ -659,22 +675,22 @@ impl VioletApp {
                     String::new(),
                     TabKind::Data(view),
                 );
-                self.run_data(ctx, tab);
+                self.run_data(ctx, tab, CachePolicy::Use);
             }
             Action::Run(tab, scope) => self.run(ctx, tab, scope),
             Action::RefreshTab(tab) => self.refresh(ctx, tab),
-            Action::ApplyFilter(tab) => self.run_data(ctx, tab),
+            Action::ApplyFilter(tab) => self.run_data(ctx, tab, CachePolicy::Use),
             Action::ClearFilter(tab) => {
                 if let Some(view) = self.workspace.get_mut(tab).and_then(|t| t.data_mut()) {
                     view.filter.clear();
                 }
-                self.run_data(ctx, tab);
+                self.run_data(ctx, tab, CachePolicy::Use);
             }
             Action::Sort(tab, column) => {
                 if let Some(view) = self.workspace.get_mut(tab).and_then(|t| t.data_mut()) {
                     view.cycle_order(&column);
                 }
-                self.run_data(ctx, tab);
+                self.run_data(ctx, tab, CachePolicy::Use);
             }
             Action::FetchMore(tab) => self.fetch_more(tab, false),
             Action::FetchAll(tab) => self.fetch_more(tab, true),

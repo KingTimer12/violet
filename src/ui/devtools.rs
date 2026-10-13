@@ -221,7 +221,8 @@ impl VioletApp {
                 ready && elapsed > Duration::from_millis(5_000)
             }
             ("data", 3) => {
-                // Back to the unfiltered first page.
+                // Back to the unfiltered first page: nothing changed on the
+                // server, so it comes from the cache.
                 let Some(tab) = self.workspace.active else {
                     return false;
                 };

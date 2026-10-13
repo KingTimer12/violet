@@ -127,6 +127,18 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, actions: &mut Vec<Action>) {
                                 actions.push(Action::RefreshTab(tab.id));
                             }
                             ui.label(RichText::new(format_duration(elapsed)).color(palette.dim));
+                            if let Some(age) = output.cached {
+                                widgets::pill(
+                                    ui,
+                                    &format!("Cached · {}", format_age(age)),
+                                    palette.success,
+                                    palette.success.gamma_multiply(0.15),
+                                )
+                                .on_hover_text(
+                                    "Nothing changed on the server since these rows were read, \
+                                     so they were shown from memory. Refresh to read them again.",
+                                );
+                            }
                             if set.has_rows() {
                                 let more = tab.paging.as_ref().is_some_and(|p| p.has_more);
                                 widgets::pill(
@@ -263,6 +275,15 @@ fn paging_bar(ui: &mut Ui, tab: u64, paging: &Paging, fetching: bool, actions: &
             }
         });
     });
+}
+
+/// `just now`, `42 s ago`, `3 min ago`.
+fn format_age(age: std::time::Duration) -> String {
+    match age.as_secs() {
+        0..=1 => "just now".to_owned(),
+        seconds @ 2..=59 => format!("{seconds} s ago"),
+        seconds => format!("{} min ago", seconds / 60),
+    }
 }
 
 fn grid(

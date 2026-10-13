@@ -11,5 +11,9 @@ violet-core.workspace = true
 log.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+async-trait.workspace = true
+violet-storage.workspace = true
+
 [lints]
 workspace = true

@@ -302,7 +302,7 @@ fn data_toolbar(
             })
             .inner;
         if refresh
-            .on_hover_text("Read the rows again from the server")
+            .on_hover_text("Read the rows again from the server, past the cache")
             .clicked()
         {
             actions.push(Action::RefreshTab(tab.id));

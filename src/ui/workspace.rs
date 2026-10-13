@@ -82,6 +82,8 @@ impl DataView {
 pub struct Paging {
     /// The single statement being paged, as the user wrote it.
     pub base: String,
+    /// How the first page was run; later pages run the same way.
+    pub options: ExecOptions,
     pub loaded: u64,
     pub has_more: bool,
     pub total: Option<Count>,

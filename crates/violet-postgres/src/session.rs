@@ -262,6 +262,15 @@ impl Session for PgSession {
         Ok(sets)
     }
 
+    async fn change_token(&self) -> Result<Option<String>> {
+        let row = self
+            .client
+            .query_one(catalog::CHANGE_TOKEN, &[])
+            .await
+            .map_err(|e| error::map(&e))?;
+        Ok(row.get(0))
+    }
+
     fn canceller(&self) -> Option<Box<dyn Canceller>> {
         Some(Box::new(PgCanceller {
             token: self.client.cancel_token(),

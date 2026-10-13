@@ -70,6 +70,14 @@ pub trait Session: Send + Sync + 'static {
     /// A handle that cancels the statement running now, from another task.
     fn canceller(&self) -> Option<Box<dyn Canceller>>;
 
+    /// A value that changes whenever data or schema may have changed, so a
+    /// cached result can be checked cheaply before it is shown again.
+    /// `None` when the database offers no such signal; cached results then
+    /// only live as long as the cache's time limit.
+    async fn change_token(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     fn dialect(&self) -> &dyn Dialect;
 
     async fn close(&self);
