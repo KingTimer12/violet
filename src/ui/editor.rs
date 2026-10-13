@@ -1,7 +1,6 @@
 //! The SQL editor: a code text field with highlighting, line numbers and
 //! the last error marked where the server pointed.
 
-use std::hash::{Hash as _, Hasher as _};
 use std::sync::Arc;
 
 use egui::text::{CCursor, LayoutJob};
@@ -17,22 +16,23 @@ const GUTTER: f32 = 46.0;
 /// Remembers the last layout so unchanged text is not re-lexed each frame.
 #[derive(Default)]
 pub struct Highlighter {
-    key: u64,
-    job: Option<LayoutJob>,
+    /// The job holds the text it was made from: comparing against it is a
+    /// `memcmp`, far cheaper than hashing the whole buffer every frame.
+    job: Option<(LayoutJob, bool, Option<usize>)>,
 }
 
 impl Highlighter {
     fn job(&mut self, text: &str, palette: &Palette, error_at: Option<usize>) -> LayoutJob {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        text.hash(&mut hasher);
-        palette.dark.hash(&mut hasher);
-        error_at.hash(&mut hasher);
-        let key = hasher.finish();
-        if self.key != key || self.job.is_none() {
-            self.key = key;
-            self.job = Some(highlight(text, palette, error_at));
+        let fresh = self.job.as_ref().is_some_and(|(job, dark, at)| {
+            *dark == palette.dark && *at == error_at && job.text == text
+        });
+        if !fresh {
+            self.job = Some((highlight(text, palette, error_at), palette.dark, error_at));
         }
-        self.job.clone().unwrap_or_default()
+        self.job
+            .as_ref()
+            .map(|(job, ..)| job.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -139,13 +139,20 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab) {
                 let cursor_row = output
                     .cursor_range
                     .map(|range| output.galley.layout_from_cursor(range.primary).row);
+                // Only rows inside the viewport are painted; the rest are
+                // just counted, so long scripts cost no text layout.
+                let visible = ui.clip_rect().y_range();
                 let mut line = 1;
                 let mut starts_line = true;
                 for (index, row) in output.galley.rows.iter().enumerate() {
-                    if starts_line {
+                    let top = output.galley_pos.y + row.pos.y;
+                    if top > visible.max {
+                        break;
+                    }
+                    if starts_line && top + 2.0 * FONT_SIZE >= visible.min {
                         let current = cursor_row == Some(index);
                         painter.text(
-                            egui::pos2(right, output.galley_pos.y + row.pos.y),
+                            egui::pos2(right, top),
                             egui::Align2::RIGHT_TOP,
                             line.to_string(),
                             theme::mono(12.0),
@@ -155,6 +162,8 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab) {
                                 palette.dim.gamma_multiply(0.7)
                             },
                         );
+                    }
+                    if starts_line {
                         line += 1;
                     }
                     starts_line = row.ends_with_newline;
