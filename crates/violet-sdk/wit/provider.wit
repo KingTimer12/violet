@@ -190,7 +190,8 @@ interface network {
         ///
         /// When the profile requires TLS, the host refuses to send more
         /// than a short preamble (such as PostgreSQL's `SSLRequest` or
-        /// MySQL's SSL packet) before this is called.
+        /// MySQL's SSL packet) in plain text, over all of the instance's
+        /// sockets together.
         start-tls: func() -> result<_, db-error>;
         is-tls: func() -> bool;
     }

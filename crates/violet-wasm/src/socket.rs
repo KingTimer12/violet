@@ -1,7 +1,7 @@
 //! The one connection a provider can open, and the rules around it.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -27,6 +27,32 @@ const PLAIN_PREAMBLE: usize = 64;
 
 /// Sockets one instance may hold at once.
 pub(crate) const MAX_SOCKETS: usize = 4;
+
+/// Sockets one instance may open in its life, so it cannot hammer the
+/// server with reconnects.
+pub(crate) const MAX_OPENS: usize = 16;
+
+/// The plain text an instance may still send before TLS, over all its
+/// sockets together. Per socket, a provider could open one socket after
+/// another and send a secret a preamble at a time.
+#[derive(Debug)]
+pub(crate) struct PlainBudget(AtomicUsize);
+
+impl PlainBudget {
+    pub fn new() -> Self {
+        Self(AtomicUsize::new(PLAIN_PREAMBLE))
+    }
+
+    /// Takes `n` bytes from the budget; `false` (and nothing taken) when
+    /// that is more than is left.
+    fn spend(&self, n: usize) -> bool {
+        self.0
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(n)
+            })
+            .is_ok()
+    }
+}
 
 /// Where an instance may connect: the profile it serves.
 #[derive(Clone, Debug)]
@@ -78,8 +104,9 @@ enum Transport {
 pub struct Socket {
     transport: Transport,
     host: String,
-    /// Plain-text bytes still allowed before TLS; `None` when unlimited.
-    plain_budget: Option<usize>,
+    /// The instance's plain-text budget while TLS is required and not
+    /// started; `None` when unlimited.
+    plain_budget: Option<Arc<PlainBudget>>,
     kill: Arc<Kill>,
 }
 
@@ -104,7 +131,11 @@ fn killed() -> DbError {
 
 impl Socket {
     /// Opens TCP to `target`.
-    pub(crate) async fn connect(target: &Target, kill: Arc<Kill>) -> Result<Self, DbError> {
+    pub(crate) async fn connect(
+        target: &Target,
+        kill: Arc<Kill>,
+        budget: &Arc<PlainBudget>,
+    ) -> Result<Self, DbError> {
         if target.host.starts_with('/') {
             return Err(error(
                 ErrorKind::Connection,
@@ -139,7 +170,7 @@ impl Socket {
         Ok(Self {
             transport: Transport::Tcp(stream),
             host,
-            plain_budget: target.tls_required.then_some(PLAIN_PREAMBLE),
+            plain_budget: target.tls_required.then(|| Arc::clone(budget)),
             kill,
         })
     }
@@ -206,15 +237,14 @@ impl Socket {
     }
 
     pub(crate) async fn write(&mut self, bytes: &[u8]) -> Result<(), DbError> {
-        if let Some(budget) = &mut self.plain_budget {
-            if bytes.len() > *budget {
-                self.transport = Transport::Closed;
-                return Err(error(
-                    ErrorKind::Tls,
-                    "Refused to send data in plain text: this connection requires TLS",
-                ));
-            }
-            *budget -= bytes.len();
+        if let Some(budget) = &self.plain_budget
+            && !budget.spend(bytes.len())
+        {
+            self.transport = Transport::Closed;
+            return Err(error(
+                ErrorKind::Tls,
+                "Refused to send data in plain text: this connection requires TLS",
+            ));
         }
         let kill = Arc::clone(&self.kill);
         let write = async {
@@ -311,6 +341,17 @@ fn tls_config() -> Result<Arc<ClientConfig>, DbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_plain_text_budget_is_shared_and_never_refilled() {
+        let budget = PlainBudget::new();
+        assert!(budget.spend(8), "an SSLRequest");
+        assert!(budget.spend(PLAIN_PREAMBLE - 8));
+        // Another socket of the same instance gets nothing more.
+        assert!(!budget.spend(1));
+        assert!(budget.spend(0));
+        assert!(!PlainBudget::new().spend(PLAIN_PREAMBLE + 1));
+    }
 
     #[test]
     fn socket_names_stay_in_their_directory() {

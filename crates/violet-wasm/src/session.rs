@@ -18,6 +18,11 @@ use crate::convert;
 use crate::host::HostState;
 use crate::socket::{Kill, Target};
 
+/// Instructions one call into a provider may run: tens of seconds of
+/// busy work, far more than reading the rows Violet keeps (and skipping
+/// the rest) needs. Waiting on the server costs nothing; a loop runs out.
+const FUEL_PER_CALL: u64 = 50_000_000_000;
+
 /// A fresh instance of a provider, alone in its store.
 pub(crate) struct Instance {
     store: Store<HostState>,
@@ -40,6 +45,7 @@ impl Instance {
             }
         });
         store.set_epoch_deadline(1);
+        refuel(&mut store);
         let world = provider
             .pre
             .instantiate_async(&mut store)
@@ -60,8 +66,20 @@ impl Instance {
     }
 }
 
+/// Gives the next call its budget of instructions.
+fn refuel(store: &mut Store<HostState>) {
+    // Only fails when fuel is not enabled, which the engine always has.
+    let _ = store.set_fuel(FUEL_PER_CALL);
+}
+
 /// A trap or a broken invariant: the instance cannot be trusted further.
 fn crashed(error: &wasmtime::Error) -> DbError {
+    if error.downcast_ref::<wasmtime::Trap>() == Some(&wasmtime::Trap::OutOfFuel) {
+        return DbError::new(
+            ErrorKind::Provider,
+            "The provider ran too long without waiting on the server and was stopped",
+        );
+    }
     DbError::new(
         ErrorKind::Provider,
         format!("The provider stopped: {error:#}"),
@@ -157,6 +175,7 @@ impl WasmSession {
         let Some(Live { instance, session }) = live.as_mut() else {
             return Err(gone());
         };
+        refuel(&mut instance.store);
         match call(&mut instance.store, &instance.world, *session).await {
             Ok(result) => result.map_err(convert::error),
             Err(error) => {
@@ -306,6 +325,7 @@ impl Session for WasmSession {
         }) = live.take()
             && !self.broken.load(Ordering::SeqCst)
         {
+            refuel(&mut instance.store);
             let goodbye = session.resource_drop_async(&mut instance.store);
             let _ = tokio::time::timeout(std::time::Duration::from_secs(2), goodbye).await;
         }

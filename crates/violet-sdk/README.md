@@ -20,10 +20,10 @@ only one thing: the server of the connection they serve.
 
 | | |
 | --- | --- |
-| Network | One kind of socket, to the profile's host and port only (`net::Connection::open`), or a socket file inside the profile's directory (`open_local`). TLS is done by Violet: call `start_tls()` and the certificate is checked against the host the user typed. When the profile requires TLS, Violet refuses to send more than a 64-byte plain-text preamble, so a password cannot leak by mistake. |
+| Network | One kind of socket, to the profile's host and port only (`net::Connection::open`), or a socket file inside the profile's directory (`open_local`). TLS is done by Violet: call `start_tls()` and the certificate is checked against the host the user typed. When the profile requires TLS, Violet refuses to send more than a 64-byte plain-text preamble per session, over all its sockets, so a password cannot leak by mistake. |
 | Files, environment, arguments | None. WASI's own sockets are disabled too. |
 | Memory | 512 MiB per session. |
-| CPU | Runaway code yields to Violet's runtime and is stopped when its session closes. |
+| CPU | A budget of instructions per call (tens of seconds of busy work; waiting on the server is free). Running code yields to Violet's runtime and is stopped when its session closes. |
 | Output | Everything returned is validated by Violet; malformed rows are refused. |
 
 Each session lives in its own instance, so calls never overlap and one

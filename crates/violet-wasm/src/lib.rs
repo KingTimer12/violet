@@ -10,9 +10,10 @@
 //! - the bare WASI a Rust program needs to start (clocks, randomness), with
 //!   no files, environment, arguments or sockets of its own.
 //!
-//! Memory is capped, runaway code yields back to the async runtime and is
-//! stopped when its session closes, and every value a provider returns is
-//! checked before Violet uses it.
+//! Memory is capped, each call may only run so many instructions, running
+//! code yields back to the async runtime and is stopped when its session
+//! closes, and every value a provider returns is checked before Violet uses
+//! it.
 
 mod bindings;
 mod convert;
@@ -56,6 +57,7 @@ impl Runtime {
         config
             .wasm_component_model(true)
             .epoch_interruption(true)
+            .consume_fuel(true)
             .max_wasm_stack(2 << 20);
         if let Some(dir) = cache_dir {
             let mut cache = wasmtime::CacheConfig::new();

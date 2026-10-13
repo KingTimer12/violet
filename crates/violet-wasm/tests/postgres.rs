@@ -259,6 +259,18 @@ async fn browses_queries_and_cancels() {
     assert_eq!(sets[0].rows.len(), 10);
     assert!(sets[0].truncated);
 
+    // Rows past the cap are read and dropped within a call's budget of
+    // instructions, so later statements still run.
+    let sets = session
+        .execute(
+            "SELECT generate_series(1, 2000000); SELECT 'after'",
+            ExecLimits { max_rows: 10 },
+        )
+        .await
+        .expect("big result");
+    assert!(sets[0].truncated && sets[0].rows.len() == 10);
+    assert_eq!(sets[1].rows.get(0, 0), Some(Some("after")));
+
     // Unicode survives the trip.
     let sets = session
         .execute("SELECT 'olá, 世界 🐘'", ExecLimits::default())

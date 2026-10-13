@@ -106,15 +106,17 @@ changed:
   buffers are zeroed when dialogs close.
 - Profiles are written atomically with mode `0600`.
 - Providers are sandboxed (see [Providers](#providers)): each connection
-  runs in its own WebAssembly instance, capped at 512 MiB, that can only
-  open a socket to that profile's server. Downloads must match the
+  runs in its own WebAssembly instance, capped at 512 MiB and at a budget
+  of instructions per call, that can only open a few sockets, all to that
+  profile's server. Downloads must match the
   catalogue's SHA-256; installed components are checked again on every
   load, so a file changed on disk is refused. Catalogues are fetched over
   HTTPS (plain HTTP only from this machine) and redirects cannot leave
   HTTPS.
 - TLS (`Prefer`/`Require`) is done by Violet, not the provider, and verifies
   the server against the web PKI roots. With `Require`, Violet sends at most
-  a 64-byte preamble in plain text, whatever the provider tries.
+  a 64-byte preamble in plain text per connection, across all the sockets
+  its provider opens, whatever the provider tries.
   `Prefer` only falls back to plain text on loopback hosts and Unix sockets;
   for any other host it is enforced as `Require`, so a network attacker
   cannot downgrade the connection and read the password.

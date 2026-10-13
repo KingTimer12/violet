@@ -9,7 +9,7 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
 use crate::bindings::types::{DbError, ErrorKind};
 use crate::bindings::violet::provider::{logging, network};
-use crate::socket::{Kill, MAX_SOCKETS, Socket, Target, error};
+use crate::socket::{Kill, MAX_OPENS, MAX_SOCKETS, PlainBudget, Socket, Target, error};
 
 /// Memory one instance may use.
 const MAX_MEMORY: usize = 512 << 20;
@@ -25,7 +25,10 @@ pub struct HostState {
     /// Where the socket may go; `None` when describing the provider.
     target: Option<Target>,
     pub(crate) kill: Arc<Kill>,
+    /// Sockets open now, and opened in all.
     sockets: usize,
+    opened: usize,
+    plain_budget: Arc<PlainBudget>,
     /// For log lines.
     provider: String,
 }
@@ -54,6 +57,8 @@ impl HostState {
             target,
             kill,
             sockets: 0,
+            opened: 0,
+            plain_budget: Arc::new(PlainBudget::new()),
             provider: "provider".into(),
         }
     }
@@ -63,8 +68,8 @@ impl HostState {
     }
 
     fn target(&self) -> Result<&Target, DbError> {
-        if self.sockets >= MAX_SOCKETS {
-            return Err(error(ErrorKind::Connection, "Too many open sockets"));
+        if self.sockets >= MAX_SOCKETS || self.opened >= MAX_OPENS {
+            return Err(error(ErrorKind::Connection, "Too many sockets"));
         }
         self.target
             .as_ref()
@@ -77,6 +82,7 @@ impl HostState {
             .push(socket)
             .map_err(|e| error(ErrorKind::Other, e.to_string()))?;
         self.sockets += 1;
+        self.opened += 1;
         Ok(resource)
     }
 
@@ -101,7 +107,7 @@ impl crate::bindings::types::Host for HostState {}
 impl network::Host for HostState {
     async fn connect(&mut self) -> Result<Resource<Socket>, DbError> {
         let target = self.target()?.clone();
-        let socket = Socket::connect(&target, Arc::clone(&self.kill)).await?;
+        let socket = Socket::connect(&target, Arc::clone(&self.kill), &self.plain_budget).await?;
         self.adopt(socket)
     }
 
