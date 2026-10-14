@@ -10,7 +10,8 @@
 //! connection dialog), `data` (a table's data tab, filtered and sorted),
 //! `menu` (the data tab with a connection's context menu open), `page`
 //! (a data tab after fetching the next page and counting), `providers`
-//! (the providers dialog). Add `VIOLET_THEME=light` for the light theme.
+//! (the providers dialog), `complete` (completion at the `|` of
+//! `VIOLET_SCENE_SQL`). Add `VIOLET_THEME=light` for the light theme.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -30,6 +31,8 @@ pub struct Snapshot {
     requested: bool,
     /// Input to feed the next frame, as if the user did it.
     events: Vec<egui::Event>,
+    /// Where the `complete` scene puts the cursor, in characters.
+    cursor: usize,
 }
 
 impl Snapshot {
@@ -42,6 +45,7 @@ impl Snapshot {
             step: 0,
             requested: false,
             events: Vec::new(),
+            cursor: 0,
         })
     }
 
@@ -58,6 +62,17 @@ fn secondary(pos: egui::Pos2, pressed: bool) -> egui::Event {
         button: egui::PointerButton::Secondary,
         pressed,
         modifiers: egui::Modifiers::NONE,
+    }
+}
+
+/// A key press.
+fn key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers,
     }
 }
 
@@ -90,7 +105,7 @@ impl VioletApp {
             return;
         }
 
-        let ready = self.advance_scene(&mut snapshot, elapsed);
+        let ready = self.advance_scene(ctx, &mut snapshot, elapsed);
         if (ready || elapsed > Duration::from_secs(20)) && !snapshot.requested {
             snapshot.requested = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
@@ -100,7 +115,12 @@ impl VioletApp {
 
     /// Takes the scene one step further. Returns `true` when it is ready to
     /// be captured.
-    fn advance_scene(&mut self, snapshot: &mut Snapshot, elapsed: Duration) -> bool {
+    fn advance_scene(
+        &mut self,
+        ctx: &egui::Context,
+        snapshot: &mut Snapshot,
+        elapsed: Duration,
+    ) -> bool {
         let first = self.profiles.all().first().map(|profile| profile.id);
         let settle = elapsed > Duration::from_millis(1_500);
         match (snapshot.scene.as_str(), snapshot.step) {
@@ -117,7 +137,7 @@ impl VioletApp {
             ("providers", _) => {
                 settle && matches!(self.providers.listing, super::providers::Listing::Ready(_))
             }
-            ("browse" | "error" | "data" | "menu" | "page", 0) => {
+            ("browse" | "error" | "data" | "menu" | "page" | "complete", 0) => {
                 if let Some(id) = first {
                     self.explorer.expanded.insert(NodeKey::Connection(id));
                     self.actions.push(Action::Connect(id));
@@ -269,6 +289,65 @@ impl VioletApp {
                 snapshot.started = Instant::now() - Duration::from_millis(1_000);
                 false
             }
+            ("complete", 1) => {
+                let Some(id) = first else { return true };
+                let loaded = self
+                    .explorer
+                    .objects
+                    .contains_key(&(id, "public".to_owned()));
+                if loaded && self.explorer.link(id).is_online() {
+                    let sql = std::env::var("VIOLET_SCENE_SQL")
+                        .unwrap_or_else(|_| "SELECT *\nFROM customers c\nJOIN |".to_owned());
+                    let cursor = sql.find('|').unwrap_or(sql.len());
+                    self.actions.push(Action::OpenEditor {
+                        connection: Some(id),
+                        sql: sql.replacen('|', "", 1),
+                    });
+                    snapshot.step = 2;
+                    snapshot.cursor = sql[..cursor].chars().count();
+                }
+                false
+            }
+            ("complete", 2) => {
+                // Put the cursor in place and press ⌃Space.
+                let Some(tab) = self.workspace.active else {
+                    return false;
+                };
+                let text_id = egui::Id::new(("violet-editor", tab));
+                let mut state =
+                    egui::text_edit::TextEditState::load(ctx, text_id).unwrap_or_default();
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::one(
+                        egui::text::CCursor::new(snapshot.cursor),
+                    )));
+                state.store(ctx, text_id);
+                ctx.memory_mut(|memory| memory.request_focus(text_id));
+                // `VIOLET_SCENE_TYPE` types text instead, as a user would.
+                match std::env::var("VIOLET_SCENE_TYPE") {
+                    Ok(text) => snapshot.events.push(egui::Event::Text(text)),
+                    Err(_) => snapshot
+                        .events
+                        .push(key(egui::Key::Space, egui::Modifiers::CTRL)),
+                }
+                snapshot.step = 3;
+                snapshot.started = Instant::now();
+                false
+            }
+            ("complete", 3) => {
+                // `VIOLET_SCENE_ACCEPT` presses Enter once the list is up.
+                if elapsed > Duration::from_millis(1_500) {
+                    if std::env::var_os("VIOLET_SCENE_ACCEPT").is_some() {
+                        snapshot
+                            .events
+                            .push(key(egui::Key::Enter, egui::Modifiers::NONE));
+                    }
+                    snapshot.step = 10;
+                    snapshot.started = Instant::now() - Duration::from_millis(1_000);
+                }
+                false
+            }
+            ("complete", _) => settle,
             ("error", 1) => {
                 let Some(id) = first else { return true };
                 if matches!(self.explorer.link(id), Link::Online(_)) {

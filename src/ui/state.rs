@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use violet_core::{ColumnInfo, ConnectionId, DbObject, ObjectKind, ServerInfo};
+use violet_core::{ColumnInfo, ConnectionId, DbObject, ForeignKey, ObjectKind, ServerInfo};
 
 /// Something fetched from a database.
 #[derive(Clone, Debug, Default)]
@@ -67,6 +67,8 @@ pub struct Explorer {
     pub schemas: HashMap<ConnectionId, Loadable<Arc<[String]>>>,
     pub objects: HashMap<(ConnectionId, String), Loadable<Arc<[DbObject]>>>,
     pub columns: HashMap<RelationKey, Loadable<Arc<[ColumnInfo]>>>,
+    /// Foreign keys from or to each schema's tables, for completion.
+    pub foreign_keys: HashMap<(ConnectionId, String), Loadable<Arc<[ForeignKey]>>>,
     pub expanded: HashSet<NodeKey>,
     pub selected: Option<NodeKey>,
     pub filter: String,
@@ -97,6 +99,35 @@ impl Explorer {
         self.schemas.remove(&id);
         self.objects.retain(|(owner, _), _| *owner != id);
         self.columns.retain(|(owner, _, _), _| *owner != id);
+        self.foreign_keys.retain(|(owner, _), _| *owner != id);
+    }
+
+    /// Schemas whose objects completion offers unqualified: PostgreSQL's
+    /// `public` and the user's own, or the database itself where schemas
+    /// are databases; else the first one.
+    pub fn search_path(&self, id: ConnectionId) -> Vec<String> {
+        let Some(Loadable::Ready(schemas)) = self.schemas.get(&id) else {
+            return Vec::new();
+        };
+        let mut path: Vec<String> = Vec::new();
+        let mut add = |name: &str| {
+            if schemas.iter().any(|schema| schema == name) && !path.iter().any(|p| p == name) {
+                path.push(name.to_owned());
+            }
+        };
+        if let Link::Online(server) = self.link(id) {
+            add(&server.user);
+        }
+        add("public");
+        if let Link::Online(server) = self.link(id) {
+            add(&server.database);
+        }
+        if path.is_empty()
+            && let Some(first) = schemas.first()
+        {
+            path.push(first.clone());
+        }
+        path
     }
 
     pub fn remove(&mut self, id: ConnectionId) {
@@ -115,5 +146,49 @@ fn owner(key: &NodeKey) -> ConnectionId {
         | NodeKey::Schema(id, _)
         | NodeKey::Group(id, _, _)
         | NodeKey::Object(id, _, _) => *id,
+    }
+}
+
+/// One connection's catalog, as completion reads it. Failed loads count as
+/// empty, so they are not asked for again and again.
+pub struct ConnectionCatalog<'a> {
+    pub explorer: &'a Explorer,
+    pub id: Option<ConnectionId>,
+}
+
+fn ready<'a, T: ?Sized>(
+    loadable: Option<&'a Loadable<Arc<T>>>,
+    empty: &'static T,
+) -> Option<&'a T> {
+    match loadable? {
+        Loadable::Ready(value) => Some(value),
+        Loadable::Failed(_) => Some(empty),
+        Loadable::Idle | Loadable::Loading => None,
+    }
+}
+
+impl crate::completion::Catalog for ConnectionCatalog<'_> {
+    fn schemas(&self) -> &[String] {
+        let Some(id) = self.id else { return &[] };
+        ready(self.explorer.schemas.get(&id), &[]).unwrap_or_default()
+    }
+
+    fn objects(&self, schema: &str) -> Option<&[DbObject]> {
+        let id = self.id?;
+        ready(self.explorer.objects.get(&(id, schema.to_owned())), &[])
+    }
+
+    fn columns(&self, schema: &str, relation: &str) -> Option<&[ColumnInfo]> {
+        let id = self.id?;
+        let key = (id, schema.to_owned(), relation.to_owned());
+        ready(self.explorer.columns.get(&key), &[])
+    }
+
+    fn foreign_keys(&self, schema: &str) -> Option<&[ForeignKey]> {
+        let id = self.id?;
+        ready(
+            self.explorer.foreign_keys.get(&(id, schema.to_owned())),
+            &[],
+        )
     }
 }

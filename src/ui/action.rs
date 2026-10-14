@@ -4,6 +4,7 @@
 use violet_core::{ConnectionId, ConnectionProfile, DriverId, Secret};
 
 use super::workspace::TabId;
+use crate::completion::Need;
 
 /// Which part of an editor to run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,6 +29,9 @@ pub enum Action {
     Refresh(ConnectionId),
     LoadObjects(ConnectionId, String),
     LoadColumns(ConnectionId, String, String),
+    /// Catalog data completion is waiting for; what is already loading or
+    /// loaded is skipped.
+    LoadForCompletion(ConnectionId, Vec<Need>),
     SaveProfile {
         profile: ConnectionProfile,
         password: Option<Secret>,

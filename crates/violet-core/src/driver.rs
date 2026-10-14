@@ -155,6 +155,53 @@ pub trait Dialect: Send + Sync {
     fn count(&self, sql: &str) -> String {
         format!("SELECT count(*) FROM (\n{sql}\n) AS violet_count")
     }
+
+    /// Shows how the server would run a statement; with `analyze`, runs it
+    /// and shows what happened. The statement follows the prefix unchanged,
+    /// so error positions can be mapped back to it.
+    fn explain(&self, sql: &str, analyze: bool) -> String {
+        if analyze {
+            format!("EXPLAIN ANALYZE {sql}")
+        } else {
+            format!("EXPLAIN {sql}")
+        }
+    }
+
+    /// Lists the foreign keys from or to `schema`'s tables, one row per
+    /// column pair, in key order: constraint schema and name, table schema,
+    /// table, column, then the referenced schema, table and column. By
+    /// default the standard `information_schema` query; `None` when the
+    /// database has no way, or `schema` cannot be written safely as a
+    /// literal.
+    fn foreign_keys(&self, schema: &str) -> Option<String> {
+        let schema = string_literal(schema)?;
+        Some(format!(
+            "SELECT kcu.constraint_schema, kcu.constraint_name, \
+             kcu.table_schema, kcu.table_name, kcu.column_name, \
+             ref.table_schema, ref.table_name, ref.column_name \
+             FROM information_schema.referential_constraints rc \
+             JOIN information_schema.key_column_usage kcu \
+             ON kcu.constraint_schema = rc.constraint_schema \
+             AND kcu.constraint_name = rc.constraint_name \
+             JOIN information_schema.key_column_usage ref \
+             ON ref.constraint_schema = rc.unique_constraint_schema \
+             AND ref.constraint_name = rc.unique_constraint_name \
+             AND ref.ordinal_position = kcu.position_in_unique_constraint \
+             WHERE kcu.table_schema = {schema} OR ref.table_schema = {schema} \
+             ORDER BY 1, 2, 3, 4, kcu.ordinal_position"
+        ))
+    }
+}
+
+/// `text` as a standard SQL string literal, or `None` when it holds a
+/// character some databases treat specially inside one (a backslash, a NUL
+/// or another control character), so it is never sent at all.
+#[must_use]
+pub fn string_literal(text: &str) -> Option<String> {
+    if text.chars().any(|c| c == '\\' || c.is_control()) {
+        return None;
+    }
+    Some(format!("'{}'", text.replace('\'', "''")))
 }
 
 /// How a dialect cuts a query into pages.
@@ -243,6 +290,21 @@ mod tests {
         assert_eq!(
             AnsiDialect.browse("public", "users", None, None),
             r#"SELECT * FROM "public"."users""#
+        );
+    }
+
+    #[test]
+    fn catalog_literals_cannot_break_out() {
+        assert_eq!(string_literal("it's").as_deref(), Some("'it''s'"));
+        // MySQL reads a backslash as an escape: such names are never sent.
+        assert_eq!(string_literal(r"x\' OR 1=1 --"), None);
+        assert_eq!(string_literal("a\0b"), None);
+        let sql = AnsiDialect.foreign_keys("o'k").expect("query");
+        assert!(sql.contains("kcu.table_schema = 'o''k' OR ref.table_schema = 'o''k'"));
+        assert_eq!(AnsiDialect.explain("SELECT 1", false), "EXPLAIN SELECT 1");
+        assert_eq!(
+            AnsiDialect.explain("SELECT 1", true),
+            "EXPLAIN ANALYZE SELECT 1"
         );
     }
 

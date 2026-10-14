@@ -12,8 +12,8 @@ use violet_core::ports::{
 };
 use violet_core::{
     Canceller, ColumnInfo, ConnectionId, ConnectionProfile, Credentials, DbError, DbObject, Driver,
-    DriverId, DriverInfo, ErrorKind, ExecLimits, OrderBy, Page, PageInfo, QueryOutput, Result,
-    Secret, ServerInfo, Session,
+    DriverId, DriverInfo, ErrorKind, ExecLimits, ForeignKey, OrderBy, Page, PageInfo, QueryOutput,
+    Result, ResultSet, Secret, ServerInfo, Session,
 };
 
 use crate::registry::DriverRegistry;
@@ -94,6 +94,12 @@ pub enum Event {
         schema: String,
         relation: String,
         result: Result<Vec<ColumnInfo>>,
+    },
+    /// Foreign keys from or to a schema's tables.
+    ForeignKeys {
+        id: ConnectionId,
+        schema: String,
+        result: Result<Vec<ForeignKey>>,
     },
     QueryFinished {
         request: RequestId,
@@ -417,6 +423,13 @@ impl Backend {
         Some(session.dialect().browse(schema, relation, filter, order))
     }
 
+    /// How the session's dialect explains `sql`.
+    #[must_use]
+    pub fn explain_sql(&self, id: ConnectionId, sql: &str, analyze: bool) -> Option<String> {
+        let session = self.shared.session(id).ok()?;
+        Some(session.dialect().explain(sql, analyze))
+    }
+
     /// The most rows one result may hold.
     #[must_use]
     pub fn max_rows(&self) -> usize {
@@ -515,6 +528,24 @@ impl Backend {
         });
     }
 
+    /// Reads the foreign keys from or to `schema`'s tables, for completing
+    /// joins. Databases the dialect has no query for answer with none.
+    pub fn load_foreign_keys(&self, id: ConnectionId, schema: String) {
+        let shared = Arc::clone(&self.shared);
+        let limits = self.limits;
+        self.runtime.spawn(async move {
+            let result = async {
+                let session = shared.session(id)?;
+                let Some(sql) = session.dialect().foreign_keys(&schema) else {
+                    return Ok(Vec::new());
+                };
+                Ok(foreign_keys_from(&session.execute(&sql, limits).await?))
+            }
+            .await;
+            shared.emit(Event::ForeignKeys { id, schema, result });
+        });
+    }
+
     /// Runs `sql` on the open session for `id`.
     pub fn execute(&self, id: ConnectionId, sql: String, options: ExecOptions) -> RequestId {
         let request = self.request();
@@ -601,6 +632,51 @@ impl Backend {
     }
 }
 
+/// Groups the rows of [`violet_core::Dialect::foreign_keys`] into keys.
+/// Rows with a missing cell are left out.
+fn foreign_keys_from(sets: &[ResultSet]) -> Vec<ForeignKey> {
+    let mut keys: Vec<ForeignKey> = Vec::new();
+    let Some(set) = sets.iter().find(|set| set.rows.width() >= 8) else {
+        return keys;
+    };
+    for row in set.rows.iter() {
+        let cells: Option<Vec<&str>> = (0..8).map(|i| row.get(i).flatten()).collect();
+        let Some(cells) = cells else { continue };
+        let [
+            _,
+            name,
+            schema,
+            table,
+            column,
+            ref_schema,
+            ref_table,
+            ref_column,
+        ] = cells[..]
+        else {
+            continue;
+        };
+        let same = keys
+            .last_mut()
+            .filter(|key| key.name == name && key.schema == schema && key.table == table);
+        match same {
+            Some(key) => {
+                key.columns.push(column.to_owned());
+                key.ref_columns.push(ref_column.to_owned());
+            }
+            None => keys.push(ForeignKey {
+                name: name.to_owned(),
+                schema: schema.to_owned(),
+                table: table.to_owned(),
+                columns: vec![column.to_owned()],
+                ref_schema: ref_schema.to_owned(),
+                ref_table: ref_table.to_owned(),
+                ref_columns: vec![ref_column.to_owned()],
+            }),
+        }
+    }
+    keys
+}
+
 impl Drop for Backend {
     fn drop(&mut self) {
         let sessions: Vec<_> = self.shared.sessions().drain().map(|(_, s)| s).collect();
@@ -610,5 +686,37 @@ impl Drop for Backend {
                 let _ = tokio::time::timeout(Duration::from_secs(2), session.close()).await;
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn foreign_key_rows_group_into_keys() {
+        let mut set = ResultSet::default();
+        for row in [
+            [
+                "s",
+                "fk_a",
+                "s",
+                "orders",
+                "customer_id",
+                "s",
+                "customers",
+                "id",
+            ],
+            ["s", "fk_b", "s", "lines", "order_id", "s", "orders", "id"],
+            ["s", "fk_b", "s", "lines", "order_rev", "s", "orders", "rev"],
+        ] {
+            set.rows.push(row.map(Some));
+        }
+        let keys = foreign_keys_from(&[set]);
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].table, "orders");
+        assert_eq!(keys[0].ref_table, "customers");
+        assert_eq!(keys[1].columns, ["order_id", "order_rev"]);
+        assert_eq!(keys[1].ref_columns, ["id", "rev"]);
     }
 }

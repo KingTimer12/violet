@@ -66,6 +66,19 @@ pub struct ColumnInfo {
     pub comment: Option<String>,
 }
 
+/// A foreign key: `columns` of `schema.table` point at `ref_columns` of
+/// `ref_schema.ref_table`, pair by pair.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForeignKey {
+    pub name: String,
+    pub schema: String,
+    pub table: String,
+    pub columns: Vec<String>,
+    pub ref_schema: String,
+    pub ref_table: String,
+    pub ref_columns: Vec<String>,
+}
+
 /// What the server says about itself after connecting.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServerInfo {

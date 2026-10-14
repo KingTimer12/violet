@@ -28,11 +28,12 @@ use violet_app::{Backend, CachePolicy, Event, ExecOptions, ProfileService};
 use violet_core::{ConnectionId, ErrorKind, Page};
 use violet_storage::JsonFile;
 
+use crate::completion::{self, Need};
 use crate::settings::Settings;
 use crate::sql;
 use action::{Action, RunScope};
 use connection_form::{ConnectionForm, PasswordPrompt, TestState};
-use state::{Explorer, Link, Loadable, NodeKey};
+use state::{ConnectionCatalog, Explorer, Link, Loadable, NodeKey};
 use theme::Palette;
 use toasts::{Toast, Toasts};
 use workspace::{Count, DataView, Executed, Outcome, Paging, Running, TabId, TabKind, Workspace};
@@ -257,6 +258,11 @@ impl VioletApp {
                     .columns
                     .insert((id, schema, relation), Loadable::from_result(result));
             }
+            Event::ForeignKeys { id, schema, result } => {
+                self.explorer
+                    .foreign_keys
+                    .insert((id, schema), Loadable::from_result(result));
+            }
             Event::QueryFinished { request, result } => {
                 let Some(tab) = self.workspace.by_request(request) else {
                     return;
@@ -413,6 +419,37 @@ impl VioletApp {
             .columns
             .insert((id, schema.clone(), relation.clone()), Loadable::Loading);
         self.backend.load_columns(id, schema, relation);
+    }
+
+    /// Loads what completion asked for, unless it is loaded or on its way.
+    fn load_for_completion(&mut self, id: ConnectionId, needs: Vec<Need>) {
+        if !self.explorer.link(id).is_online() {
+            return;
+        }
+        for need in needs {
+            match need {
+                Need::Objects(schema) => {
+                    if !self.explorer.objects.contains_key(&(id, schema.clone())) {
+                        self.load_objects(id, schema);
+                    }
+                }
+                Need::Columns(schema, relation) => {
+                    let key = (id, schema.clone(), relation.clone());
+                    if !self.explorer.columns.contains_key(&key) {
+                        self.load_columns(id, schema, relation);
+                    }
+                }
+                Need::ForeignKeys(schema) => {
+                    let key = (id, schema.clone());
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        self.explorer.foreign_keys.entry(key)
+                    {
+                        entry.insert(Loadable::Loading);
+                        self.backend.load_foreign_keys(id, schema);
+                    }
+                }
+            }
+        }
     }
 
     fn connect(&mut self, id: ConnectionId, password: Option<violet_core::Secret>) {
@@ -742,6 +779,7 @@ impl VioletApp {
             }
             Action::LoadObjects(id, schema) => self.load_objects(id, schema),
             Action::LoadColumns(id, schema, relation) => self.load_columns(id, schema, relation),
+            Action::LoadForCompletion(id, needs) => self.load_for_completion(id, needs),
             Action::SaveProfile {
                 profile,
                 password,
@@ -927,6 +965,14 @@ impl VioletApp {
         let Some(tab) = self.workspace.tabs.iter_mut().find(|tab| tab.id == active) else {
             return;
         };
+        // Completion quotes names the way the connection's database does.
+        let dialect = tab
+            .connection
+            .and_then(|id| profiles.iter().find(|profile| profile.id == id))
+            .and_then(|profile| self.backend.registry().get(&profile.driver))
+            .map_or(violet_core::SqlDialect::ANSI, |driver| {
+                driver.info().dialect
+            });
 
         Panel::top(Id::new(("toolbar", tab.id)))
             .exact_size(44.0)
@@ -966,9 +1012,25 @@ impl VioletApp {
             )
             .show(ui, |ui| results::show(ui, tab, actions));
 
+        let search = tab
+            .connection
+            .map(|id| explorer.search_path(id))
+            .unwrap_or_default();
+        let quote = |name: &str| violet_core::Dialect::quote_ident(&dialect, name);
+        let assist = editor::Assist {
+            connection: tab.connection,
+            catalog: &ConnectionCatalog {
+                explorer,
+                id: tab.connection,
+            },
+            options: completion::Options {
+                search: &search,
+                quote: &quote,
+            },
+        };
         egui::CentralPanel::default()
             .frame(Frame::NONE.fill(palette.window))
-            .show(ui, |ui| editor::show(ui, tab));
+            .show(ui, |ui| editor::show(ui, tab, &assist, actions));
     }
 
     fn modals(&mut self, ctx: &egui::Context) {

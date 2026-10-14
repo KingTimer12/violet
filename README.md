@@ -86,6 +86,29 @@ through it), build it for `wasm32-wasip2`, and add it to the catalogue with
 `violet-provider package`. Violet itself does not change: the connection
 form, tree, editor and grid work as they are.
 
+## Code completion
+
+The editor completes as you type a name or a dot, and on ⌃Space. What it
+offers depends on where the cursor is:
+
+- after `FROM`, `JOIN`, `UPDATE`, `INTO`: tables and views (unqualified
+  from the search path, `schema.table` from the others), CTEs and schemas;
+- after `JOIN`, whole joins along foreign keys first:
+  `orders o ON o.customer_id = c.id`; after `ON`, the conditions alone;
+- in `SELECT`, `WHERE`, `ORDER BY`...: the columns of the tables the
+  statement reads, with their types, qualified by alias when two tables
+  share a name, then functions and keywords;
+- after `alias.`, `table.` or `schema.`: that table's columns or that
+  schema's objects; after `INSERT INTO t (`: `t`'s columns; after `::`,
+  types.
+
+It knows the statement's aliases, subqueries and `WITH` queries, and the
+tables, views and foreign keys the script itself creates (`CREATE TABLE`
+with `REFERENCES`, `CREATE VIEW ... AS`) before they exist on the server.
+Columns and foreign keys are read from the server the first time they are
+needed; foreign keys come from the standard `information_schema`, so any
+database that has it is covered. ↑↓ choose, ↵ or ⇥ insert, esc closes.
+
 ## Browsing data and the result cache
 
 Clicking a table or view in the tree opens its data tab, as in DBeaver
@@ -180,6 +203,7 @@ icons come from `assets/app/violet.svg` (`scripts/app-icons.sh`).
 | ⌘/Ctrl + Enter | Run selection, or the statement under the cursor |
 | ⇧ + ⌘/Ctrl + Enter | Run the whole script |
 | ⌘/Ctrl + . | Cancel the running query |
+| ⌃ + Space | Complete the name under the cursor |
 | ⌘/Ctrl + T / W | New / close editor tab |
 | ⌘/Ctrl + N | New connection |
 | ⌘/Ctrl + B | Toggle sidebar |

@@ -26,7 +26,8 @@ pub struct Token {
     pub range: Range<usize>,
 }
 
-const KEYWORDS: &[&str] = &[
+/// Words coloured as keywords, sorted.
+pub const KEYWORDS: &[&str] = &[
     "ADD",
     "ALL",
     "ALTER",
@@ -153,7 +154,8 @@ const KEYWORDS: &[&str] = &[
     "WITH",
 ];
 
-const TYPES: &[&str] = &[
+/// Type names, sorted.
+pub const TYPES: &[&str] = &[
     "BIGINT",
     "BIGSERIAL",
     "BIT",
@@ -216,6 +218,12 @@ fn word_kind(word: &str) -> TokenKind {
     } else {
         TokenKind::Identifier
     }
+}
+
+/// Whether `word` is one of [`KEYWORDS`], in any case.
+#[must_use]
+pub fn is_keyword(word: &str) -> bool {
+    word_kind(word) == TokenKind::Keyword
 }
 
 /// Lazily splits `source` into tokens that cover it end to end, without
