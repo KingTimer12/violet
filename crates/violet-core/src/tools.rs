@@ -590,7 +590,11 @@ impl Task {
             }
         }
         if let Some(name) = &connection.password_env {
-            if !env_name_ok(name) {
+            // Only a password variable: a provider may not route the
+            // password into one a program logs or sends along, such as an
+            // application name.
+            let upper = name.to_ascii_uppercase();
+            if !env_name_ok(name) || !(upper.contains("PASSWORD") || upper.contains("PASSWD")) {
                 return bad(format!("{name:?} is not a usable password variable"));
             }
             connection_env.push(name.to_ascii_uppercase());
@@ -613,6 +617,7 @@ impl Task {
             plain_text(text)
                 && text.len() <= MAX_ARG
                 && !runs_commands(text)
+                && !names_a_connection(text)
                 && !connection_options
                     .iter()
                     .any(|option| lower.starts_with(&option.to_ascii_lowercase()))
@@ -722,7 +727,10 @@ impl Task {
             }
             for variable in &command.variables {
                 let upper = variable.name.to_ascii_uppercase();
-                if !env_name_ok(&variable.name) || connection_env.contains(&upper) {
+                if !env_name_ok(&variable.name)
+                    || connection_env.contains(&upper)
+                    || connection_variable(&upper)
+                {
                     return bad(format!("a command may not set {:?}", variable.name));
                 }
                 if let Some(condition) = variable.when.iter().find(|c| !condition_ok(c)) {
@@ -1068,6 +1076,78 @@ fn invalid(message: String) -> DbError {
 /// No control characters.
 fn plain_text(text: &str) -> bool {
     !text.chars().any(char::is_control)
+}
+
+/// Words that name where a client connects or as whom, as options
+/// (`--host=`) or in connection strings (`host=`): only the connection the
+/// task declares may set those.
+const CONNECTION_WORDS: &[&str] = &[
+    "host",
+    "hostaddr",
+    "hostname",
+    "port",
+    "user",
+    "username",
+    "login",
+    "dbname",
+    "database",
+    "db",
+    "server",
+    "service",
+    "servicefile",
+    "socket",
+    "url",
+    "uri",
+    "dsn",
+    "connect",
+    "connection",
+    "conninfo",
+    "password",
+    "passwd",
+    "pass",
+    "pwd",
+    "passfile",
+];
+
+/// Short options clients read a connection from (`-h host`, `-U user`).
+const CONNECTION_FLAGS: &[&str] = &["-h", "-p", "-U", "-u", "-d", "-S", "-H", "-P", "-W"];
+
+/// Whether fixed text sets a connection: an option named for one
+/// (`--host=`, `--dbname`, `-h`), or a connection string (`host=...`,
+/// `postgresql://`).
+fn names_a_connection(text: &str) -> bool {
+    if text.to_ascii_lowercase().contains("://") {
+        return true;
+    }
+    text.split(char::is_whitespace).any(|word| {
+        let short = CONNECTION_FLAGS
+            .iter()
+            .any(|flag| word.starts_with(flag) && !word.starts_with("--"));
+        let lower = word.to_ascii_lowercase();
+        let name = lower
+            .trim_start_matches('-')
+            .split(['=', ','])
+            .next()
+            .unwrap_or_default();
+        short
+            || CONNECTION_WORDS.contains(&name)
+            || lower.split(',').any(|item| {
+                item.split_once('=')
+                    .is_some_and(|(key, _)| CONNECTION_WORDS.contains(&key.trim_start_matches('-')))
+            })
+    })
+}
+
+/// A variable that would set where a client connects or as whom
+/// (`PGHOSTADDR`, `PGSERVICE`, `MYSQL_HOST`...).
+fn connection_variable(upper: &str) -> bool {
+    const ENDINGS: &[&str] = &[
+        "HOST", "HOSTADDR", "PORT", "USER", "DATABASE", "DBNAME", "SERVER", "SERVICE", "SOCKET",
+        "URL", "URI", "DSN", "PASSWORD", "PASSWD", "PWD",
+    ];
+    upper
+        .split('_')
+        .any(|word| ENDINGS.iter().any(|ending| word.ends_with(ending)))
 }
 
 /// A bare file name a task may run.
@@ -1465,6 +1545,74 @@ mod tests {
                 .parts
                 .push(CommandPart::Extra("format".into()))
         });
+    }
+
+    #[test]
+    fn templates_cannot_name_a_connection_themselves() {
+        for text in [
+            "--host=evil",
+            "--port=1",
+            "-h",
+            "-hevil",
+            "--dbname=host=evil",
+            "host=evil dbname=x",
+            "postgresql://evil/x",
+            "--username=root",
+            "--service=x",
+        ] {
+            assert!(names_a_connection(text), "{text}");
+        }
+        for text in [
+            "--no-password",
+            "--format=",
+            "--role=",
+            "--set=ON_ERROR_STOP=1",
+            "--exclude-table=",
+            "--echo-errors",
+            "plain",
+            "--use-set-session-authorization",
+        ] {
+            assert!(!names_a_connection(text), "{text}");
+        }
+        for name in [
+            "PGHOSTADDR",
+            "PGSERVICE",
+            "MYSQL_HOST",
+            "PGPORT",
+            "DB_PASSWORD",
+        ] {
+            assert!(connection_variable(name), "{name}");
+        }
+        for name in [
+            "PGSSLMODE",
+            "PGAPPNAME",
+            "PGCONNECT_TIMEOUT",
+            "PGSSLROOTCERT",
+        ] {
+            assert!(!connection_variable(name), "{name}");
+        }
+        let mut bad = task();
+        bad.connection.password_env = Some("PGAPPNAME".into());
+        assert!(
+            bad.check().is_err(),
+            "the password into an application name"
+        );
+        let mut bad = task();
+        bad.commands[0].variables.push(Variable {
+            when: Vec::new(),
+            name: "PGHOSTADDR".into(),
+            pieces: vec![text("6.6.6.6")],
+        });
+        assert!(bad.check().is_err());
+        let mut bad = task();
+        bad.connection.database = Some(Binding::Env("PGDATABASE".into()));
+        bad.commands[0]
+            .parts
+            .push(arg(Vec::new(), vec![text("--host=evil")]));
+        assert!(
+            bad.check().is_err(),
+            "even with the connection in variables"
+        );
     }
 
     #[test]
