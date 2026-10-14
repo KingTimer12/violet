@@ -5148,7 +5148,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "violet"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "eframe",
  "egui",
@@ -5172,7 +5172,7 @@ dependencies = [
 
 [[package]]
 name = "violet-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "hotpath",
@@ -5184,7 +5184,7 @@ dependencies = [
 
 [[package]]
 name = "violet-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "serde",
@@ -5195,7 +5195,7 @@ dependencies = [
 
 [[package]]
 name = "violet-provider-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde_json",
  "tokio",
@@ -5207,7 +5207,7 @@ dependencies = [
 
 [[package]]
 name = "violet-providers"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "hotpath",
@@ -5224,7 +5224,7 @@ dependencies = [
 
 [[package]]
 name = "violet-sdk"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "log",
  "wit-bindgen 0.62.0",
@@ -5232,7 +5232,7 @@ dependencies = [
 
 [[package]]
 name = "violet-storage"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "directories",
  "hotpath",
@@ -5246,7 +5246,7 @@ dependencies = [
 
 [[package]]
 name = "violet-wasm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "hotpath",
