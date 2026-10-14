@@ -2,7 +2,7 @@
 //! columns, loaded as they are expanded.
 
 use egui::{Align2, Color32, CornerRadius, Response, Sense, Ui, Vec2};
-use violet_core::{ConnectionProfile, DbObject, ObjectKind, ObjectRef, TaskKind};
+use violet_core::{ConnectionId, ConnectionProfile, DbObject, ObjectKind, ObjectRef, TaskKind};
 
 use super::action::Action;
 use super::icons::Icon;
@@ -333,14 +333,129 @@ fn connection(
     if !expanded {
         return;
     }
-    match explorer.schemas.get(&id).cloned().unwrap_or_default() {
-        Loadable::Idle | Loadable::Loading => loading_row(ui, 1),
-        Loadable::Failed(error) => error_row(ui, 1, &error),
-        Loadable::Ready(schemas) => {
-            for schema in schemas.iter() {
-                schema_node(ui, id, schema, explorer, actions);
+    // Every database on the server, when the connection lists them; else
+    // its own database's schemas straight away.
+    if profile.show_all_databases
+        && let Some(databases) = explorer.databases.get(&id).cloned()
+    {
+        match databases {
+            Loadable::Idle | Loadable::Loading => loading_row(ui, 1),
+            Loadable::Failed(error) => error_row(ui, 1, &error),
+            Loadable::Ready(databases) => {
+                for database in databases.iter() {
+                    database_node(ui, id, database, explorer, actions);
+                }
             }
         }
+        return;
+    }
+    schemas(ui, id, 1, explorer, actions);
+}
+
+/// `id`'s schemas, at `depth`.
+fn schemas(
+    ui: &mut Ui,
+    id: ConnectionId,
+    depth: usize,
+    explorer: &mut Explorer,
+    actions: &mut Vec<Action>,
+) {
+    match explorer.schemas.get(&id).cloned().unwrap_or_default() {
+        Loadable::Idle | Loadable::Loading => loading_row(ui, depth),
+        Loadable::Failed(error) => error_row(ui, depth, &error),
+        Loadable::Ready(schemas) => {
+            for schema in schemas.iter() {
+                schema_node(ui, id, schema, depth, explorer, actions);
+            }
+        }
+    }
+}
+
+/// A database of connection `parent`. Its own database is browsed on the
+/// connection's session; any other opens a session of its own.
+fn database_node(
+    ui: &mut Ui,
+    parent: ConnectionId,
+    database: &str,
+    explorer: &mut Explorer,
+    actions: &mut Vec<Action>,
+) {
+    let palette = Palette::current(ui.ctx());
+    let key = NodeKey::Database(parent, database.to_owned());
+    let own = matches!(
+        explorer.link(parent),
+        Link::Online(server) if server.database == database
+    );
+    let session = if own {
+        Some(parent)
+    } else {
+        explorer.opened(parent, database)
+    };
+    let link = session.map_or(Link::Offline, |id| explorer.link(id).clone());
+    let expanded = explorer.is_expanded(&key);
+
+    let mut row = Row::new(1, Icon::Database, database);
+    row.expanded = Some(expanded);
+    row.selected = explorer.selected.as_ref() == Some(&key);
+    row.loading = matches!(link, Link::Connecting);
+    row.strong = own;
+    if !own {
+        row.status = Some(match &link {
+            Link::Online(_) => palette.success,
+            Link::Connecting => palette.warning,
+            Link::Failed(_) => palette.danger,
+            Link::Offline => palette.dim.gamma_multiply(0.6),
+        });
+    }
+    let response = row.show(ui);
+    let response = match &link {
+        Link::Failed(error) => response.on_hover_text(error),
+        _ => response,
+    };
+    if response.clicked() {
+        explorer.selected = Some(key.clone());
+        if expanded && link.is_online() {
+            explorer.toggle(key.clone());
+        } else {
+            actions.push(Action::OpenDatabase(parent, database.to_owned()));
+        }
+    }
+    response.context_menu(|ui| {
+        match session.filter(|_| link.is_online()) {
+            Some(session) => {
+                if menu_item(ui, Icon::Terminal, "New SQL editor") {
+                    actions.push(Action::OpenEditor {
+                        connection: Some(session),
+                        sql: String::new(),
+                    });
+                }
+                if menu_item(ui, Icon::Refresh, "Refresh") {
+                    actions.push(Action::Refresh(session));
+                }
+                if !own && menu_item(ui, Icon::Power, "Disconnect") {
+                    actions.push(Action::Disconnect(session));
+                }
+            }
+            None => {
+                if menu_item(ui, Icon::Plug, "Connect") {
+                    actions.push(Action::OpenDatabase(parent, database.to_owned()));
+                }
+            }
+        }
+        if menu_item(ui, Icon::Copy, "Copy name") {
+            actions.push(Action::Copy(database.to_owned()));
+        }
+    });
+
+    if !expanded {
+        return;
+    }
+    match (session, &link) {
+        (Some(session), Link::Online(_)) => schemas(ui, session, 2, explorer, actions),
+        (_, Link::Failed(error)) => error_row(ui, 2, error),
+        (_, Link::Connecting) => loading_row(ui, 2),
+        // Closed since it was opened: a click opens it again.
+        _ => {}
     }
 }
 
@@ -348,6 +463,7 @@ fn schema_node(
     ui: &mut Ui,
     id: violet_core::ConnectionId,
     schema: &str,
+    depth: usize,
     explorer: &mut Explorer,
     actions: &mut Vec<Action>,
 ) {
@@ -370,7 +486,7 @@ fn schema_node(
         return;
     }
 
-    let mut row = Row::new(1, Icon::Schema, schema);
+    let mut row = Row::new(depth, Icon::Schema, schema);
     row.expanded = Some(expanded);
     row.selected = explorer.selected.as_ref() == Some(&key);
     row.loading = objects.is_loading();
@@ -417,8 +533,8 @@ fn schema_node(
         return;
     }
     match objects {
-        Loadable::Idle | Loadable::Loading => loading_row(ui, 2),
-        Loadable::Failed(error) => error_row(ui, 2, &error),
+        Loadable::Idle | Loadable::Loading => loading_row(ui, depth + 1),
+        Loadable::Failed(error) => error_row(ui, depth + 1, &error),
         Loadable::Ready(objects) => {
             // One pass sorts the objects into their groups.
             let mut groups: [Vec<&DbObject>; ObjectKind::ALL.len()] = Default::default();
@@ -439,6 +555,7 @@ fn schema_node(
                     ui,
                     id,
                     schema,
+                    depth + 1,
                     kind,
                     members,
                     explorer,
@@ -455,6 +572,7 @@ fn group_node(
     ui: &mut Ui,
     id: violet_core::ConnectionId,
     schema: &str,
+    depth: usize,
     kind: ObjectKind,
     members: &[&DbObject],
     explorer: &mut Explorer,
@@ -464,7 +582,7 @@ fn group_node(
     let key = NodeKey::Group(id, schema.to_owned(), kind);
     let expanded = filtering || explorer.is_expanded(&key);
     let count = members.len().to_string();
-    let mut row = Row::new(2, Icon::Folder, kind.plural());
+    let mut row = Row::new(depth, Icon::Folder, kind.plural());
     row.expanded = Some(expanded);
     row.detail = Some(&count);
     if row.show(ui).clicked() {
@@ -474,7 +592,7 @@ fn group_node(
         return;
     }
     for object in members {
-        object_node(ui, id, object, explorer, actions);
+        object_node(ui, id, object, depth + 1, explorer, actions);
     }
 }
 
@@ -482,6 +600,7 @@ fn object_node(
     ui: &mut Ui,
     id: violet_core::ConnectionId,
     object: &DbObject,
+    depth: usize,
     explorer: &mut Explorer,
     actions: &mut Vec<Action>,
 ) {
@@ -502,7 +621,7 @@ fn object_node(
         .filter(|_| relation)
         .map(compact_count);
 
-    let mut row = Row::new(3, Icon::for_kind(object.kind), &object.name);
+    let mut row = Row::new(depth, Icon::for_kind(object.kind), &object.name);
     row.expanded = relation.then_some(expanded);
     row.selected = explorer.selected.as_ref() == Some(&key);
     row.loading = columns.is_loading();
@@ -583,8 +702,8 @@ fn object_node(
         return;
     }
     match columns {
-        Loadable::Idle | Loadable::Loading => loading_row(ui, 4),
-        Loadable::Failed(error) => error_row(ui, 4, &error),
+        Loadable::Idle | Loadable::Loading => loading_row(ui, depth + 1),
+        Loadable::Failed(error) => error_row(ui, depth + 1, &error),
         Loadable::Ready(columns) => {
             for column in columns.iter() {
                 let palette = Palette::current(ui.ctx());
@@ -593,7 +712,7 @@ fn object_node(
                 } else {
                     Icon::Columns
                 };
-                let mut row = Row::new(4, icon, &column.name);
+                let mut row = Row::new(depth + 1, icon, &column.name);
                 row.detail = Some(&column.data_type);
                 if column.primary_key {
                     row.icon_tint = Some(palette.warning);

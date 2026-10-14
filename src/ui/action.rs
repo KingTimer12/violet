@@ -33,6 +33,9 @@ pub enum Action {
     DeleteConnection(ConnectionId),
     Connect(ConnectionId),
     Disconnect(ConnectionId),
+    /// Opens a database of a connection that shows them all, in a session
+    /// of its own.
+    OpenDatabase(ConnectionId, String),
     Refresh(ConnectionId),
     LoadObjects(ConnectionId, String),
     LoadColumns(ConnectionId, String, String),

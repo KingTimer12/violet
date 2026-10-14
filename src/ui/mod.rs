@@ -23,6 +23,7 @@ mod toasts;
 mod widgets;
 mod workspace;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::{Hash as _, Hasher as _};
 use std::path::PathBuf;
@@ -32,7 +33,7 @@ use std::time::{Duration, Instant, SystemTime};
 use egui::{Frame, Id, Panel, Stroke};
 use violet_app::{Backend, CachePolicy, Event, ExecOptions, ProfileService, TaskId};
 use violet_core::ports::{HistoryEntry, QueryHistory};
-use violet_core::{ConnectionId, DriverId, ErrorKind, Page};
+use violet_core::{ConnectionId, ConnectionProfile, DriverId, ErrorKind, Page};
 use violet_storage::JsonFile;
 
 use crate::completion::{self, Need};
@@ -111,6 +112,58 @@ pub struct VioletApp {
     started: HashMap<TaskId, task_flow::Started>,
     #[cfg(debug_assertions)]
     snapshot: Option<devtools::Snapshot>,
+}
+
+fn connection_name(
+    profiles: &ProfileService,
+    explorer: &Explorer,
+    id: ConnectionId,
+) -> Option<String> {
+    match explorer.opened.get(&id) {
+        Some((parent, database)) => profiles
+            .get(*parent)
+            .map(|profile| format!("{} · {database}", profile.display_name())),
+        None => profiles.get(id).map(ConnectionProfile::display_name),
+    }
+}
+
+/// The profile a session opens with: a saved connection's, or for another
+/// of its databases, the connection's on that database. Its id stays the
+/// connection's, where the password is kept.
+fn session_profile(
+    profiles: &ProfileService,
+    explorer: &Explorer,
+    id: ConnectionId,
+) -> Option<ConnectionProfile> {
+    match explorer.opened.get(&id) {
+        Some((parent, database)) => profiles.get(*parent).map(|profile| {
+            let mut profile = profile.clone();
+            profile.database.clone_from(database);
+            profile
+        }),
+        None => profiles.get(id).cloned(),
+    }
+}
+
+/// The saved connections, then the other databases opened, each as a
+/// connection of its own: what editors can run on.
+fn connections<'a>(
+    profiles: &'a ProfileService,
+    explorer: &Explorer,
+) -> Cow<'a, [ConnectionProfile]> {
+    if explorer.opened.is_empty() {
+        return Cow::Borrowed(profiles.all());
+    }
+    let mut opened: Vec<_> = explorer.opened.keys().copied().collect();
+    opened.sort_by_key(|id| connection_name(profiles, explorer, *id));
+    let mut all = profiles.all().to_vec();
+    all.extend(opened.into_iter().filter_map(|id| {
+        let mut profile = session_profile(profiles, explorer, id)?;
+        profile.name = connection_name(profiles, explorer, id)?;
+        profile.id = id;
+        Some(profile)
+    }));
+    Cow::Owned(all)
 }
 
 impl VioletApp {
@@ -287,10 +340,38 @@ impl VioletApp {
     }
 
     fn profile_name(&self, id: ConnectionId) -> String {
-        self.profiles.get(id).map_or_else(
-            || "connection".to_owned(),
-            violet_core::ConnectionProfile::display_name,
-        )
+        self.connection_name(id)
+            .unwrap_or_else(|| "connection".to_owned())
+    }
+
+    fn connection_name(&self, id: ConnectionId) -> Option<String> {
+        connection_name(&self.profiles, &self.explorer, id)
+    }
+
+    fn profile(&self, id: ConnectionId) -> Option<ConnectionProfile> {
+        session_profile(&self.profiles, &self.explorer, id)
+    }
+
+    /// Whether `id` is a saved connection that lists its server's databases.
+    fn shows_all_databases(&self, id: ConnectionId) -> bool {
+        self.profiles.get(id).is_some_and(|profile| {
+            profile.show_all_databases
+                && self
+                    .backend
+                    .registry()
+                    .get(&profile.driver)
+                    .is_some_and(|driver| driver.info().capabilities.databases)
+        })
+    }
+
+    /// Closes the sessions on other databases of `parent`.
+    fn disconnect_opened(&mut self, parent: ConnectionId) {
+        for id in self.explorer.opened_under(parent) {
+            if self.backend.is_connected(id) {
+                self.backend.disconnect(id);
+            }
+            self.explorer.links.insert(id, Link::Offline);
+        }
     }
 
     // ---- events from the backend ---------------------------------------
@@ -313,6 +394,10 @@ impl VioletApp {
                 self.explorer.forget(id);
                 self.explorer.schemas.insert(id, Loadable::Loading);
                 self.backend.load_schemas(id);
+                if self.shows_all_databases(id) {
+                    self.explorer.databases.insert(id, Loadable::Loading);
+                    self.backend.load_databases(id);
+                }
                 let ready: Vec<_> = self
                     .queued
                     .iter()
@@ -339,8 +424,7 @@ impl VioletApp {
                 });
                 let needs_password = error.kind == ErrorKind::Authentication
                     && self
-                        .profiles
-                        .get(id)
+                        .profile(id)
                         .is_some_and(|profile| !profile.save_password);
                 self.explorer
                     .links
@@ -364,6 +448,11 @@ impl VioletApp {
             Event::Disconnected { id } => {
                 self.explorer.links.insert(id, Link::Offline);
                 self.explorer.forget(id);
+            }
+            Event::Databases { id, result } => {
+                self.explorer
+                    .databases
+                    .insert(id, Loadable::from_result(result));
             }
             Event::Schemas { id, result } => {
                 if let Ok(schemas) = &result {
@@ -437,8 +526,7 @@ impl VioletApp {
                         }),
                     connection,
                     source: connection
-                        .and_then(|id| self.profiles.get(id))
-                        .map(violet_core::ConnectionProfile::display_name)
+                        .and_then(|id| connection_name(&self.profiles, &self.explorer, id))
                         .unwrap_or_default(),
                     sql: sql::redact_secrets(&running.executed.sql),
                     elapsed_ms: u64::try_from(
@@ -664,14 +752,40 @@ impl VioletApp {
     }
 
     fn connect(&mut self, id: ConnectionId, password: Option<violet_core::Secret>) {
-        let Some(profile) = self.profiles.get(id).cloned() else {
+        let Some(profile) = self.profile(id) else {
             return;
         };
         if matches!(self.explorer.link(id), Link::Connecting) {
             return;
         }
         self.explorer.links.insert(id, Link::Connecting);
-        self.backend.connect(profile, password);
+        self.backend.connect_to(id, profile, password);
+    }
+
+    /// Opens `database` of connection `parent`: its own database is the
+    /// connection's session, any other gets a session of its own.
+    fn open_database(&mut self, parent: ConnectionId, database: String) {
+        let own = matches!(
+            self.explorer.link(parent),
+            Link::Online(server) if server.database == database
+        );
+        let key = NodeKey::Database(parent, database.clone());
+        if own {
+            self.explorer.expanded.insert(key);
+            return;
+        }
+        let id = match self.explorer.opened(parent, &database) {
+            Some(id) => id,
+            None => {
+                let id = ConnectionId::new();
+                self.explorer.opened.insert(id, (parent, database));
+                id
+            }
+        };
+        self.explorer.expanded.insert(key);
+        if !matches!(self.explorer.link(id), Link::Online(_)) {
+            self.connect(id, None);
+        }
     }
 
     // ---- running queries ------------------------------------------------
@@ -1032,10 +1146,16 @@ impl VioletApp {
                 }
                 match self.profiles.remove(id) {
                     Ok(()) => {
-                        self.explorer.remove(id);
-                        for tab in &mut self.workspace.tabs {
-                            if tab.connection == Some(id) {
-                                tab.connection = None;
+                        self.disconnect_opened(id);
+                        let mut gone = self.explorer.opened_under(id);
+                        gone.push(id);
+                        for gone in gone {
+                            self.explorer.remove(gone);
+                            self.explorer.opened.remove(&gone);
+                            for tab in &mut self.workspace.tabs {
+                                if tab.connection == Some(gone) {
+                                    tab.connection = None;
+                                }
                             }
                         }
                     }
@@ -1048,13 +1168,19 @@ impl VioletApp {
             Action::Connect(id) => self.connect(id, None),
             Action::ConnectWithPassword(id, password) => self.connect(id, Some(password)),
             Action::Disconnect(id) => {
+                self.disconnect_opened(id);
                 self.explorer.links.insert(id, Link::Offline);
                 self.backend.disconnect(id);
             }
+            Action::OpenDatabase(parent, database) => self.open_database(parent, database),
             Action::Refresh(id) => {
                 self.explorer.forget(id);
                 self.explorer.schemas.insert(id, Loadable::Loading);
                 self.backend.load_schemas(id);
+                if self.shows_all_databases(id) {
+                    self.explorer.databases.insert(id, Loadable::Loading);
+                    self.backend.load_databases(id);
+                }
             }
             Action::LoadObjects(id, schema) => self.load_objects(id, schema),
             Action::LoadColumns(id, schema, relation) => self.load_columns(id, schema, relation),
@@ -1069,6 +1195,9 @@ impl VioletApp {
                 match self.profiles.upsert(profile, password.as_ref()) {
                     Ok(()) => {
                         self.names_unchecked = true;
+                        // Other databases open on the old settings close; they
+                        // reopen from the tree.
+                        self.disconnect_opened(id);
                         if connect || reconnect {
                             self.explorer.expanded.insert(NodeKey::Connection(id));
                             self.explorer.links.remove(&id);
@@ -1299,13 +1428,14 @@ impl VioletApp {
             .frame(Frame::NONE)
             .show_separator_line(false)
             .show(ui, |ui| {
-                chrome::tab_strip(ui, &self.workspace, self.profiles.all(), &mut self.actions)
+                let connections = connections(&self.profiles, &self.explorer);
+                chrome::tab_strip(ui, &self.workspace, &connections, &mut self.actions);
             });
 
         let Some(active) = self.workspace.active else {
             return;
         };
-        let profiles = self.profiles.all();
+        let profiles = &*connections(&self.profiles, &self.explorer);
         let explorer = &self.explorer;
         let actions = &mut self.actions;
         let Some(tab) = self.workspace.tabs.iter_mut().find(|tab| tab.id == active) else {
@@ -1489,9 +1619,9 @@ impl eframe::App for VioletApp {
                 chrome::status_bar(
                     ui,
                     self.workspace.active(),
-                    self.profiles.all(),
+                    &connections(&self.profiles, &self.explorer),
                     &self.explorer,
-                )
+                );
             });
 
         let mut sidebar_open = self.settings.sidebar;

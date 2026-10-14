@@ -129,6 +129,10 @@ pub struct ConnectionProfile {
     /// An accent to tell environments apart (production in red, say).
     #[serde(default)]
     pub color: Option<[u8; 3]>,
+    /// Whether the tree lists every database on the server, not only this
+    /// one, where the driver can list them.
+    #[serde(default)]
+    pub show_all_databases: bool,
     /// Driver specific settings the generic form does not cover.
     #[serde(default)]
     pub options: BTreeMap<String, String>,
@@ -148,6 +152,7 @@ impl ConnectionProfile {
             ssl: SslMode::default(),
             save_password: true,
             color: None,
+            show_all_databases: false,
             options: BTreeMap::new(),
         }
     }

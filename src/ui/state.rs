@@ -48,6 +48,8 @@ impl Link {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NodeKey {
     Connection(ConnectionId),
+    /// A database of a connection that shows them all.
+    Database(ConnectionId, String),
     Schema(ConnectionId, String),
     Group(ConnectionId, String, ObjectKind),
     Object(ConnectionId, String, String),
@@ -64,6 +66,12 @@ pub type RelationKey = (ConnectionId, String, String);
 #[derive(Default)]
 pub struct Explorer {
     pub links: HashMap<ConnectionId, Link>,
+    /// The databases on each connection's server, for connections that
+    /// show them all.
+    pub databases: HashMap<ConnectionId, Loadable<Arc<[String]>>>,
+    /// Sessions opened on another database of a saved connection: their
+    /// connection and database. They come and go with the app.
+    pub opened: HashMap<ConnectionId, (ConnectionId, String)>,
     pub schemas: HashMap<ConnectionId, Loadable<Arc<[String]>>>,
     pub objects: HashMap<(ConnectionId, String), Loadable<Arc<[DbObject]>>>,
     pub columns: HashMap<RelationKey, Loadable<Arc<[ColumnInfo]>>>,
@@ -96,6 +104,7 @@ impl Explorer {
     /// Forgets everything loaded for a connection, keeping expansion so a
     /// reconnect reopens the same branches.
     pub fn forget(&mut self, id: ConnectionId) {
+        self.databases.remove(&id);
         self.schemas.remove(&id);
         self.objects.retain(|(owner, _), _| *owner != id);
         self.columns.retain(|(owner, _, _), _| *owner != id);
@@ -130,6 +139,23 @@ impl Explorer {
         path
     }
 
+    /// The session opened on `database` of connection `parent`.
+    pub fn opened(&self, parent: ConnectionId, database: &str) -> Option<ConnectionId> {
+        self.opened
+            .iter()
+            .find(|(_, (owner, name))| *owner == parent && name == database)
+            .map(|(id, _)| *id)
+    }
+
+    /// The sessions opened on other databases of `parent`.
+    pub fn opened_under(&self, parent: ConnectionId) -> Vec<ConnectionId> {
+        self.opened
+            .iter()
+            .filter(|(_, (owner, _))| *owner == parent)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
     pub fn remove(&mut self, id: ConnectionId) {
         self.forget(id);
         self.links.remove(&id);
@@ -143,6 +169,7 @@ impl Explorer {
 fn owner(key: &NodeKey) -> ConnectionId {
     match key {
         NodeKey::Connection(id)
+        | NodeKey::Database(id, _)
         | NodeKey::Schema(id, _)
         | NodeKey::Group(id, _, _)
         | NodeKey::Object(id, _, _) => *id,
