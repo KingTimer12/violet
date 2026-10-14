@@ -292,6 +292,28 @@ changed:
 cargo run --release
 ```
 
+### Linux and WSL: the keychain
+
+On Linux, saved passwords go to the Secret Service over D-Bus. GNOME and
+KDE desktops run one; WSL, minimal window managers and headless sessions
+usually do not, and saving a connection fails with:
+
+```
+Keychain: Platform secure storage failure: DBus error: The name
+org.freedesktop.secrets was not provided by any .service files
+```
+
+Install `gnome-keyring`, then start it with a default keyring, unlocked
+(the password you pipe in becomes the keyring's):
+
+```sh
+sudo apt install gnome-keyring
+echo -n '<keyring password>' | gnome-keyring-daemon --replace --unlock --components=secrets -d
+```
+
+On WSL the daemon does not survive a restart: run the second line again
+before starting Violet, or add it to your shell's startup file.
+
 ### Releases
 
 `.github/workflows/release.yml` builds Violet for every platform, and the
