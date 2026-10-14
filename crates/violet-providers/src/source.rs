@@ -101,12 +101,19 @@ impl Source {
                     .get(url)
                     .call()
                     .map_err(|e| error(format!("Could not download {url}: {e}")))?;
-                response
+                // ureq fails a body of exactly its limit (it refuses the
+                // read that would find the end), so it gets one byte more
+                // and the limit is enforced here.
+                let body = response
                     .body_mut()
                     .with_config()
-                    .limit(limit)
+                    .limit(limit.saturating_add(1))
                     .read_to_vec()
-                    .map_err(|e| error(format!("Could not download {url}: {e}")))
+                    .map_err(|e| error(format!("Could not download {url}: {e}")))?;
+                if body.len() as u64 > limit {
+                    return Err(error(format!("{url} is too large")));
+                }
+                Ok(body)
             }
         }
     }
@@ -149,6 +156,33 @@ mod tests {
             Source::parse("/tmp/p.json").ok(),
             Some(Source::File("/tmp/p.json".into()))
         );
+    }
+
+    /// Serves `body` once over plain HTTP on loopback.
+    fn serve(body: &'static [u8]) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(body);
+        });
+        format!("http://{address}/p.wasm")
+    }
+
+    #[test]
+    fn downloads_may_be_exactly_the_limit() {
+        let exact = Source::parse(&serve(b"hello")).expect("source");
+        assert_eq!(exact.read(5).expect("exact size"), b"hello");
+        let bigger = Source::parse(&serve(b"hello!")).expect("source");
+        assert!(bigger.read(5).is_err());
     }
 
     #[test]
