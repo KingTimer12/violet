@@ -1,6 +1,7 @@
 //! Open tabs: SQL editors and table data views.
 
 use std::ops::Range;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -128,6 +129,15 @@ pub struct QueryTab {
     pub highlighter: Highlighter,
     /// Completion, while it shows.
     pub popup: Popup,
+    /// The file the script is saved in, and its text as last read or
+    /// written there.
+    pub file: Option<ScriptFile>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScriptFile {
+    pub path: PathBuf,
+    pub saved: String,
 }
 
 impl QueryTab {
@@ -136,6 +146,13 @@ impl QueryTab {
             TabKind::Data(view) => Some(view),
             TabKind::Script => None,
         }
+    }
+
+    /// Whether the script has changes its file does not.
+    pub fn unsaved(&self) -> bool {
+        self.file
+            .as_ref()
+            .is_some_and(|file| file.saved != self.sql)
     }
 
     pub fn data_mut(&mut self) -> Option<&mut DataView> {
@@ -175,6 +192,9 @@ pub struct SavedTab {
     pub title: String,
     pub connection: Option<ConnectionId>,
     pub sql: String,
+    /// The file the script is saved in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -209,6 +229,7 @@ impl Workspace {
             last_run: None,
             highlighter: Highlighter::default(),
             popup: Popup::default(),
+            file: None,
         });
         self.active = Some(id);
         id
@@ -230,6 +251,7 @@ impl Workspace {
                     title: tab.title.clone(),
                     connection: tab.connection,
                     sql: tab.sql.clone(),
+                    path: tab.file.as_ref().map(|file| file.path.clone()),
                 })
                 .collect(),
         }
@@ -241,7 +263,15 @@ impl Workspace {
         let mut ids = Vec::new();
         for tab in session.tabs {
             let connection = tab.connection.filter(|id| exists(*id));
-            ids.push(self.open(tab.title, connection, tab.sql, TabKind::Script));
+            let id = self.open(tab.title, connection, tab.sql, TabKind::Script);
+            if let (Some(path), Some(opened)) = (tab.path, self.get_mut(id)) {
+                // Compared with the file once it is read.
+                opened.file = Some(ScriptFile {
+                    path,
+                    saved: opened.sql.clone(),
+                });
+            }
+            ids.push(id);
         }
         self.active = session
             .active
@@ -255,6 +285,14 @@ impl Workspace {
             .map(|n| format!("Script {n}"))
             .find(|title| !self.tabs.iter().any(|tab| tab.title == *title))
             .unwrap_or_default()
+    }
+
+    /// The editor open on the script at `path`.
+    pub fn script_tab(&self, path: &std::path::Path) -> Option<TabId> {
+        self.tabs
+            .iter()
+            .find(|tab| tab.file.as_ref().is_some_and(|file| file.path == path))
+            .map(|tab| tab.id)
     }
 
     pub fn get(&self, id: TabId) -> Option<&QueryTab> {

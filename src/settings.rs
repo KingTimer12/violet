@@ -52,6 +52,8 @@ pub struct Settings {
     /// Where backups went last, and how they were named.
     pub backup_folder: String,
     pub backup_name: String,
+    /// Where a script was last saved, for the file dialogs.
+    pub script_folder: String,
 }
 
 impl Default for Settings {
@@ -66,6 +68,7 @@ impl Default for Settings {
             task_settings: BTreeMap::new(),
             backup_folder: String::new(),
             backup_name: String::new(),
+            script_folder: String::new(),
         }
     }
 }

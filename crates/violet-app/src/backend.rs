@@ -96,6 +96,11 @@ pub enum Event {
     Disconnected {
         id: ConnectionId,
     },
+    /// The other databases on the session's server.
+    Databases {
+        id: ConnectionId,
+        result: Result<Vec<String>>,
+    },
     Schemas {
         id: ConnectionId,
         result: Result<Vec<String>>,
@@ -743,9 +748,20 @@ impl Backend {
 
     /// Opens a session for `profile`, replacing one already open.
     pub fn connect(&self, profile: ConnectionProfile, password: Option<Secret>) {
+        self.connect_to(profile.id, profile, password);
+    }
+
+    /// Opens a session for `profile` as `id`, replacing one already open:
+    /// another database of a saved connection, whose password is the
+    /// connection's own.
+    pub fn connect_to(
+        &self,
+        id: ConnectionId,
+        profile: ConnectionProfile,
+        password: Option<Secret>,
+    ) {
         let shared = Arc::clone(&self.shared);
         self.runtime.spawn(async move {
-            let id = profile.id;
             match shared.open(&profile, password).await {
                 Ok((session, server)) => {
                     // A new session may see other data (another database,
@@ -788,6 +804,17 @@ impl Backend {
                 session.close().await;
             }
             shared.emit(Event::Disconnected { id });
+        });
+    }
+
+    pub fn load_databases(&self, id: ConnectionId) {
+        let shared = Arc::clone(&self.shared);
+        self.runtime.spawn(async move {
+            let result = match shared.session(id) {
+                Ok(session) => session.databases().await,
+                Err(error) => Err(error),
+            };
+            shared.emit(Event::Databases { id, result });
         });
     }
 

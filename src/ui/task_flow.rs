@@ -48,7 +48,7 @@ impl VioletApp {
         kind: TaskKind,
         objects: Vec<ObjectRef>,
     ) {
-        let Some(profile) = self.profiles.get(connection) else {
+        let Some(profile) = self.profile(connection) else {
             return;
         };
         let driver = profile.driver.clone();
@@ -158,7 +158,7 @@ impl VioletApp {
         Option<PathBuf>,
     )> {
         let dialog = self.task_dialog.as_ref()?;
-        let profile = self.profiles.get(dialog.connection)?.clone();
+        let profile = self.profile(dialog.connection)?;
         let Some(Loadable::Ready(offer)) = self.tasks.get(&dialog.driver) else {
             return None;
         };
@@ -343,7 +343,9 @@ impl VioletApp {
         let Some(dialog) = &mut self.task_dialog else {
             return;
         };
-        let Some(profile) = self.profiles.get(dialog.connection) else {
+        let Some(profile) =
+            super::session_profile(&self.profiles, &self.explorer, dialog.connection)
+        else {
             self.task_dialog = None;
             return;
         };
@@ -353,7 +355,7 @@ impl VioletApp {
             .get(&dialog.driver)
             .map_or_else(|| dialog.driver.to_string(), |driver| driver.info().name);
         let env = tasks::Env {
-            profile,
+            profile: &profile,
             offer: self.tasks.get(&dialog.driver),
             tools: self.tools.get(&dialog.driver),
             explorer: &self.explorer,

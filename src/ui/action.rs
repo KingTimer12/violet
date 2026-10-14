@@ -33,6 +33,12 @@ pub enum Action {
     DeleteConnection(ConnectionId),
     Connect(ConnectionId),
     Disconnect(ConnectionId),
+    /// Opens a database of a connection that shows them all, in a session
+    /// of its own.
+    OpenDatabase(ConnectionId, String),
+    /// Opens the backup or restore dialog for a database of a connection
+    /// that shows them all, whether or not it is open.
+    DatabaseTask(ConnectionId, String, TaskKind),
     Refresh(ConnectionId),
     LoadObjects(ConnectionId, String),
     LoadColumns(ConnectionId, String, String),
@@ -59,6 +65,17 @@ pub enum Action {
         relation: String,
     },
     Run(TabId, RunScope),
+    /// Saves an editor: to its file, else as a script of its connection's
+    /// database, else wherever the user picks.
+    SaveScript(TabId),
+    /// Saves an editor to a file the user picks.
+    SaveScriptAs(TabId),
+    /// Saves an editor as a script of its connection's database, named.
+    SaveScriptNamed(TabId, String),
+    /// Opens a `.sql` file the user picks.
+    OpenScriptFile,
+    /// Opens a script, on the database it was saved for.
+    OpenScript(PathBuf),
     /// Reads the shown result again, skipping the cache.
     RefreshTab(TabId),
     /// Applies a data tab's filter box.

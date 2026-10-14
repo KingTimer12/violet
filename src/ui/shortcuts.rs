@@ -19,4 +19,7 @@ pub const NEW_CONNECTION: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CO
 pub const TOGGLE_SIDEBAR: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::B);
 pub const EXPLAIN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::E);
 pub const EXPLAIN_ANALYZE: KeyboardShortcut = KeyboardShortcut::new(COMMAND_SHIFT, Key::E);
+pub const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
+pub const SAVE_AS: KeyboardShortcut = KeyboardShortcut::new(COMMAND_SHIFT, Key::S);
+pub const OPEN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::O);
 pub const HISTORY: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Y);

@@ -82,6 +82,13 @@ impl AppDirs {
         self.state.join("history.jsonl")
     }
 
+    /// SQL scripts saved for connections, one folder per connection and
+    /// database.
+    #[must_use]
+    pub fn scripts_dir(&self) -> PathBuf {
+        self.data.join("scripts")
+    }
+
     /// The editors open when Violet last closed.
     #[must_use]
     pub fn session_file(&self) -> PathBuf {

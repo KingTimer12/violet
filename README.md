@@ -74,6 +74,10 @@ DBeaver bundles every driver it might need. Violet starts with none:
 3. The package button in the title bar lists providers, installs updates
    and removes them.
 
+With **Show all databases** ticked in a connection's settings, the tree
+lists every database on its server, as DBeaver does; each one opens in a
+session of its own, with the connection's password.
+
 Each provider runs in its own sandbox, per connection: no files, no
 environment, no network except a socket to the host and port of the
 profile it serves, with TLS done by Violet. Even a hostile provider cannot
@@ -145,6 +149,23 @@ Nothing is lost between runs:
   connections are saved as you type (`session.json`, next to the history,
   mode `0600`) and reopened on the next start. Like a `.sql` file you
   save, it keeps the text exactly as typed, passwords included.
+
+## Scripts
+
+⌘/Ctrl + S saves an editor as a script of its connection and database, as
+DBeaver does: the first time it asks for a name, and the file goes to
+Violet's scripts folder (on Linux `~/.local/share/violet/scripts`), at
+`<connection id>/<database>/<name>.sql`. The tree lists a connection's
+scripts under **Scripts**, with the database when it is not the
+connection's own; clicking one opens it on that database, in a session of
+its own if needed. Moving an editor to another connection or database and
+saving moves its script along. A dot after a tab's title marks changes
+not saved yet.
+
+⇧ + ⌘/Ctrl + S saves to a `.sql` file anywhere, and ⌘/Ctrl + O opens one
+(a script of the scripts folder on its database, any other file on the
+current editor's connection). Scripts are plain files, written with mode
+`0600` since they may hold passwords as typed.
 
 ## Backup and restore
 
@@ -292,6 +313,28 @@ changed:
 cargo run --release
 ```
 
+### Linux and WSL: the keychain
+
+On Linux, saved passwords go to the Secret Service over D-Bus. GNOME and
+KDE desktops run one; WSL, minimal window managers and headless sessions
+usually do not, and saving a connection fails with:
+
+```
+Keychain: Platform secure storage failure: DBus error: The name
+org.freedesktop.secrets was not provided by any .service files
+```
+
+Install `gnome-keyring`, then start it with a default keyring, unlocked
+(the password you pipe in becomes the keyring's):
+
+```sh
+sudo apt install gnome-keyring
+echo -n '<keyring password>' | gnome-keyring-daemon --replace --unlock --components=secrets -d
+```
+
+On WSL the daemon does not survive a restart: run the second line again
+before starting Violet, or add it to your shell's startup file.
+
 ### Releases
 
 `.github/workflows/release.yml` builds Violet for every platform, and the
@@ -321,6 +364,9 @@ icons come from `assets/app/violet.svg` (`scripts/app-icons.sh`).
 | ⌘/Ctrl + . | Cancel the running query |
 | ⌘/Ctrl + E | Explain the statement under the cursor |
 | ⇧ + ⌘/Ctrl + E | Explain analyze it (reads only) |
+| ⌘/Ctrl + S | Save the script |
+| ⇧ + ⌘/Ctrl + S | Save the script as a file |
+| ⌘/Ctrl + O | Open a script file |
 | ⌘/Ctrl + Y | Query history |
 | ⌃ + Space | Complete the name under the cursor |
 | ⌘/Ctrl + T / W | New / close editor tab |
