@@ -13,6 +13,7 @@ mod history;
 pub mod icons;
 mod providers;
 mod results;
+mod script_flow;
 mod shortcuts;
 mod sidebar;
 mod state;
@@ -34,7 +35,7 @@ use egui::{Frame, Id, Panel, Stroke};
 use violet_app::{Backend, CachePolicy, Event, ExecOptions, ProfileService, TaskId};
 use violet_core::ports::{HistoryEntry, QueryHistory};
 use violet_core::{ConnectionId, ConnectionProfile, DriverId, ErrorKind, Page};
-use violet_storage::JsonFile;
+use violet_storage::{JsonFile, SavedScript, ScriptStore};
 
 use crate::completion::{self, Need};
 use crate::settings::Settings;
@@ -71,6 +72,7 @@ pub struct Services {
     pub history: Arc<dyn QueryHistory>,
     /// The editors open last time.
     pub session: JsonFile<SavedSession>,
+    pub scripts: ScriptStore,
 }
 
 pub struct VioletApp {
@@ -85,6 +87,10 @@ pub struct VioletApp {
     providers: providers::Providers,
     providers_dir: PathBuf,
     prompt: Option<PasswordPrompt>,
+    scripts: ScriptStore,
+    /// The scripts saved for connections, as last listed.
+    script_list: Vec<SavedScript>,
+    script_prompt: Option<script_flow::ScriptPrompt>,
     confirm_delete: Option<ConnectionId>,
     /// Runs waiting for their tab's connection to open.
     queued: Vec<(TabId, RunScope)>,
@@ -185,6 +191,9 @@ impl VioletApp {
             providers: providers::Providers::default(),
             providers_dir: services.providers_dir,
             prompt: None,
+            scripts: services.scripts,
+            script_list: Vec::new(),
+            script_prompt: None,
             confirm_delete: None,
             queued: Vec::new(),
             actions: Vec::new(),
@@ -215,6 +224,8 @@ impl VioletApp {
             ),
         }
         app.restore_session(ctx);
+        app.reattach_scripts();
+        app.reload_scripts(ctx);
         app.load_providers();
         app
     }
@@ -774,13 +785,8 @@ impl VioletApp {
             self.explorer.expanded.insert(key);
             return;
         }
-        let id = match self.explorer.opened(parent, &database) {
-            Some(id) => id,
-            None => {
-                let id = ConnectionId::new();
-                self.explorer.opened.insert(id, (parent, database));
-                id
-            }
+        let Some(id) = self.database_session(parent, &database) else {
+            return;
         };
         self.explorer.expanded.insert(key);
         if !matches!(self.explorer.link(id), Link::Online(_)) {
@@ -1243,6 +1249,11 @@ impl VioletApp {
                 self.run_data(ctx, tab, CachePolicy::Use);
             }
             Action::Run(tab, scope) => self.run(ctx, tab, scope),
+            action @ (Action::SaveScript(_)
+            | Action::SaveScriptAs(_)
+            | Action::SaveScriptNamed(..)
+            | Action::OpenScriptFile
+            | Action::OpenScript(_)) => self.script_action(ctx, action),
             Action::RefreshTab(tab) => self.refresh(ctx, tab),
             Action::ApplyFilter(tab) => self.run_data(ctx, tab, CachePolicy::Use),
             Action::ClearFilter(tab) => {
@@ -1359,6 +1370,7 @@ impl VioletApp {
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let modal_open = self.form.is_some()
             || self.prompt.is_some()
+            || self.script_prompt.is_some()
             || self.confirm_delete.is_some()
             || self.history_view.is_some()
             || self.task_dialog.is_some();
@@ -1383,6 +1395,20 @@ impl VioletApp {
                 && let Some(tab) = active
             {
                 self.actions.push(Action::Run(tab, RunScope::Explain));
+            }
+            // Save as first: it is save plus Shift.
+            if input.consume_shortcut(&shortcuts::SAVE_AS)
+                && let Some(tab) = active
+            {
+                self.actions.push(Action::SaveScriptAs(tab));
+            }
+            if input.consume_shortcut(&shortcuts::SAVE)
+                && let Some(tab) = active
+            {
+                self.actions.push(Action::SaveScript(tab));
+            }
+            if input.consume_shortcut(&shortcuts::OPEN) {
+                self.actions.push(Action::OpenScriptFile);
             }
             if input.consume_shortcut(&shortcuts::HISTORY) {
                 self.actions.push(Action::OpenHistory);
@@ -1533,6 +1559,11 @@ impl VioletApp {
         {
             self.prompt = None;
         }
+        if let Some(prompt) = &mut self.script_prompt
+            && !script_flow::show_prompt(ctx, prompt, &mut self.actions)
+        {
+            self.script_prompt = None;
+        }
         if let Some(view) = &mut self.history_view {
             let active = self.workspace.active();
             let target = history::Target {
@@ -1640,6 +1671,7 @@ impl eframe::App for VioletApp {
                 sidebar::show(
                     ui,
                     self.profiles.all(),
+                    &self.script_list,
                     &mut self.explorer,
                     &mut self.actions,
                 );

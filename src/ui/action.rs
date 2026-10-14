@@ -62,6 +62,17 @@ pub enum Action {
         relation: String,
     },
     Run(TabId, RunScope),
+    /// Saves an editor: to its file, else as a script of its connection's
+    /// database, else wherever the user picks.
+    SaveScript(TabId),
+    /// Saves an editor to a file the user picks.
+    SaveScriptAs(TabId),
+    /// Saves an editor as a script of its connection's database, named.
+    SaveScriptNamed(TabId, String),
+    /// Opens a `.sql` file the user picks.
+    OpenScriptFile,
+    /// Opens a script, on the database it was saved for.
+    OpenScript(PathBuf),
     /// Reads the shown result again, skipping the cache.
     RefreshTab(TabId),
     /// Applies a data tab's filter box.

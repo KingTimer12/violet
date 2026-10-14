@@ -13,6 +13,7 @@ directories.workspace = true
 log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+uuid.workspace = true
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 
 [dev-dependencies]

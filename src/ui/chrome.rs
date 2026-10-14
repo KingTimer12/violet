@@ -155,7 +155,13 @@ fn tab_button(
 ) {
     let palette = Palette::current(ui.ctx());
     let height = ui.available_height().max(36.0);
-    let title_galley = widgets::elided(ui, &tab.title, theme::medium(12.5), palette.text, 170.0);
+    // A dot after the title: changes the script's file does not have.
+    let title = if tab.unsaved() {
+        format!("{} ●", tab.title)
+    } else {
+        tab.title.clone()
+    };
+    let title_galley = widgets::elided(ui, &title, theme::medium(12.5), palette.text, 170.0);
     let width = 14.0 + 16.0 + 8.0 + title_galley.size().x + 8.0 + 18.0 + 10.0;
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
     let painter = ui.painter();
@@ -305,6 +311,34 @@ pub fn toolbar(
         {
             actions.push(Action::Cancel(tab.id));
         }
+        let save_tip = match &tab.file {
+            Some(file) => format!(
+                "Save ({})\n{}",
+                ui.ctx().format_shortcut(&shortcuts::SAVE),
+                file.path.display()
+            ),
+            None => format!(
+                "Save script ({})",
+                ui.ctx().format_shortcut(&shortcuts::SAVE)
+            ),
+        };
+        let save = widgets::icon_button(ui, Icon::Save, &save_tip);
+        if save.clicked() {
+            actions.push(Action::SaveScript(tab.id));
+        }
+        save.context_menu(|ui| {
+            let label = format!(
+                "Save as… ({})",
+                ui.ctx().format_shortcut(&shortcuts::SAVE_AS)
+            );
+            if ui.button(label).clicked() {
+                actions.push(Action::SaveScriptAs(tab.id));
+            }
+            let label = format!("Open… ({})", ui.ctx().format_shortcut(&shortcuts::OPEN));
+            if ui.button(label).clicked() {
+                actions.push(Action::OpenScriptFile);
+            }
+        });
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.add_space(10.0);

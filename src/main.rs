@@ -21,7 +21,7 @@ use violet_core::ports::{
 use violet_providers::{DEFAULT_INDEX, Providers, Source};
 use violet_storage::{
     AppDirs, JsonFile, JsonLinesHistory, JsonProfileRepository, KeyringSecretStore,
-    MemoryResultCache,
+    MemoryResultCache, ScriptStore,
 };
 
 use settings::Settings;
@@ -127,6 +127,7 @@ fn main() -> eframe::Result {
                 providers_dir,
                 history,
                 session: JsonFile::new(dirs.session_file()),
+                scripts: ScriptStore::new(dirs.scripts_dir()),
             };
             Ok(Box::new(VioletApp::new(
                 &ctx,

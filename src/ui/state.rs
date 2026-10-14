@@ -50,6 +50,8 @@ pub enum NodeKey {
     Connection(ConnectionId),
     /// A database of a connection that shows them all.
     Database(ConnectionId, String),
+    /// The scripts saved for a connection.
+    Scripts(ConnectionId),
     Schema(ConnectionId, String),
     Group(ConnectionId, String, ObjectKind),
     Object(ConnectionId, String, String),
@@ -170,6 +172,7 @@ fn owner(key: &NodeKey) -> ConnectionId {
     match key {
         NodeKey::Connection(id)
         | NodeKey::Database(id, _)
+        | NodeKey::Scripts(id)
         | NodeKey::Schema(id, _)
         | NodeKey::Group(id, _, _)
         | NodeKey::Object(id, _, _) => *id,

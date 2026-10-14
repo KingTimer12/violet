@@ -5302,6 +5302,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "uuid",
  "violet-core",
 ]
 

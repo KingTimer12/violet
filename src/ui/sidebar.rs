@@ -3,6 +3,7 @@
 
 use egui::{Align2, Color32, CornerRadius, Response, Sense, Ui, Vec2};
 use violet_core::{ConnectionId, ConnectionProfile, DbObject, ObjectKind, ObjectRef, TaskKind};
+use violet_storage::SavedScript;
 
 use super::action::Action;
 use super::icons::Icon;
@@ -150,6 +151,7 @@ impl<'a> Row<'a> {
 pub fn show(
     ui: &mut Ui,
     profiles: &[ConnectionProfile],
+    scripts: &[SavedScript],
     explorer: &mut Explorer,
     actions: &mut Vec<Action>,
 ) {
@@ -222,7 +224,7 @@ pub fn show(
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             for profile in profiles {
-                connection(ui, profile, explorer, actions);
+                connection(ui, profile, scripts, explorer, actions);
             }
             ui.add_space(12.0);
         });
@@ -231,6 +233,7 @@ pub fn show(
 fn connection(
     ui: &mut Ui,
     profile: &ConnectionProfile,
+    scripts: &[SavedScript],
     explorer: &mut Explorer,
     actions: &mut Vec<Action>,
 ) {
@@ -333,6 +336,13 @@ fn connection(
     if !expanded {
         return;
     }
+    let scripts: Vec<&SavedScript> = scripts
+        .iter()
+        .filter(|script| script.connection == id)
+        .collect();
+    if !scripts.is_empty() {
+        scripts_node(ui, profile, &scripts, explorer, actions);
+    }
     // Every database on the server, when the connection lists them; else
     // its own database's schemas straight away.
     if profile.show_all_databases
@@ -350,6 +360,67 @@ fn connection(
         return;
     }
     schemas(ui, id, 1, explorer, actions);
+}
+
+/// The scripts saved for a connection, each opening on its database.
+fn scripts_node(
+    ui: &mut Ui,
+    profile: &ConnectionProfile,
+    scripts: &[&SavedScript],
+    explorer: &mut Explorer,
+    actions: &mut Vec<Action>,
+) {
+    let key = NodeKey::Scripts(profile.id);
+    let filter = explorer.filter.trim().to_lowercase();
+    let filtering = !filter.is_empty();
+    let shown: Vec<&SavedScript> = scripts
+        .iter()
+        .copied()
+        .filter(|script| !filtering || matches_filter(&script.name, &filter))
+        .collect();
+    if filtering && shown.is_empty() {
+        return;
+    }
+    let expanded = filtering || explorer.is_expanded(&key);
+    let count = shown.len().to_string();
+    let mut row = Row::new(1, Icon::Folder, "Scripts");
+    row.expanded = Some(expanded);
+    row.detail = Some(&count);
+    if row.show(ui).clicked() {
+        explorer.toggle(key);
+    }
+    if !expanded {
+        return;
+    }
+    // The database shows only for scripts of another one than the
+    // connection's.
+    let own = match explorer.link(profile.id) {
+        Link::Online(server) => server.database.clone(),
+        _ => profile.database.clone(),
+    };
+    for script in shown {
+        let mut row = Row::new(2, Icon::FileCode, &script.name);
+        if script.database != own {
+            row.detail = Some(&script.database);
+        }
+        let response =
+            row.show(ui)
+                .on_hover_text(format!("{}\n{}", script.database, script.path.display()));
+        if response.clicked() {
+            actions.push(Action::OpenScript(script.path.clone()));
+        }
+        response.context_menu(|ui| {
+            if menu_item(ui, Icon::FileCode, "Open") {
+                actions.push(Action::OpenScript(script.path.clone()));
+            }
+            if menu_item(ui, Icon::FolderOpen, "Show in folder") {
+                actions.push(Action::Reveal(script.path.clone()));
+            }
+            if menu_item(ui, Icon::Copy, "Copy path") {
+                actions.push(Action::Copy(script.path.display().to_string()));
+            }
+        });
+    }
 }
 
 /// `id`'s schemas, at `depth`.

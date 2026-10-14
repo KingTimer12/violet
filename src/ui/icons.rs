@@ -60,6 +60,7 @@ fastframe_icons::icons! {
         Archive => "archive",
         ArchiveRestore => "archive-restore",
         FolderOpen => "folder-open",
+        Save => "save",
         ShieldAlert => "shield-alert",
     }
 }
