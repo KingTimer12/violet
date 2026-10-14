@@ -11,7 +11,9 @@
 //! `menu` (the data tab with a connection's context menu open), `page`
 //! (a data tab after fetching the next page and counting), `providers`
 //! (the providers dialog), `complete` (completion at the `|` of
-//! `VIOLET_SCENE_SQL`). Add `VIOLET_THEME=light` for the light theme.
+//! `VIOLET_SCENE_SQL`), `explain` (`EXPLAIN ANALYZE` of a join),
+//! `history` (a run, then the history dialog), `restore` (the editors
+//! saved last time). Add `VIOLET_THEME=light` for the light theme.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -47,6 +49,12 @@ impl Snapshot {
             events: Vec::new(),
             cursor: 0,
         })
+    }
+
+    /// Whether the scene starts from the editors saved last time; the
+    /// others start from none.
+    pub fn restores(&self) -> bool {
+        self.scene == "restore"
     }
 
     /// Hands queued input to the frame about to start.
@@ -137,7 +145,10 @@ impl VioletApp {
             ("providers", _) => {
                 settle && matches!(self.providers.listing, super::providers::Listing::Ready(_))
             }
-            ("browse" | "error" | "data" | "menu" | "page" | "complete", 0) => {
+            (
+                "browse" | "error" | "data" | "menu" | "page" | "complete" | "explain" | "history",
+                0,
+            ) => {
                 if let Some(id) = first {
                     self.explorer.expanded.insert(NodeKey::Connection(id));
                     self.actions.push(Action::Connect(id));
@@ -348,6 +359,49 @@ impl VioletApp {
                 false
             }
             ("complete", _) => settle,
+            ("explain" | "history", 1) => {
+                let Some(id) = first else { return true };
+                if self.explorer.link(id).is_online() {
+                    let sql = if snapshot.scene == "explain" {
+                        "SELECT c.country, count(*) AS orders\nFROM customers c\nJOIN orders o ON o.customer_id = c.id\nGROUP BY c.country;"
+                    } else {
+                        "SELECT count(*) FROM orders WHERE status = 'paid';"
+                    };
+                    self.actions.push(Action::OpenEditor {
+                        connection: Some(id),
+                        sql: sql.to_owned(),
+                    });
+                    snapshot.step = 2;
+                }
+                false
+            }
+            ("explain" | "history", 2) => {
+                if let Some(tab) = self.workspace.active {
+                    let scope = if snapshot.scene == "explain" {
+                        RunScope::ExplainAnalyze
+                    } else {
+                        RunScope::Statement
+                    };
+                    self.actions.push(Action::Run(tab, scope));
+                }
+                snapshot.step = 3;
+                false
+            }
+            ("explain" | "history", 3) => {
+                let done = self
+                    .workspace
+                    .active()
+                    .is_some_and(|tab| tab.running.is_none() && tab.outcome.is_some());
+                if done {
+                    if snapshot.scene == "history" {
+                        self.actions.push(Action::OpenHistory);
+                    }
+                    snapshot.step = 10;
+                    snapshot.started = Instant::now() - Duration::from_millis(800);
+                }
+                false
+            }
+            ("explain" | "history", _) => settle,
             ("error", 1) => {
                 let Some(id) = first else { return true };
                 if matches!(self.explorer.link(id), Link::Online(_)) {

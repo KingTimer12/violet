@@ -11,6 +11,36 @@ use crate::profile::{ConnectionId, ConnectionProfile, DriverId};
 use crate::query::QueryOutput;
 use crate::secret::Secret;
 
+/// One query run from an editor, as the history keeps it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HistoryEntry {
+    /// When it finished, in milliseconds since the Unix epoch.
+    pub at: u64,
+    pub connection: Option<ConnectionId>,
+    /// The connection's name at the time, so entries outlive the profile.
+    pub source: String,
+    pub sql: String,
+    pub elapsed_ms: u64,
+    /// Rows returned or affected.
+    #[serde(default)]
+    pub rows: Option<u64>,
+    /// Why it failed.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Every query run from an editor, kept on this machine.
+///
+/// Queries can hold anything the user typed, so implementations keep them
+/// readable by the user only, and the interface leaves literals out of
+/// statements that set passwords.
+pub trait QueryHistory: Send + Sync + 'static {
+    /// The entries kept, oldest first.
+    fn load(&self) -> Result<Vec<HistoryEntry>>;
+    fn append(&self, entry: &HistoryEntry) -> Result<()>;
+    fn clear(&self) -> Result<()>;
+}
+
 /// Where saved connections live.
 pub trait ProfileRepository: Send + Sync + 'static {
     fn load(&self) -> Result<Vec<ConnectionProfile>>;

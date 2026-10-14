@@ -5160,6 +5160,7 @@ dependencies = [
  "fastframe-text",
  "hotpath",
  "image",
+ "jiff",
  "log",
  "serde",
  "violet-app",

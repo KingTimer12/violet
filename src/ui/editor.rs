@@ -41,6 +41,22 @@ impl Highlighter {
     }
 }
 
+/// `text` coloured as the editor colours it, for previews.
+pub fn highlighted(text: &str, palette: &Palette) -> LayoutJob {
+    highlight(text, palette, None)
+}
+
+/// Moves `tab`'s editor cursor to `char_index`, and focuses it.
+pub fn place_cursor(ctx: &egui::Context, tab: u64, char_index: usize) {
+    let text_id = Id::new(("violet-editor", tab));
+    let mut state = egui::text_edit::TextEditState::load(ctx, text_id).unwrap_or_default();
+    state
+        .cursor
+        .set_char_range(Some(CCursorRange::one(CCursor::new(char_index))));
+    state.store(ctx, text_id);
+    ctx.memory_mut(|memory| memory.request_focus(text_id));
+}
+
 #[hotpath::measure]
 fn highlight(text: &str, palette: &Palette, error_at: Option<usize>) -> LayoutJob {
     let syntax = palette.syntax;

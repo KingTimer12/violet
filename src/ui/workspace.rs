@@ -3,6 +3,7 @@
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use violet_app::{ExecOptions, RequestId};
 use violet_core::{ConnectionId, DbError, OrderBy, QueryOutput};
 
@@ -13,9 +14,12 @@ pub type TabId = u64;
 /// What a run sent to the server, to place errors back in the editor.
 #[derive(Clone, Debug)]
 pub struct Executed {
-    /// Byte offset of `sql` in the editor's text.
+    /// Byte offset of the user's text in the editor.
     pub offset: usize,
     pub sql: String,
+    /// Characters Violet put before the user's text in `sql`, such as
+    /// `EXPLAIN `.
+    pub shift: usize,
 }
 
 #[derive(Debug)]
@@ -147,13 +151,30 @@ impl QueryTab {
             return None;
         };
         let position = usize::try_from(error.position?).ok()?;
-        let within = executed
-            .sql
-            .char_indices()
-            .nth(position.saturating_sub(1))
+        let mut chars = executed.sql.char_indices().skip(executed.shift);
+        let start = chars
+            .clone()
+            .next()
             .map_or(executed.sql.len(), |(at, _)| at);
-        Some(executed.offset + within)
+        let within = chars
+            .nth(position.saturating_sub(executed.shift + 1))
+            .map_or(executed.sql.len(), |(at, _)| at);
+        Some(executed.offset + within.max(start) - start)
     }
+}
+
+/// The SQL editors open when Violet closed, to open them again.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SavedSession {
+    pub tabs: Vec<SavedTab>,
+    pub active: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SavedTab {
+    pub title: String,
+    pub connection: Option<ConnectionId>,
+    pub sql: String,
 }
 
 #[derive(Default)]
@@ -193,14 +214,47 @@ impl Workspace {
         id
     }
 
-    /// A title for a new editor: `Script 3`.
-    pub fn next_script_title(&self) -> String {
-        let used = self
+    /// The SQL editors, as they are now. Data tabs are left out: they read
+    /// the server again when opened.
+    pub fn save(&self) -> SavedSession {
+        let scripts: Vec<&QueryTab> = self
             .tabs
             .iter()
             .filter(|tab| matches!(tab.kind, TabKind::Script))
-            .count();
-        format!("Script {}", used + 1)
+            .collect();
+        SavedSession {
+            active: scripts.iter().position(|tab| Some(tab.id) == self.active),
+            tabs: scripts
+                .into_iter()
+                .map(|tab| SavedTab {
+                    title: tab.title.clone(),
+                    connection: tab.connection,
+                    sql: tab.sql.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Opens the editors of a saved session; `exists` says which
+    /// connections are still there.
+    pub fn restore(&mut self, session: SavedSession, exists: impl Fn(ConnectionId) -> bool) {
+        let mut ids = Vec::new();
+        for tab in session.tabs {
+            let connection = tab.connection.filter(|id| exists(*id));
+            ids.push(self.open(tab.title, connection, tab.sql, TabKind::Script));
+        }
+        self.active = session
+            .active
+            .and_then(|index| ids.get(index).copied())
+            .or_else(|| ids.last().copied());
+    }
+
+    /// A title for a new editor: `Script 3`.
+    pub fn next_script_title(&self) -> String {
+        (1..)
+            .map(|n| format!("Script {n}"))
+            .find(|title| !self.tabs.iter().any(|tab| tab.title == *title))
+            .unwrap_or_default()
     }
 
     pub fn get(&self, id: TabId) -> Option<&QueryTab> {
@@ -312,6 +366,35 @@ mod tests {
     }
 
     #[test]
+    fn editors_survive_a_restart() {
+        let mut workspace = Workspace::default();
+        let kept = ConnectionId::new();
+        let gone = ConnectionId::new();
+        workspace.open("A".into(), Some(kept), "SELECT 1".into(), TabKind::Script);
+        let b = workspace.open("B".into(), Some(gone), "SELECT 2".into(), TabKind::Script);
+        workspace.open(
+            "t".into(),
+            Some(kept),
+            String::new(),
+            TabKind::Data(DataView::new("s".into(), "t".into())),
+        );
+        workspace.active = Some(b);
+        let saved = workspace.save();
+        assert_eq!(saved.tabs.len(), 2);
+        assert_eq!(saved.active, Some(1));
+
+        let mut restored = Workspace::default();
+        restored.restore(saved, |id| id == kept);
+        assert_eq!(restored.tabs.len(), 2);
+        assert_eq!(
+            restored.active().map(|tab| tab.sql.as_str()),
+            Some("SELECT 2")
+        );
+        assert_eq!(restored.tabs[0].connection, Some(kept));
+        assert_eq!(restored.tabs[1].connection, None);
+    }
+
+    #[test]
     fn sorting_cycles_through_both_directions() {
         let mut view = DataView::new("s".into(), "t".into());
         view.cycle_order("a");
@@ -362,8 +445,22 @@ mod tests {
             executed: Executed {
                 offset: 10,
                 sql: "SELEC 2".into(),
+                shift: 0,
             },
         });
         assert_eq!(tab.error_offset(), Some(10));
+        // Behind `EXPLAIN `, position 9 is the user's first character.
+        tab.outcome = Some(Outcome::Failed {
+            error: DbError {
+                position: Some(10),
+                ..DbError::new(violet_core::ErrorKind::Query, "syntax")
+            },
+            executed: Executed {
+                offset: 10,
+                sql: "EXPLAIN SELEC 2".into(),
+                shift: 8,
+            },
+        });
+        assert_eq!(tab.error_offset(), Some(11));
     }
 }

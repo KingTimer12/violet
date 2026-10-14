@@ -268,6 +268,33 @@ pub fn toolbar(
         if response.on_hover_text(script_tip).clicked() {
             actions.push(Action::Run(tab.id, RunScope::Script));
         }
+        let explain = ui
+            .add_enabled_ui(!running, |ui| {
+                widgets::button(ui, Tone::Secondary, Some(Icon::Zap), "Explain")
+            })
+            .inner
+            .on_hover_text("How the server runs the statement under the cursor");
+        egui::Popup::menu(&explain).show(|ui| {
+            let ctx = ui.ctx().clone();
+            for (icon, label, shortcut, scope) in [
+                (
+                    Icon::Zap,
+                    "Explain plan",
+                    shortcuts::EXPLAIN,
+                    RunScope::Explain,
+                ),
+                (
+                    Icon::Clock,
+                    "Explain analyze (reads only)",
+                    shortcuts::EXPLAIN_ANALYZE,
+                    RunScope::ExplainAnalyze,
+                ),
+            ] {
+                if mode_item(ui, icon, label, &ctx.format_shortcut(&shortcut)) {
+                    actions.push(Action::Run(tab.id, scope));
+                }
+            }
+        });
         let cancel_tip = format!("Cancel ({})", ui.ctx().format_shortcut(&shortcuts::CANCEL));
         if ui
             .add_enabled_ui(running, |ui| {
@@ -283,8 +310,27 @@ pub fn toolbar(
             ui.add_space(10.0);
             connection_picker(ui, tab, profiles, explorer, actions);
             ui.label(RichText::new("Connection").color(palette.dim));
+            let history_tip = format!(
+                "Query history ({})",
+                ui.ctx().format_shortcut(&shortcuts::HISTORY)
+            );
+            if widgets::icon_button(ui, Icon::Clock, &history_tip).clicked() {
+                actions.push(Action::OpenHistory);
+            }
         });
     });
+}
+
+/// A menu entry with its shortcut on the right.
+fn mode_item(ui: &mut Ui, icon: Icon, label: &str, shortcut: &str) -> bool {
+    let palette = Palette::current(ui.ctx());
+    ui.add(
+        egui::Button::image_and_text(icon.image(palette.secondary, 14.0), label)
+            .shortcut_text(RichText::new(shortcut).color(palette.dim))
+            .frame(false)
+            .min_size(Vec2::new(250.0, 26.0)),
+    )
+    .clicked()
 }
 
 /// A data tab's bar: refresh, stop, and what is being browsed.
@@ -579,6 +625,8 @@ pub fn welcome(
                                     ("Run statement under cursor", shortcuts::RUN_STATEMENT),
                                     ("Run whole script", shortcuts::RUN_SCRIPT),
                                     ("Cancel running query", shortcuts::CANCEL),
+                                    ("Explain the statement", shortcuts::EXPLAIN),
+                                    ("Query history", shortcuts::HISTORY),
                                     ("New SQL editor", shortcuts::NEW_EDITOR),
                                     ("New connection", shortcuts::NEW_CONNECTION),
                                     ("Close tab", shortcuts::CLOSE_TAB),

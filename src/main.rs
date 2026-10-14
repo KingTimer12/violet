@@ -15,10 +15,13 @@ mod ui;
 use std::sync::Arc;
 
 use violet_app::{Backend, ProfileService};
-use violet_core::ports::{ProfileRepository, ProviderStore, ResultCache, SecretStore};
+use violet_core::ports::{
+    ProfileRepository, ProviderStore, QueryHistory, ResultCache, SecretStore,
+};
 use violet_providers::{DEFAULT_INDEX, Providers, Source};
 use violet_storage::{
-    AppDirs, JsonFile, JsonProfileRepository, KeyringSecretStore, MemoryResultCache,
+    AppDirs, JsonFile, JsonLinesHistory, JsonProfileRepository, KeyringSecretStore,
+    MemoryResultCache,
 };
 
 use settings::Settings;
@@ -115,11 +118,15 @@ fn main() -> eframe::Result {
                 repaint.request_repaint();
             })?;
 
+            let history: Arc<dyn QueryHistory> =
+                Arc::new(JsonLinesHistory::new(dirs.history_file(), ui::HISTORY_SIZE));
             let services = Services {
                 backend,
                 profiles,
                 settings: settings_file,
                 providers_dir,
+                history,
+                session: JsonFile::new(dirs.session_file()),
             };
             Ok(Box::new(VioletApp::new(
                 &ctx,

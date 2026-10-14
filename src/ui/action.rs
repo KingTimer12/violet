@@ -15,6 +15,11 @@ pub enum RunScope {
     Script,
     /// A data tab's rows, read again from the first page.
     Data,
+    /// How the server would run the statement under the cursor.
+    Explain,
+    /// The statement under the cursor run and timed by the server; reads
+    /// only.
+    ExplainAnalyze,
 }
 
 #[derive(Debug)]
@@ -75,4 +80,8 @@ pub enum Action {
     RemoveProvider(DriverId),
     ToggleSidebar,
     Copy(String),
+    OpenHistory,
+    ClearHistory,
+    /// Puts SQL at the active editor's cursor.
+    InsertSql(String),
 }

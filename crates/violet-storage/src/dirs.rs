@@ -76,6 +76,18 @@ impl AppDirs {
         self.cache.join("providers")
     }
 
+    /// Queries run from editors, one JSON object per line.
+    #[must_use]
+    pub fn history_file(&self) -> PathBuf {
+        self.state.join("history.jsonl")
+    }
+
+    /// The editors open when Violet last closed.
+    #[must_use]
+    pub fn session_file(&self) -> PathBuf {
+        self.state.join("session.json")
+    }
+
     #[must_use]
     pub fn state_dir(&self) -> &Path {
         &self.state

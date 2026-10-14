@@ -109,6 +109,35 @@ Columns and foreign keys are read from the server the first time they are
 needed; foreign keys come from the standard `information_schema`, so any
 database that has it is covered. ↑↓ choose, ↵ or ⇥ insert, esc closes.
 
+## Query console
+
+Each SQL editor runs queries in several modes, from the toolbar or the
+keyboard:
+
+- **Run** the selection, or the statement under the cursor; a single
+  `SELECT` is read a page at a time.
+- **Run script**: every statement in the editor.
+- **Explain plan**: the statement under the cursor behind `EXPLAIN`, to see
+  how the server would run it without running it.
+- **Explain analyze**: the statement run for real and timed by the server.
+  Since that executes it, Violet only does it for statements that read.
+
+Errors are marked in the editor where the server points, explain modes
+included.
+
+Nothing is lost between runs:
+
+- **Query history** (⌘/Ctrl + Y, or the clock in the toolbar): every query
+  run from an editor, with its connection, time, duration and rows, or the
+  error. Search it, keep to the current connection, and put a query back at
+  the cursor or in a new editor. It lives in `history.jsonl` in Violet's
+  state directory, readable by the user only, trimmed to the last 5,000
+  queries; statements that set a password (`PASSWORD`, `IDENTIFIED BY`)
+  are kept with their literals replaced by `'•••'`.
+- **Open editors** come back as they were: their text, titles and
+  connections are saved as you type (`session.json`, next to the history)
+  and reopened on the next start.
+
 ## Browsing data and the result cache
 
 Clicking a table or view in the tree opens its data tab, as in DBeaver
@@ -165,6 +194,8 @@ changed:
   memory; running queries can be cancelled server-side.
 - Cached results stay in memory only (never on disk) and go when the app
   closes or the connection does.
+- The query history and the saved editors are written with mode `0600`;
+  string literals in statements that set passwords never reach the history.
 - The data filter must be one expression: a `;` or unbalanced bracket is
   refused before anything is sent.
 - `unsafe_code = "forbid"` across the workspace (the SDK excepted: the
@@ -203,6 +234,9 @@ icons come from `assets/app/violet.svg` (`scripts/app-icons.sh`).
 | ⌘/Ctrl + Enter | Run selection, or the statement under the cursor |
 | ⇧ + ⌘/Ctrl + Enter | Run the whole script |
 | ⌘/Ctrl + . | Cancel the running query |
+| ⌘/Ctrl + E | Explain the statement under the cursor |
+| ⇧ + ⌘/Ctrl + E | Explain analyze it (reads only) |
+| ⌘/Ctrl + Y | Query history |
 | ⌃ + Space | Complete the name under the cursor |
 | ⌘/Ctrl + T / W | New / close editor tab |
 | ⌘/Ctrl + N | New connection |

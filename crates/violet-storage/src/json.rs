@@ -72,7 +72,7 @@ impl<T: Serialize + DeserializeOwned> JsonFile<T> {
 }
 
 #[cfg(unix)]
-fn open_private(path: &Path) -> std::io::Result<fs::File> {
+pub(crate) fn open_private(path: &Path) -> std::io::Result<fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
     fs::OpenOptions::new()
         .write(true)
@@ -83,11 +83,11 @@ fn open_private(path: &Path) -> std::io::Result<fs::File> {
 }
 
 #[cfg(not(unix))]
-fn open_private(path: &Path) -> std::io::Result<fs::File> {
+pub(crate) fn open_private(path: &Path) -> std::io::Result<fs::File> {
     fs::File::create(path)
 }
 
-fn storage_error(message: impl Into<String>) -> DbError {
+pub(crate) fn storage_error(message: impl Into<String>) -> DbError {
     DbError::new(ErrorKind::Storage, message)
 }
 

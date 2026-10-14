@@ -572,6 +572,9 @@ pub struct Plan {
     /// A single query that can be read a page at a time: its text without
     /// the trailing `;`.
     pub pageable: Option<String>,
+    /// Every statement only reads, volatile or not: running it changes
+    /// nothing, so `EXPLAIN ANALYZE` may run it.
+    pub reads_only: bool,
 }
 
 /// Decides whether `source` may be cached and paged. It errs on the side of
@@ -584,6 +587,7 @@ pub fn plan(source: &str) -> Plan {
         return Plan::default();
     }
     let mut cacheable = true;
+    let mut reads_only = true;
     let mut pageable = ranges.len() == 1;
     for range in &ranges {
         let words = words(&source[range.clone()]);
@@ -603,6 +607,7 @@ pub fn plan(source: &str) -> Plan {
                 || (*called && VOLATILE_FUNCTIONS.binary_search(&word.as_str()).is_ok())
         });
         cacheable &= reads && !writes && !volatile;
+        reads_only &= reads && !writes;
         pageable &= reads && !writes;
     }
     let pageable = pageable.then(|| {
@@ -612,7 +617,36 @@ pub fn plan(source: &str) -> Plan {
     Plan {
         cacheable,
         pageable,
+        reads_only,
     }
+}
+
+/// Words that mark a statement as setting a password or a secret:
+/// `ALTER ROLE ... PASSWORD '...'`, MySQL's `IDENTIFIED BY '...'`.
+const SECRET_WORDS: &[&str] = &["IDENTIFIED", "PASSWORD", "SECRET"];
+
+/// `source` with every string literal replaced by `'•••'` when it sets a
+/// password, so the history never keeps one. Other text is kept as is.
+#[must_use]
+pub fn redact_secrets(source: &str) -> String {
+    let secret = tokens(source).any(|token| {
+        matches!(token.kind, TokenKind::Keyword | TokenKind::Identifier)
+            && SECRET_WORDS
+                .iter()
+                .any(|word| source[token.range.clone()].eq_ignore_ascii_case(word))
+    });
+    if !secret {
+        return source.to_owned();
+    }
+    let mut out = String::with_capacity(source.len());
+    for token in tokens(source) {
+        if token.kind == TokenKind::String {
+            out.push_str("'•••'");
+        } else {
+            out.push_str(&source[token.range]);
+        }
+    }
+    out
 }
 
 /// Whether `filter` is one expression, safe to place in `WHERE (...)`: no
@@ -660,6 +694,24 @@ pub fn line_column(source: &str, char_offset: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn passwords_never_reach_the_history() {
+        assert_eq!(
+            redact_secrets("ALTER ROLE app PASSWORD 'hunter2';"),
+            "ALTER ROLE app PASSWORD '•••';"
+        );
+        assert_eq!(
+            redact_secrets("CREATE USER x IDENTIFIED BY E'a\\'b' -- note"),
+            "CREATE USER x IDENTIFIED BY '•••' -- note"
+        );
+        let plain = "SELECT 'password' FROM t";
+        assert_eq!(redact_secrets(plain), plain);
+        assert!(plan("SELECT now()").reads_only);
+        assert!(!plan("SELECT now()").cacheable);
+        assert!(!plan("DELETE FROM t").reads_only);
+        assert!(!plan("SELECT 1; UPDATE t SET a = 1").reads_only);
+    }
 
     fn kinds(source: &str) -> Vec<(TokenKind, &str)> {
         tokens(source)

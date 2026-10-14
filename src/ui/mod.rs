@@ -9,6 +9,7 @@ mod connection_form;
 mod devtools;
 mod editor;
 mod fonts;
+mod history;
 pub mod icons;
 mod providers;
 mod results;
@@ -20,11 +21,14 @@ mod toasts;
 mod widgets;
 mod workspace;
 
+use std::hash::{Hash as _, Hasher as _};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 
 use egui::{Frame, Id, Panel, Stroke};
 use violet_app::{Backend, CachePolicy, Event, ExecOptions, ProfileService};
+use violet_core::ports::{HistoryEntry, QueryHistory};
 use violet_core::{ConnectionId, ErrorKind, Page};
 use violet_storage::JsonFile;
 
@@ -36,7 +40,12 @@ use connection_form::{ConnectionForm, PasswordPrompt, TestState};
 use state::{ConnectionCatalog, Explorer, Link, Loadable, NodeKey};
 use theme::Palette;
 use toasts::{Toast, Toasts};
-use workspace::{Count, DataView, Executed, Outcome, Paging, Running, TabId, TabKind, Workspace};
+use workspace::{
+    Count, DataView, Executed, Outcome, Paging, Running, SavedSession, TabId, TabKind, Workspace,
+};
+
+/// The most queries the history keeps.
+pub const HISTORY_SIZE: usize = 5_000;
 
 /// Everything the interface needs from the rest of the app.
 pub struct Services {
@@ -45,6 +54,9 @@ pub struct Services {
     pub settings: JsonFile<Settings>,
     /// Where providers are installed, to show in their dialog.
     pub providers_dir: PathBuf,
+    pub history: Arc<dyn QueryHistory>,
+    /// The editors open last time.
+    pub session: JsonFile<SavedSession>,
 }
 
 pub struct VioletApp {
@@ -66,6 +78,15 @@ pub struct VioletApp {
     fonts: fonts::Fallbacks,
     /// Connection names not yet checked against the fonts.
     names_unchecked: bool,
+    history_store: Arc<dyn QueryHistory>,
+    /// Oldest first.
+    history: Vec<HistoryEntry>,
+    history_view: Option<history::HistoryView>,
+    session_file: JsonFile<SavedSession>,
+    /// A fingerprint of the editors as last saved, and when they were last
+    /// compared.
+    session_saved: u64,
+    session_checked: Instant,
     #[cfg(debug_assertions)]
     snapshot: Option<devtools::Snapshot>,
 }
@@ -94,14 +115,91 @@ impl VioletApp {
             actions: Vec::new(),
             fonts: fonts::Fallbacks::default(),
             names_unchecked: true,
+            history_store: services.history,
+            history: Vec::new(),
+            history_view: None,
+            session_file: services.session,
+            session_saved: 0,
+            session_checked: Instant::now(),
             #[cfg(debug_assertions)]
             snapshot: devtools::Snapshot::from_env(),
         };
         for toast in startup_errors {
             app.toasts.push(ctx, toast);
         }
+        match app.history_store.load() {
+            Ok(entries) => app.history = entries,
+            Err(error) => app.toasts.push(
+                ctx,
+                Toast::error("The query history could not be read", error.to_string()),
+            ),
+        }
+        app.restore_session(ctx);
         app.load_providers();
         app
+    }
+
+    /// Opens the editors that were open when Violet last closed. Screenshot
+    /// scenes start from none.
+    fn restore_session(&mut self, ctx: &egui::Context) {
+        #[cfg(debug_assertions)]
+        if self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.restores())
+        {
+            return;
+        }
+        match self.session_file.read() {
+            Ok(Some(session)) => {
+                self.session_saved = fingerprint(&session);
+                let profiles = &self.profiles;
+                self.workspace
+                    .restore(session, |id| profiles.get(id).is_some());
+            }
+            Ok(None) => {}
+            Err(error) => self.toasts.push(
+                ctx,
+                Toast::error("The open editors could not be restored", error.to_string()),
+            ),
+        }
+    }
+
+    /// Writes the open editors when they changed, at most every couple of
+    /// seconds, and always when `now`.
+    fn save_session(&mut self, now: bool) {
+        if !now && self.session_checked.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        #[cfg(debug_assertions)]
+        if self.snapshot.is_some() {
+            return;
+        }
+        self.session_checked = Instant::now();
+        let session = self.workspace.save();
+        let print = fingerprint(&session);
+        if print == self.session_saved {
+            return;
+        }
+        match self.session_file.write(&session) {
+            Ok(()) => self.session_saved = print,
+            Err(error) => log::warn!("session: {error}"),
+        }
+    }
+
+    /// Keeps a finished run in the history.
+    fn record(&mut self, entry: HistoryEntry) {
+        if let Err(error) = self.history_store.append(&entry) {
+            log::warn!("history: {error}");
+        }
+        self.history.push(entry);
+        if self.history.len() > HISTORY_SIZE {
+            let excess = self.history.len() - HISTORY_SIZE;
+            self.history.drain(..excess);
+            if let Some(view) = &mut self.history_view {
+                view.selected = None;
+            }
+        }
     }
 
     fn load_providers(&mut self) {
@@ -271,6 +369,42 @@ impl VioletApp {
                     return;
                 };
                 let connection = tab.connection;
+                // Runs from editors go to the history; pages and data tabs
+                // do not.
+                let entry = (!running.append && tab.data().is_none()).then(|| HistoryEntry {
+                    at: SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .map_or(0, |since| {
+                            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+                        }),
+                    connection,
+                    source: connection
+                        .and_then(|id| self.profiles.get(id))
+                        .map(violet_core::ConnectionProfile::display_name)
+                        .unwrap_or_default(),
+                    sql: sql::redact_secrets(&running.executed.sql),
+                    elapsed_ms: u64::try_from(
+                        result
+                            .as_ref()
+                            .map_or_else(|_| running.started.elapsed(), |output| output.elapsed)
+                            .as_millis(),
+                    )
+                    .unwrap_or(u64::MAX),
+                    rows: result.as_ref().ok().map(|output| {
+                        output
+                            .sets
+                            .iter()
+                            .map(|set| {
+                                if set.has_rows() {
+                                    set.rows.len() as u64
+                                } else {
+                                    set.affected.unwrap_or(0)
+                                }
+                            })
+                            .sum()
+                    }),
+                    error: result.as_ref().err().map(|error| error.message.clone()),
+                });
                 if let Ok(output) = &result
                     && let Some(page) = output.page
                     && let Some(paging) = &mut tab.paging
@@ -318,6 +452,9 @@ impl VioletApp {
                         }
                     }
                 });
+                if let Some(entry) = entry {
+                    self.record(entry);
+                }
             }
             Event::Counted { request, result } => {
                 if let Some(paging) = self
@@ -481,13 +618,20 @@ impl VioletApp {
         if tab.running.is_some() {
             return;
         }
+        let explain = matches!(scope, RunScope::Explain | RunScope::ExplainAnalyze);
         let range = match scope {
             RunScope::Script | RunScope::Data => 0..tab.sql.len(),
-            RunScope::Statement if !tab.selection.is_empty() => tab.selection.clone(),
-            RunScope::Statement => match sql::statement_at(&tab.sql, tab.selection.start) {
-                Some(range) => range,
-                None => 0..0,
-            },
+            RunScope::Statement | RunScope::Explain | RunScope::ExplainAnalyze
+                if !tab.selection.is_empty() =>
+            {
+                tab.selection.clone()
+            }
+            RunScope::Statement | RunScope::Explain | RunScope::ExplainAnalyze => {
+                match sql::statement_at(&tab.sql, tab.selection.start) {
+                    Some(range) => range,
+                    None => 0..0,
+                }
+            }
         };
         let text = tab
             .sql
@@ -513,6 +657,10 @@ impl VioletApp {
         }
         let offset = range.start
             + (tab.sql[range.clone()].len() - tab.sql[range.clone()].trim_start().len());
+        if explain {
+            self.explain(ctx, tab_id, connection, offset, &text, scope);
+            return;
+        }
         // Reads may come from the cache, and a single query is read a page
         // at a time, as DBeaver does.
         let plan = sql::plan(&text);
@@ -526,7 +674,59 @@ impl VioletApp {
             None => (text, None),
         };
         let options = ExecOptions { cache, page };
-        let executed = Executed { offset, sql: text };
+        let executed = Executed {
+            offset,
+            sql: text,
+            shift: 0,
+        };
+        self.start(tab_id, connection, executed, options, false);
+    }
+
+    /// Runs one statement under `EXPLAIN`, or `EXPLAIN ANALYZE` when it
+    /// only reads: analysing runs it for real.
+    fn explain(
+        &mut self,
+        ctx: &egui::Context,
+        tab_id: TabId,
+        connection: ConnectionId,
+        offset: usize,
+        text: &str,
+        scope: RunScope,
+    ) {
+        if sql::statements(text).len() != 1 {
+            self.toasts.push(
+                ctx,
+                Toast::info("Explain one statement at a time: select it, or put the cursor in it"),
+            );
+            return;
+        }
+        let analyze = scope == RunScope::ExplainAnalyze;
+        if analyze && !sql::plan(text).reads_only {
+            self.toasts.push(
+                ctx,
+                Toast::error(
+                    "EXPLAIN ANALYZE runs the statement",
+                    "Violet only analyses statements that read. Use Explain to see the plan of one that writes.",
+                ),
+            );
+            return;
+        }
+        let statement = text.trim_end().trim_end_matches(';').trim_end();
+        let Some(sent) = self.backend.explain_sql(connection, statement, analyze) else {
+            return;
+        };
+        let shift = sent
+            .find(statement)
+            .map_or(0, |at| sent[..at].chars().count());
+        let executed = Executed {
+            offset,
+            sql: sent,
+            shift,
+        };
+        let options = ExecOptions {
+            cache: CachePolicy::Refresh,
+            page: None,
+        };
         self.start(tab_id, connection, executed, options, false);
     }
 
@@ -604,7 +804,11 @@ impl VioletApp {
             view.applied = filter;
         }
         tab.sql.clone_from(&sql);
-        let executed = Executed { offset: 0, sql };
+        let executed = Executed {
+            offset: 0,
+            sql,
+            shift: 0,
+        };
         let options = ExecOptions {
             cache,
             page: Some(Page::first()),
@@ -644,6 +848,7 @@ impl VioletApp {
             || Executed {
                 offset: 0,
                 sql: paging.base.clone(),
+                shift: 0,
             },
             |(executed, _)| executed.clone(),
         );
@@ -895,12 +1100,53 @@ impl VioletApp {
                 ctx.copy_text(text);
                 self.toasts.push(ctx, Toast::success("Copied to clipboard"));
             }
+            Action::OpenHistory => {
+                self.history_view = Some(history::HistoryView::default());
+            }
+            Action::ClearHistory => match self.history_store.clear() {
+                Ok(()) => self.history.clear(),
+                Err(error) => self.toasts.push(
+                    ctx,
+                    Toast::error("Could not clear the history", error.to_string()),
+                ),
+            },
+            Action::InsertSql(text) => self.insert_sql(ctx, &text),
         }
     }
 
+    /// Puts `text` at the active editor's cursor, replacing the selection,
+    /// on lines of its own.
+    fn insert_sql(&mut self, ctx: &egui::Context, text: &str) {
+        let Some(tab) = self
+            .workspace
+            .active
+            .and_then(|id| self.workspace.get_mut(id))
+            .filter(|tab| tab.data().is_none())
+        else {
+            return;
+        };
+        let range = tab.selection.start.min(tab.sql.len())..tab.selection.end.min(tab.sql.len());
+        let mut block = text.trim().to_owned();
+        if !block.ends_with(';') {
+            block.push(';');
+        }
+        let before = &tab.sql[..range.start];
+        if !before.is_empty() && !before.ends_with('\n') {
+            block.insert_str(0, "\n\n");
+        }
+        block.push('\n');
+        tab.sql.replace_range(range.clone(), &block);
+        let end = range.start + block.len();
+        tab.selection = end..end;
+        let caret = tab.sql[..end].chars().count();
+        editor::place_cursor(ctx, tab.id, caret);
+    }
+
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        let modal_open =
-            self.form.is_some() || self.prompt.is_some() || self.confirm_delete.is_some();
+        let modal_open = self.form.is_some()
+            || self.prompt.is_some()
+            || self.confirm_delete.is_some()
+            || self.history_view.is_some();
         if modal_open {
             return;
         }
@@ -911,6 +1157,20 @@ impl VioletApp {
                 && let Some(tab) = active
             {
                 self.actions.push(Action::Run(tab, RunScope::Script));
+            }
+            if input.consume_shortcut(&shortcuts::EXPLAIN_ANALYZE)
+                && let Some(tab) = active
+            {
+                self.actions
+                    .push(Action::Run(tab, RunScope::ExplainAnalyze));
+            }
+            if input.consume_shortcut(&shortcuts::EXPLAIN)
+                && let Some(tab) = active
+            {
+                self.actions.push(Action::Run(tab, RunScope::Explain));
+            }
+            if input.consume_shortcut(&shortcuts::HISTORY) {
+                self.actions.push(Action::OpenHistory);
             }
             if input.consume_shortcut(&shortcuts::RUN_STATEMENT)
                 && let Some(tab) = active
@@ -1050,6 +1310,16 @@ impl VioletApp {
         {
             self.prompt = None;
         }
+        if let Some(view) = &mut self.history_view {
+            let active = self.workspace.active();
+            let target = history::Target {
+                editor: active.is_some_and(|tab| tab.data().is_none()),
+                connection: active.and_then(|tab| tab.connection),
+            };
+            if !history::show(ctx, view, &self.history, &target, &mut self.actions) {
+                self.history_view = None;
+            }
+        }
         if let Some(id) = self.confirm_delete {
             let name = self.profile_name(id);
             match connection_form::confirm_delete(ctx, &name) {
@@ -1085,6 +1355,8 @@ impl eframe::App for VioletApp {
             self.fonts.cover_editor(ctx, &tab.sql);
         }
         self.fonts.poll(ctx);
+        let closing = ctx.input(|input| input.viewport().close_requested());
+        self.save_session(closing);
     }
 
     #[hotpath::measure]
@@ -1165,4 +1437,10 @@ impl eframe::App for VioletApp {
 /// An error notice, for start-up problems found before the app exists.
 pub fn toast_error(title: impl Into<String>, body: impl Into<String>) -> Toast {
     Toast::error(title, body)
+}
+
+fn fingerprint(session: &SavedSession) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    session.hash(&mut hasher);
+    hasher.finish()
 }
