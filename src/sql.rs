@@ -572,8 +572,10 @@ pub struct Plan {
     /// A single query that can be read a page at a time: its text without
     /// the trailing `;`.
     pub pageable: Option<String>,
-    /// Every statement only reads, volatile or not: running it changes
-    /// nothing, so `EXPLAIN ANALYZE` may run it.
+    /// Every statement only reads and calls no function known to have
+    /// side effects, so `EXPLAIN ANALYZE` may run it. Functions the user
+    /// wrote cannot be told apart: this guards against accidents, it does
+    /// not sandbox anything (plain Run executes the same text).
     pub reads_only: bool,
 }
 
@@ -607,7 +609,9 @@ pub fn plan(source: &str) -> Plan {
                 || (*called && VOLATILE_FUNCTIONS.binary_search(&word.as_str()).is_ok())
         });
         cacheable &= reads && !writes && !volatile;
-        reads_only &= reads && !writes;
+        // Volatile functions may write (`nextval`, `setval`, `pg_notify`)
+        // or act on the server (`pg_terminate_backend`).
+        reads_only &= reads && !writes && !volatile;
         pageable &= reads && !writes;
     }
     let pageable = pageable.then(|| {
@@ -622,20 +626,39 @@ pub fn plan(source: &str) -> Plan {
 }
 
 /// Words that mark a statement as setting a password or a secret:
-/// `ALTER ROLE ... PASSWORD '...'`, MySQL's `IDENTIFIED BY '...'`.
-const SECRET_WORDS: &[&str] = &["IDENTIFIED", "PASSWORD", "SECRET"];
+/// `ALTER ROLE ... PASSWORD '...'`, MySQL's `IDENTIFIED BY '...'`,
+/// `CREATE SUBSCRIPTION ... CONNECTION '...'`.
+const SECRET_WORDS: &[&str] = &["CONNECTION", "IDENTIFIED", "PASSWORD", "SECRET"];
 
-/// `source` with every string literal replaced by `'•••'` when it sets a
-/// password, so the history never keeps one. Other text is kept as is.
+/// What gives a secret away inside a literal: connection strings such as
+/// `dblink_connect('host=x password=y')`.
+const SECRET_TEXT: &[&str] = &["password", "pwd=", "secret"];
+
+/// Whether `source` may carry a password: a word that sets one, or a
+/// literal that names one.
+#[must_use]
+pub fn sets_secret(source: &str) -> bool {
+    tokens(source).any(|token| {
+        let text = &source[token.range.clone()];
+        match token.kind {
+            TokenKind::Keyword | TokenKind::Identifier => SECRET_WORDS
+                .iter()
+                .any(|word| text.eq_ignore_ascii_case(word)),
+            TokenKind::String => {
+                let lower = text.to_lowercase();
+                SECRET_TEXT.iter().any(|needle| lower.contains(needle))
+            }
+            _ => false,
+        }
+    })
+}
+
+/// `source` with every string literal replaced by `'•••'` when it may
+/// carry a password ([`sets_secret`]), so the history never keeps one.
+/// Other text is kept as is.
 #[must_use]
 pub fn redact_secrets(source: &str) -> String {
-    let secret = tokens(source).any(|token| {
-        matches!(token.kind, TokenKind::Keyword | TokenKind::Identifier)
-            && SECRET_WORDS
-                .iter()
-                .any(|word| source[token.range.clone()].eq_ignore_ascii_case(word))
-    });
-    if !secret {
+    if !sets_secret(source) {
         return source.to_owned();
     }
     let mut out = String::with_capacity(source.len());
@@ -705,9 +728,19 @@ mod tests {
             redact_secrets("CREATE USER x IDENTIFIED BY E'a\\'b' -- note"),
             "CREATE USER x IDENTIFIED BY '•••' -- note"
         );
-        let plain = "SELECT 'password' FROM t";
+        assert_eq!(
+            redact_secrets("SELECT dblink_connect('host=db password=x')"),
+            "SELECT dblink_connect('•••')"
+        );
+        assert_eq!(
+            redact_secrets("CREATE SUBSCRIPTION s CONNECTION 'host=db' PUBLICATION p"),
+            "CREATE SUBSCRIPTION s CONNECTION '•••' PUBLICATION p"
+        );
+        let plain = "SELECT 'paid' FROM t";
         assert_eq!(redact_secrets(plain), plain);
-        assert!(plan("SELECT now()").reads_only);
+        // Functions with side effects are never analysed.
+        assert!(!plan("SELECT nextval('s')").reads_only);
+        assert!(!plan("SELECT pg_terminate_backend(42)").reads_only);
         assert!(!plan("SELECT now()").cacheable);
         assert!(!plan("DELETE FROM t").reads_only);
         assert!(!plan("SELECT 1; UPDATE t SET a = 1").reads_only);

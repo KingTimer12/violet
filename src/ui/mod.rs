@@ -403,7 +403,15 @@ impl VioletApp {
                             })
                             .sum()
                     }),
-                    error: result.as_ref().err().map(|error| error.message.clone()),
+                    // A server may quote the statement back, password
+                    // included.
+                    error: result.as_ref().err().map(|error| {
+                        if sql::sets_secret(&running.executed.sql) {
+                            "Failed (message hidden: the statement carries a password)".to_owned()
+                        } else {
+                            error.message.clone()
+                        }
+                    }),
                 });
                 if let Ok(output) = &result
                     && let Some(page) = output.page

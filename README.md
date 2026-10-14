@@ -120,7 +120,10 @@ keyboard:
 - **Explain plan**: the statement under the cursor behind `EXPLAIN`, to see
   how the server would run it without running it.
 - **Explain analyze**: the statement run for real and timed by the server.
-  Since that executes it, Violet only does it for statements that read.
+  Since that executes it, Violet only does it for statements that read and
+  call no function known to have side effects (`nextval`, `pg_notify`...).
+  Functions you wrote yourself cannot be told apart, so it is a guard
+  against accidents, not a sandbox.
 
 Errors are marked in the editor where the server points, explain modes
 included.
@@ -132,11 +135,14 @@ Nothing is lost between runs:
   error. Search it, keep to the current connection, and put a query back at
   the cursor or in a new editor. It lives in `history.jsonl` in Violet's
   state directory, readable by the user only, trimmed to the last 5,000
-  queries; statements that set a password (`PASSWORD`, `IDENTIFIED BY`)
-  are kept with their literals replaced by `'•••'`.
+  queries; statements that may carry a password (`PASSWORD`,
+  `IDENTIFIED BY`, `CONNECTION '...'`, or a literal mentioning a password)
+  are kept with their literals replaced by `'•••'` and their error message
+  hidden.
 - **Open editors** come back as they were: their text, titles and
-  connections are saved as you type (`session.json`, next to the history)
-  and reopened on the next start.
+  connections are saved as you type (`session.json`, next to the history,
+  mode `0600`) and reopened on the next start. Like a `.sql` file you
+  save, it keeps the text exactly as typed, passwords included.
 
 ## Browsing data and the result cache
 
