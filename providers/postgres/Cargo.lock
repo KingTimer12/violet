@@ -443,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "violet-sdk"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "log",
  "wit-bindgen",
