@@ -7,6 +7,7 @@ use crate::catalog::{ColumnInfo, DbObject, ServerInfo};
 use crate::error::Result;
 use crate::profile::{ConnectionProfile, Credentials, DriverId};
 use crate::query::{ExecLimits, ResultSet};
+use crate::tools::{Task, TaskRequest, TaskSettings, ToolCommand};
 
 /// What a driver can do, so the interface hides what does not apply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +48,38 @@ pub trait Driver: Send + Sync + 'static {
         profile: &ConnectionProfile,
         credentials: &Credentials,
     ) -> Result<Box<dyn Session>>;
+
+    /// The backups and restores the driver runs through the database's
+    /// client programs; none by default.
+    async fn tasks(&self) -> Result<Vec<Task>> {
+        Ok(Vec::new())
+    }
+
+    /// The command that runs `request` against `profile`. The password is
+    /// never asked for: the command names the variable that carries it.
+    async fn task_command(
+        &self,
+        profile: &ConnectionProfile,
+        request: &TaskRequest,
+    ) -> Result<ToolCommand> {
+        let _ = (profile, request);
+        Err(crate::DbError::new(
+            crate::ErrorKind::Unsupported,
+            "This database has no backup or restore",
+        ))
+    }
+
+    /// Settings that suit restoring from a path, such as its format: from a
+    /// file's first bytes, or a folder's file names.
+    async fn inspect_input(
+        &self,
+        head: &[u8],
+        entries: &[String],
+        directory: bool,
+    ) -> Result<TaskSettings> {
+        let _ = (head, entries, directory);
+        Ok(TaskSettings::new())
+    }
 }
 
 /// An open connection.

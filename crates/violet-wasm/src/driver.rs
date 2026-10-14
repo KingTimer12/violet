@@ -5,12 +5,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::OnceCell;
 use violet_core::{
-    ConnectionProfile, Credentials, DbError, Driver, DriverInfo, ErrorKind, Result, Session,
+    ConnectionProfile, Credentials, DbError, Driver, DriverInfo, ErrorKind, Result, Session, Task,
+    TaskRequest, TaskSettings, ToolCommand,
 };
 
 use crate::session::WasmSession;
 use crate::socket::Target;
-use crate::{Provider, Runtime, convert};
+use crate::{Provider, Runtime, convert, tools};
 
 /// Reads a provider's component, checking it is the one installed.
 pub type Loader = Box<dyn Fn() -> Result<Vec<u8>> + Send + Sync>;
@@ -22,6 +23,8 @@ pub struct WasmDriver {
     runtime: Runtime,
     loader: Loader,
     provider: OnceCell<Arc<Provider>>,
+    /// Its backup and restore tasks, checked, once asked for.
+    tasks: OnceCell<Vec<Task>>,
 }
 
 impl WasmDriver {
@@ -34,6 +37,7 @@ impl WasmDriver {
             runtime,
             loader,
             provider: OnceCell::new(),
+            tasks: OnceCell::new(),
         }
     }
 
@@ -96,5 +100,42 @@ impl Driver for WasmDriver {
             convert::ssl(profile)
         );
         Ok(Box::new(session))
+    }
+
+    async fn tasks(&self) -> Result<Vec<Task>> {
+        self.tasks
+            .get_or_try_init(|| async { tools::tasks(&*self.provider().await?).await })
+            .await
+            .cloned()
+    }
+
+    async fn task_command(
+        &self,
+        profile: &ConnectionProfile,
+        request: &TaskRequest,
+    ) -> Result<ToolCommand> {
+        let tasks = self.tasks().await?;
+        let task = tasks
+            .iter()
+            .find(|task| task.kind == request.kind)
+            .ok_or_else(|| {
+                DbError::unsupported(format!("No {} for this database", request.kind))
+            })?;
+        let provider = self.provider().await?;
+        // Never the password: the command names the variable for it.
+        let params = convert::connect_params(profile, None);
+        let command = tools::command(&provider, params, request).await?;
+        command.check(task)?;
+        Ok(command)
+    }
+
+    async fn inspect_input(
+        &self,
+        head: &[u8],
+        entries: &[String],
+        directory: bool,
+    ) -> Result<TaskSettings> {
+        let provider = self.provider().await?;
+        tools::inspect(&provider, head, entries, directory).await
     }
 }

@@ -259,8 +259,146 @@ interface provider {
     cancel: func(params: connect-params, ticket: list<u8>) -> result<_, db-error>;
 }
 
+/// Backups and restores through the database's own client programs, such
+/// as `pg_dump` and `pg_restore`. Optional: Violet offers backup and
+/// restore for providers that export it, and runs older providers without.
+///
+/// A provider cannot start programs. It describes its tasks and their
+/// settings, then turns the settings the user chose into a command line.
+/// Violet finds the program (in the folder the user picked, the provider's
+/// usual locations, then `PATH`), shows the whole command before it runs,
+/// and passes the password in the environment variable the provider
+/// names, never on the command line.
+interface tools {
+    use types.{connect-params, db-error};
+
+    enum task-kind {
+        backup,
+        restore,
+    }
+
+    record choice {
+        value: string,
+        label: string,
+    }
+
+    record number-range {
+        min: s64,
+        max: s64,
+    }
+
+    variant field-kind {
+        /// A checkbox: `true` or `false`.
+        flag,
+        /// Free text.
+        text,
+        /// A whole number in the range.
+        number(number-range),
+        /// One of the choices, by value.
+        choice(list<choice>),
+    }
+
+    /// Holds when the field `field` has one of `values`.
+    record condition {
+        field: string,
+        values: list<string>,
+    }
+
+    record field {
+        /// Lowercase letters, digits and `-`.
+        id: string,
+        label: string,
+        /// A sentence shown on hover.
+        help: string,
+        /// The group the dialog shows it in, such as `Output`.
+        section: string,
+        kind: field-kind,
+        /// As a value: `true`, `9`, `custom`...
+        default: string,
+        /// Shown only while this holds.
+        when: option<condition>,
+    }
+
+    enum path-kind {
+        file,
+        directory,
+    }
+
+    /// What a backup writes, or a restore reads.
+    record target {
+        /// The first target whose condition holds (or that has none)
+        /// applies.
+        when: option<condition>,
+        kind: path-kind,
+        /// Without the dot, for files; empty for any.
+        extension: string,
+    }
+
+    record task {
+        kind: task-kind,
+        /// The programs `command` may name, such as `pg_dump`: file names
+        /// without folder or extension.
+        programs: list<string>,
+        /// Folders the programs usually live in, tried after the one the
+        /// user picked and before `PATH`. A `*` stands for any part of one folder name,
+        /// such as a version (`/usr/lib/postgresql/*/bin`); the last match
+        /// in name order is tried first.
+        locations: list<string>,
+        /// Shows a program's version when passed alone, such as
+        /// `--version`.
+        version-arg: option<string>,
+        fields: list<field>,
+        /// The user picks the schemas and relations to include.
+        objects: bool,
+        targets: list<target>,
+    }
+
+    /// A schema, or a relation in one.
+    record object-ref {
+        schema: string,
+        name: option<string>,
+    }
+
+    record request {
+        /// The connection, without the password.
+        params: connect-params,
+        /// Every field's value, by id.
+        settings: list<tuple<string, string>>,
+        /// What to back up; empty for everything.
+        objects: list<object-ref>,
+        /// The absolute path of the file or folder to write or read.
+        path: string,
+    }
+
+    record tool-command {
+        /// One of the task's `programs`.
+        program: string,
+        args: list<string>,
+        /// Extra environment, such as `PGSSLMODE`.
+        env: list<tuple<string, string>>,
+        /// The variable that carries the password, such as `PGPASSWORD`.
+        password-env: option<string>,
+        /// Violet writes the program's standard output to the path, for
+        /// programs that only print the dump.
+        stdout-to-path: bool,
+        /// Violet feeds the path to the program's standard input.
+        stdin-from-path: bool,
+    }
+
+    /// The tasks the provider offers, at most one of each kind.
+    tasks: func() -> list<task>;
+
+    /// The command that runs a task.
+    command: func(kind: task-kind, request: request) -> result<tool-command, db-error>;
+
+    /// Settings that suit restoring from a path, such as the format it is
+    /// in: from a file's first bytes, or a folder's file names.
+    inspect: func(head: list<u8>, entries: list<string>, directory: bool) -> list<tuple<string, string>>;
+}
+
 world provider-world {
     import network;
     import logging;
     export provider;
+    export tools;
 }

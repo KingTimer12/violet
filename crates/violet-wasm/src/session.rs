@@ -13,7 +13,8 @@ use wasmtime::component::ResourceAny;
 use wasmtime::{Store, UpdateDeadline};
 
 use crate::Provider;
-use crate::bindings::{ProviderWorld, types as wit};
+use crate::bindings::exports::violet::provider::{provider as provider_api, tools as tools_api};
+use crate::bindings::types as wit;
 use crate::convert;
 use crate::host::HostState;
 use crate::socket::{Kill, Target};
@@ -25,9 +26,25 @@ const FUEL_PER_CALL: u64 = 50_000_000_000;
 
 /// A fresh instance of a provider, alone in its store.
 pub(crate) struct Instance {
-    store: Store<HostState>,
-    world: ProviderWorld,
+    pub(crate) store: Store<HostState>,
+    world: Exports,
     kill: Arc<Kill>,
+}
+
+/// What an instance exports.
+pub(crate) struct Exports {
+    provider: provider_api::Guest,
+    tools: Option<tools_api::Guest>,
+}
+
+impl Exports {
+    fn violet_provider_provider(&self) -> &provider_api::Guest {
+        &self.provider
+    }
+
+    pub(crate) fn tools(&self) -> Option<&tools_api::Guest> {
+        self.tools.as_ref()
+    }
 }
 
 impl Instance {
@@ -47,11 +64,25 @@ impl Instance {
         });
         store.set_epoch_deadline(1);
         refuel(&mut store);
-        let world = provider
+        let instance = provider
             .pre
             .instantiate_async(&mut store)
             .await
             .map_err(|error| crashed(&error))?;
+        let world = Exports {
+            provider: provider
+                .api
+                .load(&mut store, &instance)
+                .map_err(|error| crashed(&error))?,
+            tools: match &provider.tools {
+                Some(tools) => Some(
+                    tools
+                        .load(&mut store, &instance)
+                        .map_err(|error| crashed(&error))?,
+                ),
+                None => None,
+            },
+        };
         Ok(Self { store, world, kill })
     }
 
@@ -67,14 +98,20 @@ impl Instance {
     }
 }
 
+impl Instance {
+    pub(crate) fn exports(&self) -> &Exports {
+        &self.world
+    }
+}
+
 /// Gives the next call its budget of instructions.
-fn refuel(store: &mut Store<HostState>) {
+pub(crate) fn refuel(store: &mut Store<HostState>) {
     // Only fails when fuel is not enabled, which the engine always has.
     let _ = store.set_fuel(FUEL_PER_CALL);
 }
 
 /// A trap or a broken invariant: the instance cannot be trusted further.
-fn crashed(error: &wasmtime::Error) -> DbError {
+pub(crate) fn crashed(error: &wasmtime::Error) -> DbError {
     if error.downcast_ref::<wasmtime::Trap>() == Some(&wasmtime::Trap::OutOfFuel) {
         return DbError::new(
             ErrorKind::Provider,
@@ -167,7 +204,7 @@ impl WasmSession {
         label: &'static str,
         call: impl AsyncFnOnce(
             &mut Store<HostState>,
-            &ProviderWorld,
+            &Exports,
             ResourceAny,
         ) -> wasmtime::Result<std::result::Result<T, wit::DbError>>,
     ) -> Result<T> {

@@ -7,9 +7,11 @@
 
 mod catalog;
 mod session;
+mod tools;
 mod types;
 mod wire;
 
+use violet_sdk::tools::{Request, Task, TaskKind, ToolCommand};
 use violet_sdk::{Capabilities, ConnectParams, DbError, Provider, ProviderInfo, Result};
 
 pub use session::PgSession;
@@ -37,6 +39,18 @@ impl Provider for Postgres {
 
     fn connect(params: ConnectParams) -> Result<PgSession> {
         PgSession::connect(&params)
+    }
+
+    fn tasks() -> Vec<Task> {
+        tools::tasks()
+    }
+
+    fn command(kind: TaskKind, request: Request) -> Result<ToolCommand> {
+        tools::command(kind, request)
+    }
+
+    fn inspect(head: &[u8], entries: &[String], directory: bool) -> Vec<(String, String)> {
+        tools::inspect(head, entries, directory)
     }
 
     /// PostgreSQL cancels over a new connection, sending the backend key

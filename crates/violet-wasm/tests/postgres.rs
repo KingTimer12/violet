@@ -21,8 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use violet_core::{
-    ConnectionProfile, Credentials, Driver, DriverId, ErrorKind, ExecLimits, ObjectKind, OrderBy,
-    Paging, Row, Secret, Session, SslMode,
+    ConnectionProfile, Credentials, Driver, DriverId, ErrorKind, ExecLimits, ObjectKind, ObjectRef,
+    OrderBy, Paging, Row, Secret, Session, SslMode, TaskKind, TaskRequest,
 };
 use violet_wasm::{Runtime, WasmDriver};
 
@@ -98,6 +98,65 @@ async fn the_version_comes_from_the_crate() {
     let description = runtime().inspect(wasm).await.expect("inspect");
     assert_eq!(description.version, "0.1.0");
     assert!(description.description.contains("PostgreSQL"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn backups_and_restores_are_described_and_built_without_the_password() {
+    let Some(driver) = driver().await else {
+        return;
+    };
+    let tasks = driver.tasks().await.expect("tasks");
+    let kinds: Vec<TaskKind> = tasks.iter().map(|task| task.kind).collect();
+    assert_eq!(kinds, [TaskKind::Backup, TaskKind::Restore]);
+    let backup = &tasks[0];
+    assert!(backup.objects);
+    assert_eq!(backup.programs, ["pg_dump"]);
+
+    let mut profile = ConnectionProfile::new(DriverId::new("postgres"), 5432);
+    profile.host = "db.example.com".into();
+    profile.username = "app".into();
+    profile.database = "shop".into();
+    let mut settings = backup.defaults();
+    settings.insert("format".into(), "directory".into());
+    settings.insert("jobs".into(), "4".into());
+    let request = TaskRequest {
+        kind: TaskKind::Backup,
+        settings: backup.normalize(&settings),
+        objects: vec![ObjectRef {
+            schema: "public".into(),
+            name: Some("orders".into()),
+        }],
+        path: "/tmp/shop".into(),
+    };
+    let command = driver
+        .task_command(&profile, &request)
+        .await
+        .expect("command");
+    assert_eq!(command.program, "pg_dump");
+    assert_eq!(command.password_env.as_deref(), Some("PGPASSWORD"));
+    for arg in ["--format=d", "--jobs=4", "--table=\"public\".\"orders\""] {
+        assert!(command.args.iter().any(|a| a == arg), "{arg}");
+    }
+    assert!(command.args[0].contains("sslmode=verify-full"));
+
+    let format = driver
+        .inspect_input(b"PGDMP\x01", &[], false)
+        .await
+        .expect("inspect");
+    assert_eq!(format.get("format").map(String::as_str), Some("custom"));
+}
+
+/// A provider built before backup and restore still loads, with none.
+#[tokio::test(flavor = "multi_thread")]
+async fn providers_without_tools_still_run() {
+    let Some(path) = std::env::var_os("VIOLET_TEST_OLD_PROVIDER") else {
+        return;
+    };
+    let wasm = std::fs::read(path).expect("old provider");
+    let runtime = runtime();
+    let info = runtime.inspect(wasm.clone()).await.expect("inspect").info;
+    let driver = WasmDriver::new(runtime, info, Box::new(move || Ok(wasm.clone())));
+    assert!(driver.tasks().await.expect("tasks").is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]

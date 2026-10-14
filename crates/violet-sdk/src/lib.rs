@@ -42,6 +42,7 @@
 mod error;
 pub mod net;
 mod rows;
+pub mod tools;
 
 #[doc(hidden)]
 pub mod bindings {
@@ -87,6 +88,28 @@ pub trait Provider: 'static {
     /// Opens a session. `params.ssl` is the mode to honour: Violet has
     /// already turned `Prefer` into `Require` for remote hosts.
     fn connect(params: ConnectParams) -> Result<Self::Session>;
+
+    /// Backups and restores this provider runs through the database's
+    /// client programs (see [`tools`]); none by default.
+    fn tasks() -> Vec<tools::Task> {
+        Vec::new()
+    }
+
+    /// The command line for one of [`Provider::tasks`]. `request.params`
+    /// carries no password: name the variable for it with
+    /// [`tools::ToolCommand::password_env`]. Violet checks the command
+    /// runs one of the task's programs and shows it before it runs.
+    fn command(kind: tools::TaskKind, request: tools::Request) -> Result<tools::ToolCommand> {
+        let _ = (kind, request);
+        Err(DbError::unsupported("Backup and restore are not supported"))
+    }
+
+    /// Settings that suit restoring from a path, such as its format, from a
+    /// file's first bytes (`head`) or a folder's file names (`entries`).
+    fn inspect(head: &[u8], entries: &[String], directory: bool) -> Vec<(String, String)> {
+        let _ = (head, entries, directory);
+        Vec::new()
+    }
 
     /// Stops the statement the session that issued `ticket` (see
     /// [`Session::cancel_ticket`]) is running. Runs in a fresh instance,
@@ -268,6 +291,7 @@ pub mod __private {
     pub use crate::bindings::exports::violet::provider::provider::{
         Guest, GuestSession, Session as SessionHandle,
     };
+    pub use crate::bindings::exports::violet::provider::tools::Guest as ToolsGuest;
 
     use crate::{
         ColumnInfo, ConnectParams, DbError, DbObject, Provider, ProviderInfo, ResultSet,
@@ -358,6 +382,30 @@ macro_rules! export_provider {
                 ticket: ::std::vec::Vec<u8>,
             ) -> ::std::result::Result<(), $crate::DbError> {
                 $crate::__private::cancel::<$provider>(params, ticket)
+            }
+        }
+
+        impl $crate::__private::ToolsGuest for __VioletProvider {
+            fn tasks() -> ::std::vec::Vec<$crate::tools::Task> {
+                $crate::logging::install();
+                <$provider as $crate::Provider>::tasks()
+            }
+
+            fn command(
+                kind: $crate::tools::TaskKind,
+                request: $crate::tools::Request,
+            ) -> ::std::result::Result<$crate::tools::ToolCommand, $crate::DbError> {
+                $crate::logging::install();
+                <$provider as $crate::Provider>::command(kind, request)
+            }
+
+            fn inspect(
+                head: ::std::vec::Vec<u8>,
+                entries: ::std::vec::Vec<::std::string::String>,
+                directory: bool,
+            ) -> ::std::vec::Vec<(::std::string::String, ::std::string::String)> {
+                $crate::logging::install();
+                <$provider as $crate::Provider>::inspect(&head, &entries, directory)
             }
         }
 

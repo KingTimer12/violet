@@ -21,6 +21,7 @@ mod driver;
 mod host;
 mod session;
 mod socket;
+mod tools;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -33,7 +34,7 @@ use wasmtime::{Config, Engine};
 pub use convert::valid_id;
 pub use driver::{Loader, WasmDriver};
 
-use crate::bindings::ProviderWorldPre;
+use crate::bindings::exports::violet::provider::{provider as provider_api, tools as tools_api};
 use crate::host::HostState;
 
 /// The provider contract version this host speaks; see `violet-sdk`.
@@ -118,15 +119,19 @@ impl Runtime {
                 ),
             )
         })?;
-        let pre = ProviderWorldPre::new(pre).map_err(|error| {
+        let api = provider_api::GuestIndices::new(&pre).map_err(|error| {
             DbError::new(
                 ErrorKind::Provider,
                 format!("The provider does not export the provider API {API_VERSION}: {error}"),
             )
         })?;
+        // Backup and restore came later: providers without them still run.
+        let tools = tools_api::GuestIndices::new(&pre).ok();
         Ok(Provider {
             engine: self.engine.clone(),
             pre,
+            api,
+            tools,
         })
     }
 
@@ -144,7 +149,10 @@ impl Runtime {
 /// A compiled provider, ready to instantiate.
 pub struct Provider {
     engine: Engine,
-    pre: ProviderWorldPre<HostState>,
+    pre: wasmtime::component::InstancePre<HostState>,
+    api: provider_api::GuestIndices,
+    /// `None` for a provider without backup and restore.
+    tools: Option<tools_api::GuestIndices>,
 }
 
 impl Provider {

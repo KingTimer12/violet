@@ -14,6 +14,7 @@ pub mod ports;
 pub mod profile;
 pub mod query;
 pub mod secret;
+pub mod tools;
 
 pub use catalog::{ColumnInfo, DbObject, ForeignKey, ObjectKind, ServerInfo};
 pub use driver::{
@@ -24,3 +25,7 @@ pub use error::{DbError, ErrorKind, Result};
 pub use profile::{ConnectionId, ConnectionProfile, Credentials, DriverId, SslMode, is_loopback};
 pub use query::{ColumnMeta, ExecLimits, Page, PageInfo, QueryOutput, ResultSet, Row, Rows};
 pub use secret::Secret;
+pub use tools::{
+    Choice, Condition, Field, FieldKind, INSPECT_ENTRIES, INSPECT_HEAD, ObjectRef, PathKind,
+    Target, Task, TaskKind, TaskRequest, TaskSettings, ToolCommand,
+};
