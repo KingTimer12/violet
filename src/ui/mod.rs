@@ -47,6 +47,16 @@ use workspace::{
 /// The most queries the history keeps.
 pub const HISTORY_SIZE: usize = 5_000;
 
+/// The panels' sizes as drawn, to save the ones the user drags.
+#[derive(Debug, Default)]
+struct Layout {
+    /// The results' share of an editor tab's height.
+    results: Option<f32>,
+    sidebar: Option<f32>,
+    /// A panel changed size while the pointer was down.
+    dragged: bool,
+}
+
 /// Everything the interface needs from the rest of the app.
 pub struct Services {
     pub backend: Backend,
@@ -87,6 +97,8 @@ pub struct VioletApp {
     /// compared.
     session_saved: u64,
     session_checked: Instant,
+    /// Panel sizes measured this frame.
+    layout: Layout,
     #[cfg(debug_assertions)]
     snapshot: Option<devtools::Snapshot>,
 }
@@ -121,6 +133,7 @@ impl VioletApp {
             session_file: services.session,
             session_saved: 0,
             session_checked: Instant::now(),
+            layout: Layout::default(),
             #[cfg(debug_assertions)]
             snapshot: devtools::Snapshot::from_env(),
         };
@@ -217,6 +230,37 @@ impl VioletApp {
         };
         self.form = Some(ConnectionForm::create(&choice.info));
         true
+    }
+
+    /// Keeps the sizes the user dragged the sidebar and the results to, once
+    /// the drag ends. Sizes that change as the window does are not saved.
+    fn remember_layout(&mut self, ctx: &egui::Context) {
+        let dragging = ctx.input(|input| input.pointer.any_down());
+        let results = self
+            .layout
+            .results
+            .filter(|share| (share - self.settings.results_share).abs() > 0.002);
+        let sidebar = self
+            .layout
+            .sidebar
+            .filter(|width| (width - self.settings.sidebar_width).abs() > 0.5);
+        if results.is_none() && sidebar.is_none() {
+            self.layout.dragged = false;
+            return;
+        }
+        if dragging {
+            self.layout.dragged = true;
+            return;
+        }
+        if std::mem::take(&mut self.layout.dragged) {
+            if let Some(share) = results {
+                self.settings.results_share = share;
+            }
+            if let Some(width) = sidebar {
+                self.settings.sidebar_width = width;
+            }
+            self.save_settings(ctx);
+        }
     }
 
     fn save_settings(&mut self, ctx: &egui::Context) {
@@ -1267,18 +1311,25 @@ impl VioletApp {
             return;
         }
 
+        // One results panel for every editor, so they all keep the size the
+        // user gave it.
         let total = ui.available_height();
-        let results_height = total * 0.5;
-        Panel::bottom(Id::new(("results", tab.id)))
+        let results = Panel::bottom("results")
             .resizable(true)
-            .default_size(results_height)
+            .default_size(total * self.settings.results_share.clamp(0.1, 0.9))
             .size_range(90.0..=(total - 80.0).max(120.0))
             .frame(
                 Frame::NONE
                     .fill(palette.window)
                     .stroke(Stroke::new(1.0, palette.outline)),
             )
-            .show(ui, |ui| results::show(ui, tab, actions));
+            .show(ui, |ui| {
+                // The panel remembers the height its contents take: they
+                // fill it, or it would shrink to a smaller result each run.
+                ui.set_min_height(ui.available_height());
+                results::show(ui, tab, actions);
+            });
+        self.layout.results = (total > 0.0).then(|| results.response.rect.height() / total);
 
         let search = tab
             .connection
@@ -1409,9 +1460,9 @@ impl eframe::App for VioletApp {
             });
 
         let mut sidebar_open = self.settings.sidebar;
-        Panel::left("sidebar")
+        let sidebar = Panel::left("sidebar")
             .resizable(true)
-            .default_size(280.0)
+            .default_size(self.settings.sidebar_width)
             .size_range(200.0..=520.0)
             .frame(
                 Frame::NONE
@@ -1419,6 +1470,8 @@ impl eframe::App for VioletApp {
                     .stroke(Stroke::new(1.0, palette.outline)),
             )
             .show_collapsible(ui, &mut sidebar_open, |ui| {
+                // Filled, so the panel keeps its width (see the results).
+                ui.set_min_height(ui.available_height());
                 sidebar::show(
                     ui,
                     self.profiles.all(),
@@ -1426,13 +1479,16 @@ impl eframe::App for VioletApp {
                     &mut self.actions,
                 );
             });
+        self.layout.sidebar = sidebar.map(|sidebar| sidebar.response.rect.width());
         if sidebar_open != self.settings.sidebar {
             self.actions.push(Action::ToggleSidebar);
         }
 
+        self.layout.results = None;
         egui::CentralPanel::default()
             .frame(Frame::NONE.fill(palette.window))
             .show(ui, |ui| self.central(ui));
+        self.remember_layout(&ctx);
 
         self.modals(&ctx);
         self.toasts.show(&ctx);

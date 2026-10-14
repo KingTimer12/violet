@@ -31,11 +31,15 @@ impl From<egui::ThemePreference> for ThemeChoice {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub theme: ThemeChoice,
     pub sidebar: bool,
+    /// The sidebar's width, in points.
+    pub sidebar_width: f32,
+    /// How much of an editor tab the results take, from 0 to 1.
+    pub results_share: f32,
 }
 
 impl Default for Settings {
@@ -43,6 +47,8 @@ impl Default for Settings {
         Self {
             theme: ThemeChoice::System,
             sidebar: true,
+            sidebar_width: 280.0,
+            results_share: 0.5,
         }
     }
 }
