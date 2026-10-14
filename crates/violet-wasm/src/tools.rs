@@ -2,15 +2,14 @@
 //! Everything it returns is checked before use.
 
 use violet_core::{
-    Choice, Condition, DbError, ErrorKind, Field, FieldKind, INSPECT_ENTRIES as ENTRIES,
-    INSPECT_HEAD as HEAD, PathKind, Result, Target, Task, TaskKind, TaskRequest, TaskSettings,
-    ToolCommand,
+    Argument, Binding, Choice, CommandPart, CommandTemplate, Condition, Connection, DbError,
+    Download, ErrorKind, Field, FieldKind, INSPECT_ENTRIES as ENTRIES, INSPECT_HEAD as HEAD,
+    ObjectArguments, PathKind, Piece, Quoting, Result, Target, Task, TaskKind, TaskSettings,
+    ValuePiece, Variable,
 };
 
 use crate::Provider;
 use crate::bindings::exports::violet::provider::tools as api;
-use crate::bindings::types as wit;
-use crate::convert;
 use crate::session::{Instance, crashed, refuel};
 
 /// A fresh instance and its `tools` export, or `None` when the provider
@@ -49,49 +48,33 @@ pub(crate) async fn tasks(provider: &Provider) -> Result<Vec<Task>> {
     Ok(checked)
 }
 
-/// The command for `request`, unchecked. `params` carries no password.
-pub(crate) async fn command(
-    provider: &Provider,
-    params: wit::ConnectParams,
-    request: &TaskRequest,
-) -> Result<ToolCommand> {
-    let (mut instance, tools) = start(provider)
-        .await?
-        .ok_or_else(|| DbError::unsupported("This provider has no backup or restore"))?;
-    let kind = match request.kind {
-        TaskKind::Backup => api::TaskKind::Backup,
-        TaskKind::Restore => api::TaskKind::Restore,
+/// The programs the provider would have downloaded, checked.
+pub(crate) async fn downloads(provider: &Provider) -> Result<Vec<Download>> {
+    let Some((mut instance, tools)) = start(provider).await? else {
+        return Ok(Vec::new());
     };
-    let wire = api::Request {
-        params,
-        settings: request
-            .settings
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
-        objects: request
-            .objects
-            .iter()
-            .map(|object| api::ObjectRef {
-                schema: object.schema.clone(),
-                name: object.name.clone(),
-            })
-            .collect(),
-        path: request.path.clone(),
-    };
-    let command = tools
-        .call_command(&mut instance.store, kind, &wire)
+    let downloads = tools
+        .call_downloads(&mut instance.store)
         .await
-        .map_err(|error| crashed(&error))?
-        .map_err(convert::error)?;
-    Ok(ToolCommand {
-        program: command.program,
-        args: command.args,
-        env: command.env,
-        password_env: command.password_env,
-        stdout_to_path: command.stdout_to_path,
-        stdin_from_path: command.stdin_from_path,
-    })
+        .map_err(|error| crashed(&error))?;
+    let downloads: Vec<Download> = downloads
+        .into_iter()
+        .take(16)
+        .map(|d| Download {
+            platform: d.platform,
+            url: d.url,
+            sha256: d.sha256.to_ascii_lowercase(),
+            size: d.size,
+            label: d.label,
+            root: d.root,
+            extract: d.extract,
+            bin: d.bin,
+        })
+        .collect();
+    for download in &downloads {
+        download.check()?;
+    }
+    Ok(downloads)
 }
 
 /// Settings the provider suggests for restoring from a path.
@@ -152,7 +135,7 @@ fn task_from(task: api::Task) -> Task {
                     ),
                 },
                 default: field.default,
-                when: field.when.map(condition),
+                when: conditions(field.when),
             })
             .collect(),
         objects: task.objects,
@@ -160,7 +143,7 @@ fn task_from(task: api::Task) -> Task {
             .targets
             .into_iter()
             .map(|target| Target {
-                when: target.when.map(condition),
+                when: conditions(target.when),
                 kind: match target.kind {
                     api::PathKind::File => PathKind::File,
                     api::PathKind::Directory => PathKind::Directory,
@@ -168,12 +151,93 @@ fn task_from(task: api::Task) -> Task {
                 extension: target.extension,
             })
             .collect(),
+        connection: Connection {
+            host: task.connection.host.map(binding),
+            port: task.connection.port.map(binding),
+            user: task.connection.user.map(binding),
+            database: task.connection.database.map(binding),
+            password_env: task.connection.password_env,
+            database_field: task.connection.database_field,
+        },
+        commands: task
+            .commands
+            .into_iter()
+            .map(|command| CommandTemplate {
+                program: command.program,
+                when: conditions(command.when),
+                parts: command
+                    .parts
+                    .into_iter()
+                    .map(|part| match part {
+                        api::CommandPart::Argument(argument) => CommandPart::Argument(Argument {
+                            when: conditions(argument.when),
+                            pieces: pieces(argument.pieces),
+                            each: argument.each,
+                        }),
+                        api::CommandPart::Objects(objects) => {
+                            CommandPart::Objects(ObjectArguments {
+                                schema_prefix: objects.schema_prefix,
+                                table_prefix: objects.table_prefix,
+                                quoting: match objects.quoting {
+                                    api::Quoting::Bare => Quoting::None,
+                                    api::Quoting::Double => Quoting::Double,
+                                    api::Quoting::Backtick => Quoting::Backtick,
+                                    api::Quoting::Bracket => Quoting::Bracket,
+                                },
+                                schema_tables: objects.schema_tables,
+                            })
+                        }
+                        api::CommandPart::Extra(field) => CommandPart::Extra(field),
+                    })
+                    .collect(),
+                variables: command
+                    .variables
+                    .into_iter()
+                    .map(|variable| Variable {
+                        when: conditions(variable.when),
+                        name: variable.name,
+                        pieces: pieces(variable.pieces),
+                    })
+                    .collect(),
+                stdout_to_path: command.stdout_to_path,
+                stdin_from_path: command.stdin_from_path,
+            })
+            .collect(),
     }
 }
 
-fn condition(condition: api::Condition) -> Condition {
-    Condition {
-        field: condition.field,
-        values: condition.values,
+fn conditions(conditions: Vec<api::Condition>) -> Vec<Condition> {
+    conditions
+        .into_iter()
+        .map(|condition| Condition {
+            field: condition.field,
+            values: condition.values,
+            except: condition.except,
+        })
+        .collect()
+}
+
+fn binding(binding: api::Binding) -> Binding {
+    match binding {
+        api::Binding::Env(name) => Binding::Env(name),
+        api::Binding::Prefix(option) => Binding::Option(option),
     }
+}
+
+fn pieces(pieces: Vec<api::Piece>) -> Vec<Piece> {
+    pieces
+        .into_iter()
+        .map(|piece| match piece {
+            api::Piece::Text(text) => Piece::Text(text),
+            api::Piece::Value(value) => Piece::Value(ValuePiece {
+                field: value.field,
+                map: value.replace,
+            }),
+            api::Piece::Path => Piece::Path,
+            api::Piece::Host => Piece::Host,
+            api::Piece::Port => Piece::Port,
+            api::Piece::User => Piece::User,
+            api::Piece::Database => Piece::Database,
+        })
+        .collect()
 }

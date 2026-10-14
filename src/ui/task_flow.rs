@@ -18,6 +18,12 @@ pub struct Started {
     pub path: PathBuf,
 }
 
+/// A provider's downloaded client programs.
+pub enum Tools {
+    Downloading { label: String, size: u64 },
+    Failed(String),
+}
+
 /// The key a task's last settings are saved under.
 fn settings_key(driver: &DriverId, kind: TaskKind) -> String {
     format!("{driver}/{}", kind.label().to_lowercase())
@@ -71,10 +77,10 @@ impl VioletApp {
         let Some(dialog) = &mut self.task_dialog else {
             return;
         };
-        let Some(Loadable::Ready(tasks)) = self.tasks.get(&dialog.driver) else {
+        let Some(Loadable::Ready(offer)) = self.tasks.get(&dialog.driver) else {
             return;
         };
-        if let Some(task) = tasks.iter().find(|task| task.kind == dialog.kind) {
+        if let Some(task) = offer.tasks.iter().find(|task| task.kind == dialog.kind) {
             let last = self
                 .settings
                 .task_settings
@@ -98,8 +104,8 @@ impl VioletApp {
                 let Some(dialog) = &self.task_dialog else {
                     return;
                 };
-                if let Some(Loadable::Ready(tasks)) = self.tasks.get(&dialog.driver)
-                    && let Some(task) = tasks.iter().find(|task| task.kind == dialog.kind)
+                if let Some(Loadable::Ready(offer)) = self.tasks.get(&dialog.driver)
+                    && let Some(task) = offer.tasks.iter().find(|task| task.kind == dialog.kind)
                 {
                     self.backend.find_programs(
                         dialog.driver.clone(),
@@ -134,6 +140,10 @@ impl VioletApp {
                 }
             }
             Action::TaskClose => self.task_dialog = None,
+            Action::RetryTools(driver) => {
+                self.tools.remove(&driver);
+                self.backend.load_tasks(driver);
+            }
             Action::Reveal(path) => tasks::reveal(&path),
             _ => {}
         }
@@ -149,10 +159,10 @@ impl VioletApp {
     )> {
         let dialog = self.task_dialog.as_ref()?;
         let profile = self.profiles.get(dialog.connection)?.clone();
-        let Some(Loadable::Ready(tasks)) = self.tasks.get(&dialog.driver) else {
+        let Some(Loadable::Ready(offer)) = self.tasks.get(&dialog.driver) else {
             return None;
         };
-        let task = tasks.iter().find(|task| task.kind == dialog.kind)?;
+        let task = offer.tasks.iter().find(|task| task.kind == dialog.kind)?;
         let request = dialog.request(task, &profile)?;
         Some((profile, request, dialog.client_folder()))
     }
@@ -164,7 +174,9 @@ impl VioletApp {
         let Some(dialog) = &mut self.task_dialog else {
             return;
         };
-        if !self.settings.trusted_tools.contains(dialog.driver.as_str()) {
+        // One run per dialog: a second would race the first on the same
+        // file or database.
+        if dialog.running() || !self.settings.trusted_tools.contains(dialog.driver.as_str()) {
             return;
         }
         // What ran is what the dialog opens with next time.
@@ -213,6 +225,44 @@ impl VioletApp {
             Event::Tasks { driver, result } => {
                 self.tasks.insert(driver, Loadable::from_result(result));
                 self.initialize_task();
+            }
+            Event::ToolsDownloading {
+                driver,
+                label,
+                size,
+            } => {
+                self.tools
+                    .insert(driver, Tools::Downloading { label, size });
+            }
+            Event::ToolsReady { driver, result } => {
+                let label = match self.tools.remove(&driver) {
+                    Some(Tools::Downloading { label, .. }) => label,
+                    _ => "Client programs".to_owned(),
+                };
+                match result {
+                    Ok(Some(_)) => {
+                        self.toasts
+                            .push(ctx, Toast::success(format!("{label} downloaded")));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.toasts.push(
+                            ctx,
+                            Toast::error(
+                                format!("Could not download {label}"),
+                                error.message.clone(),
+                            ),
+                        );
+                        self.tools
+                            .insert(driver.clone(), Tools::Failed(error.message));
+                    }
+                }
+                // Look again: the programs may be there now.
+                if let Some(dialog) = &mut self.task_dialog
+                    && dialog.driver == driver
+                {
+                    dialog.refresh();
+                }
             }
             Event::ProgramsFound {
                 driver,
@@ -304,7 +354,8 @@ impl VioletApp {
             .map_or_else(|| dialog.driver.to_string(), |driver| driver.info().name);
         let env = tasks::Env {
             profile,
-            tasks: self.tasks.get(&dialog.driver),
+            offer: self.tasks.get(&dialog.driver),
+            tools: self.tools.get(&dialog.driver),
             explorer: &self.explorer,
             trusted: self.settings.trusted_tools.contains(dialog.driver.as_str()),
             driver_name: &driver_name,

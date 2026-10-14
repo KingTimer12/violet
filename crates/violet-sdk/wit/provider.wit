@@ -263,15 +263,14 @@ interface provider {
 /// as `pg_dump` and `pg_restore`. Optional: Violet offers backup and
 /// restore for providers that export it, and runs older providers without.
 ///
-/// A provider cannot start programs. It describes its tasks and their
-/// settings, then turns the settings the user chose into a command line.
-/// Violet finds the program (in the folder the user picked, the provider's
-/// usual locations, then `PATH`), shows the whole command before it runs,
-/// and passes the password in the environment variable the provider
-/// names, never on the command line.
+/// A provider cannot start programs, and it does not build command lines
+/// either. It declares each task up front: its settings, and a template
+/// of the command (fixed text, setting values, the chosen path, the
+/// profile's connection). Violet fills the template itself, so nothing a
+/// provider computes at run time reaches a command line, the connection
+/// always comes from the profile, and the user can be shown every
+/// argument a provider may ever use before allowing it.
 interface tools {
-    use types.{connect-params, db-error};
-
     enum task-kind {
         backup,
         restore,
@@ -290,7 +289,7 @@ interface tools {
     variant field-kind {
         /// A checkbox: `true` or `false`.
         flag,
-        /// Free text.
+        /// Free text the user types.
         text,
         /// A whole number in the range.
         number(number-range),
@@ -298,10 +297,13 @@ interface tools {
         choice(list<choice>),
     }
 
-    /// Holds when the field `field` has one of `values`.
+    /// Holds when `field` has one of `values`, or with `except`, none of
+    /// them. Besides the task's fields, `@ssl` is the profile's TLS mode:
+    /// `disable`, `prefer` or `require`.
     record condition {
         field: string,
         values: list<string>,
+        except: bool,
     }
 
     record field {
@@ -315,8 +317,8 @@ interface tools {
         kind: field-kind,
         /// As a value: `true`, `9`, `custom`...
         default: string,
-        /// Shown only while this holds.
-        when: option<condition>,
+        /// Shown only while every condition holds.
+        when: list<condition>,
     }
 
     enum path-kind {
@@ -326,23 +328,128 @@ interface tools {
 
     /// What a backup writes, or a restore reads.
     record target {
-        /// The first target whose condition holds (or that has none)
-        /// applies.
-        when: option<condition>,
+        /// The first target whose conditions hold applies.
+        when: list<condition>,
         kind: path-kind,
         /// Without the dot, for files; empty for any.
         extension: string,
     }
 
+    /// A setting's value, with listed values replaced (`custom` → `c`).
+    record value-piece {
+        field: string,
+        replace: list<tuple<string, string>>,
+    }
+
+    /// Part of an argument or a variable's value.
+    variant piece {
+        /// Fixed text.
+        text(string),
+        value(value-piece),
+        /// The file or folder the user chose.
+        path,
+        /// The profile's host, port, user and database (or the database
+        /// the connection's `database-field` names).
+        host,
+        port,
+        user,
+        database,
+    }
+
+    /// One argument, its pieces joined, added when every condition holds.
+    /// With `each` (a text field), it repeats for each comma-separated item
+    /// of that field, the item standing for the field's `value` pieces.
+    record argument {
+        when: list<condition>,
+        pieces: list<piece>,
+        each: option<string>,
+    }
+
+    enum quoting {
+        /// As is.
+        bare,
+        /// `"name"`, doubling `"` inside.
+        double,
+        /// `` `name` ``, doubling `` ` `` inside.
+        backtick,
+        /// `[name]`, doubling `]` inside.
+        bracket,
+    }
+
+    /// One argument per schema or relation the user picked: a schema as
+    /// `schema-prefix` and its quoted name, a relation as `table-prefix`
+    /// and its quoted schema and name, joined by a dot.
+    record object-arguments {
+        schema-prefix: string,
+        table-prefix: string,
+        quoting: quoting,
+        /// When relations are picked too, whole schemas are written as
+        /// `table-prefix`, the quoted schema and this, such as `.*`: some
+        /// programs (pg_dump) ignore schemas once tables are named.
+        schema-tables: option<string>,
+    }
+
+    variant command-part {
+        argument(argument),
+        objects(object-arguments),
+        /// Arguments the user typed in this text field, split as a shell
+        /// would (without running one).
+        extra(string),
+    }
+
+    /// An environment variable, set when every condition holds.
+    record variable {
+        when: list<condition>,
+        name: string,
+        pieces: list<piece>,
+    }
+
+    /// How the program reaches the server.
+    variant binding {
+        /// Through this environment variable, such as `PGHOST`.
+        env(string),
+        /// As one argument: this prefix and the value, such as `--host=`.
+        prefix(string),
+    }
+
+    /// The profile's connection, which Violet passes itself: a task cannot
+    /// set these any other way.
+    record connection {
+        host: option<binding>,
+        port: option<binding>,
+        user: option<binding>,
+        database: option<binding>,
+        /// The variable that carries the password, such as `PGPASSWORD`.
+        password-env: option<string>,
+        /// A text field naming another database on the same server, used
+        /// instead of the profile's when filled.
+        database-field: option<string>,
+    }
+
+    record command {
+        /// One of the task's programs.
+        program: string,
+        /// The first command whose conditions hold runs.
+        when: list<condition>,
+        parts: list<command-part>,
+        variables: list<variable>,
+        /// Violet writes the program's standard output to the path, for
+        /// programs that only print the dump.
+        stdout-to-path: bool,
+        /// Violet feeds the path to the program's standard input.
+        stdin-from-path: bool,
+    }
+
     record task {
         kind: task-kind,
-        /// The programs `command` may name, such as `pg_dump`: file names
+        /// The programs its commands run, such as `pg_dump`: file names
         /// without folder or extension.
         programs: list<string>,
-        /// Folders the programs usually live in, tried after the one the
-        /// user picked and before `PATH`. A `*` stands for any part of one folder name,
-        /// such as a version (`/usr/lib/postgresql/*/bin`); the last match
-        /// in name order is tried first.
+        /// Folders the programs usually live in, tried after the downloaded
+        /// ones and the one the user picked, and before `PATH`. A `*`
+        /// stands for any part of one folder name, such as a version
+        /// (`/usr/lib/postgresql/*/bin`); the last match in name order is
+        /// tried first.
         locations: list<string>,
         /// Shows a program's version when passed alone, such as
         /// `--version`.
@@ -351,45 +458,36 @@ interface tools {
         /// The user picks the schemas and relations to include.
         objects: bool,
         targets: list<target>,
+        connection: connection,
+        commands: list<command>,
     }
 
-    /// A schema, or a relation in one.
-    record object-ref {
-        schema: string,
-        name: option<string>,
-    }
-
-    record request {
-        /// The connection, without the password.
-        params: connect-params,
-        /// Every field's value, by id.
-        settings: list<tuple<string, string>>,
-        /// What to back up; empty for everything.
-        objects: list<object-ref>,
-        /// The absolute path of the file or folder to write or read.
-        path: string,
-    }
-
-    record tool-command {
-        /// One of the task's `programs`.
-        program: string,
-        args: list<string>,
-        /// Extra environment, such as `PGSSLMODE`.
-        env: list<tuple<string, string>>,
-        /// The variable that carries the password, such as `PGPASSWORD`.
-        password-env: option<string>,
-        /// Violet writes the program's standard output to the path, for
-        /// programs that only print the dump.
-        stdout-to-path: bool,
-        /// Violet feeds the path to the program's standard input.
-        stdin-from-path: bool,
+    /// Client programs Violet downloads with the provider, so backups work
+    /// without installing anything.
+    record download {
+        /// `macos-aarch64`, `macos-x86_64`, `linux-x86_64`,
+        /// `linux-aarch64` or `windows-x86_64`.
+        platform: string,
+        /// An `https://` URL of a `.tar.gz` archive.
+        url: string,
+        sha256: string,
+        size: u64,
+        /// Shown to the user, such as `PostgreSQL 18.6 client`.
+        label: string,
+        /// The top folder inside the archive.
+        root: string,
+        /// What to keep, under `root`: files, or folders ending in `/`.
+        extract: list<string>,
+        /// The folder with the programs, under `root`, such as `bin`.
+        bin: string,
     }
 
     /// The tasks the provider offers, at most one of each kind.
     tasks: func() -> list<task>;
 
-    /// The command that runs a task.
-    command: func(kind: task-kind, request: request) -> result<tool-command, db-error>;
+    /// Programs to download for each platform; none to rely on what is
+    /// installed.
+    downloads: func() -> list<download>;
 
     /// Settings that suit restoring from a path, such as the format it is
     /// in: from a file's first bytes, or a folder's file names.

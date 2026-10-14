@@ -150,40 +150,60 @@ VIOLET_PROVIDER_INDEX=$PWD/dist/providers.json cargo run
 
 ## Backup and restore
 
-A provider may also describe backups and restores run by the database's
-own client programs (`pg_dump`, `mysqldump`...). It cannot start programs
-itself: it returns [`tools::Task`]s, with their settings, and turns the
-settings the user chose into a [`tools::ToolCommand`]. Violet finds the
-program, asks the user once whether the provider may run programs, shows
-each command in full and runs it, with the password in the variable the
-command names.
+A provider may also offer backups and restores run by the database's own
+client programs (`pg_dump`, `mysqldump`...). It does not start them, and
+does not build their command lines: it declares each [`tools::Task`] up
+front, with its settings and a template of the command, and Violet fills
+the template in. The connection is Violet's to pass: the task only says
+which variables (or options) carry the host, port, user, database and
+password, and the template may not set those any other way.
 
 ```rust
-use violet_sdk::tools::{Field, Request, Target, Task, TaskKind, ToolCommand};
+use violet_sdk::tools::*;
 
 impl Provider for Lite {
     // ...
     fn tasks() -> Vec<Task> {
         vec![
             Task::new(TaskKind::Backup, &["litedump"])
-                .locations(&["/opt/lite/*/bin"])
                 .with_objects()
+                .connection(
+                    Connection::env("LITE_HOST", "LITE_PORT", "LITE_USER", "LITE_DB")
+                        .password("LITE_PASSWORD"),
+                )
                 .field(Field::choice("format", "Format", "Output", "sql", &[
                     ("sql", "SQL script"),
                     ("bin", "Binary"),
                 ]))
                 .field(Field::flag("data", "Include data", "Content", true))
+                .field(Field::text("extra", "Extra arguments", "Advanced"))
                 .target(Target::file("sql").when("format", &["sql"]))
-                .target(Target::file("lite")),
+                .target(Target::file("lite"))
+                .command(
+                    Command::new("litedump")
+                        .arg([text("--format="), mapped("format", &[("bin", "b")])])
+                        .flag("data", false, "--no-data")
+                        .arg([text("--out="), path()])
+                        .objects("--schema=", "--table=", Quoting::Double, None)
+                        .env(&[is("@ssl", &["require"])], "LITE_TLS", [text("on")])
+                        .extra("extra"),
+                ),
         ]
     }
 
-    fn command(kind: TaskKind, request: Request) -> Result<ToolCommand> {
-        Ok(ToolCommand::new("litedump")
-            .arg(format!("--host={}", request.params.host))
-            .arg_if(!request.flag("data"), "--no-data")
-            .arg(format!("--out={}", request.path))
-            .password_env("LITE_PASSWORD"))
+    /// Programs Violet downloads with the provider, so nothing has to be
+    /// installed: a `.tar.gz` per platform, with its SHA-256.
+    fn downloads() -> Vec<Download> {
+        vec![Download {
+            platform: "linux-x86_64".into(),
+            url: "https://example.com/lite-client-3.1-linux-x86_64.tar.gz".into(),
+            sha256: "…".into(),
+            size: 4_200_000,
+            label: "LiteDB 3.1 client".into(),
+            root: "lite-client-3.1".into(),
+            extract: vec!["bin/litedump".into(), "lib/".into()],
+            bin: "bin".into(),
+        }]
     }
 
     fn inspect(head: &[u8], _entries: &[String], _directory: bool) -> Vec<(String, String)> {
@@ -193,10 +213,14 @@ impl Provider for Lite {
 }
 ```
 
-Violet refuses tasks and commands that name undeclared programs, shells,
-interpreters or launchers, set variables that change what runs (`PATH`,
-`LD_*`, `*FILE`...), or are oversized. Providers built before this
-interface still load, without backup and restore.
+Conditions read the task's settings, plus `@ssl`, the profile's TLS mode
+(`disable`, `prefer`, `require`). Violet refuses tasks that name
+undeclared programs, shells or interpreters, set variables that change
+what runs (`PATH`, `LD_*`, `*FILE`...) or that carry the connection,
+reference unknown settings, or hold pipes or console commands in their
+fixed text; downloads must be HTTPS, carry a digest and unpack to plain
+relative paths. Providers built before this interface still load, without
+backup and restore.
 
 ## The contract
 

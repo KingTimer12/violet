@@ -26,6 +26,8 @@ pub use profile::{ConnectionId, ConnectionProfile, Credentials, DriverId, SslMod
 pub use query::{ColumnMeta, ExecLimits, Page, PageInfo, QueryOutput, ResultSet, Row, Rows};
 pub use secret::Secret;
 pub use tools::{
-    Choice, Condition, Field, FieldKind, INSPECT_ENTRIES, INSPECT_HEAD, ObjectRef, PathKind,
-    Target, Task, TaskKind, TaskRequest, TaskSettings, ToolCommand,
+    Argument, Binding, Choice, CommandPart, CommandTemplate, Condition, Connection, Download,
+    Field, FieldKind, INSPECT_ENTRIES, INSPECT_HEAD, ObjectArguments, ObjectRef, PathKind, Piece,
+    Quoting, Target, Task, TaskKind, TaskRequest, TaskSettings, ToolCommand, ValuePiece, Variable,
+    split_args,
 };

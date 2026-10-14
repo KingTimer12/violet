@@ -5,8 +5,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::OnceCell;
 use violet_core::{
-    ConnectionProfile, Credentials, DbError, Driver, DriverInfo, ErrorKind, Result, Session, Task,
-    TaskRequest, TaskSettings, ToolCommand,
+    ConnectionProfile, Credentials, DbError, Download, Driver, DriverInfo, ErrorKind, Result,
+    Session, Task, TaskSettings,
 };
 
 use crate::session::WasmSession;
@@ -109,24 +109,8 @@ impl Driver for WasmDriver {
             .cloned()
     }
 
-    async fn task_command(
-        &self,
-        profile: &ConnectionProfile,
-        request: &TaskRequest,
-    ) -> Result<ToolCommand> {
-        let tasks = self.tasks().await?;
-        let task = tasks
-            .iter()
-            .find(|task| task.kind == request.kind)
-            .ok_or_else(|| {
-                DbError::unsupported(format!("No {} for this database", request.kind))
-            })?;
-        let provider = self.provider().await?;
-        // Never the password: the command names the variable for it.
-        let params = convert::connect_params(profile, None);
-        let command = tools::command(&provider, params, request).await?;
-        command.check(task)?;
-        Ok(command)
+    async fn downloads(&self) -> Result<Vec<Download>> {
+        tools::downloads(&*self.provider().await?).await
     }
 
     async fn inspect_input(

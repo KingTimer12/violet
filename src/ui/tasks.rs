@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use egui::{CornerRadius, RichText, Sense, Stroke, Vec2};
 use violet_app::tasks::{Program, TaskSummary};
-use violet_app::{RequestId, TaskId};
+use violet_app::{Offer, RequestId, TaskId};
 use violet_core::{
     ConnectionId, ConnectionProfile, DriverId, Field, FieldKind, ObjectKind, ObjectRef, PathKind,
     Task, TaskKind, TaskRequest, TaskSettings, ToolCommand,
@@ -20,6 +20,7 @@ use violet_core::{
 use super::action::Action;
 use super::icons::Icon;
 use super::state::{Explorer, Link, Loadable};
+use super::task_flow::Tools;
 use super::theme::{self, Palette};
 use super::widgets::{self, Tone};
 use super::workspace::format_duration;
@@ -109,7 +110,9 @@ impl RunState {
 /// What the dialog reads from the app.
 pub struct Env<'a> {
     pub profile: &'a ConnectionProfile,
-    pub tasks: Option<&'a Loadable<Vec<Task>>>,
+    pub offer: Option<&'a Loadable<Offer>>,
+    /// Its client programs being downloaded, or why they could not be.
+    pub tools: Option<&'a Tools>,
     pub explorer: &'a Explorer,
     /// The user let this driver run programs.
     pub trusted: bool,
@@ -213,6 +216,12 @@ impl TaskDialog {
     }
 
     /// A fresh timestamp and no result, to run the same task again.
+    /// Looks for the programs and builds the command again.
+    pub fn refresh(&mut self) {
+        self.programs_for = None;
+        self.preview_key.clear();
+    }
+
     pub fn reset(&mut self) {
         self.run = None;
         self.stamp = jiff::Zoned::now();
@@ -316,7 +325,7 @@ pub fn show(
                 consent(ui, dialog, env, actions, &mut open, &palette);
                 return;
             }
-            let task = match env.tasks {
+            let task = match env.offer {
                 None | Some(Loadable::Idle | Loadable::Loading) => {
                     ui.allocate_ui(Vec2::new(ui.available_width(), 200.0), |ui| {
                         widgets::empty_state(
@@ -332,7 +341,7 @@ pub fn show(
                     notice(ui, Icon::CircleAlert, palette.danger, error, &palette);
                     return;
                 }
-                Some(Loadable::Ready(tasks)) => tasks.iter().find(|t| t.kind == dialog.kind),
+                Some(Loadable::Ready(offer)) => offer.tasks.iter().find(|t| t.kind == dialog.kind),
             };
             let Some(task) = task else {
                 ui.allocate_ui(Vec2::new(ui.available_width(), 200.0), |ui| {
@@ -447,17 +456,22 @@ fn consent(
     open: &mut bool,
     palette: &Palette,
 ) {
-    let programs = match env.tasks {
-        Some(Loadable::Ready(tasks)) => {
-            let mut names: Vec<&str> = tasks
+    let offer = match env.offer {
+        Some(Loadable::Ready(offer)) => Some(offer),
+        _ => None,
+    };
+    let programs = offer.map_or_else(
+        || "its client programs".to_owned(),
+        |offer| {
+            let mut names: Vec<&str> = offer
+                .tasks
                 .iter()
                 .flat_map(|task| task.programs.iter().map(String::as_str))
                 .collect();
             names.dedup();
             names.join(", ")
-        }
-        _ => "its client programs".to_owned(),
-    };
+        },
+    );
     egui::Frame::new()
         .fill(palette.panel)
         .stroke(Stroke::new(1.0, palette.outline))
@@ -486,11 +500,58 @@ fn consent(
             );
             ui.label(
                 RichText::new(
-                    "Violet only runs programs the provider declares, never shells or \
-                     interpreters, and shows each command in full before it starts.",
+                    "The provider cannot compose commands: it declares them up front, and \
+                     Violet fills them in, passing the connection and password of this \
+                     profile only. Shells and interpreters are never run, and each command \
+                     shows in full before it starts.",
                 )
                 .color(palette.secondary),
             );
+            if let Some(download) = offer.and_then(|offer| offer.download.as_ref()) {
+                let host = download
+                    .url
+                    .trim_start_matches("https://")
+                    .split('/')
+                    .next()
+                    .unwrap_or_default();
+                ui.label(
+                    RichText::new(format!(
+                        "It downloads its own {} ({}) from {host}, checked against the \
+                         digest the provider declares.",
+                        download.label,
+                        bytes(download.size)
+                    ))
+                    .color(palette.secondary),
+                );
+            }
+            if let Some(offer) = offer {
+                egui::CollapsingHeader::new(
+                    RichText::new("Everything it may run").color(palette.secondary),
+                )
+                .id_salt("task-vocabulary")
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(160.0)
+                        .show(ui, |ui| {
+                            for task in &offer.tasks {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{}: {}",
+                                        task.kind.label(),
+                                        task.programs.join(", ")
+                                    ))
+                                    .font(theme::medium(12.5))
+                                    .color(palette.text),
+                                );
+                                ui.label(
+                                    RichText::new(task.vocabulary().join("  "))
+                                        .font(theme::mono(11.5))
+                                        .color(palette.dim),
+                                );
+                            }
+                        });
+                });
+            }
         });
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -570,6 +631,16 @@ fn objects(
         }
     };
 
+    if dialog.objects.iter().any(|o| o.name.is_some()) {
+        notice(
+            ui,
+            Icon::Info,
+            palette.accent,
+            "With single tables picked, the backup holds those tables only: not the schemas \
+             around them, nor functions or types. Restore it where its schemas exist.",
+            palette,
+        );
+    }
     ui.add(widgets::text_input(
         &mut dialog.filter,
         "Filter schemas and tables",
@@ -938,7 +1009,10 @@ fn files(
 
     widgets::caption(ui, "Client programs");
     ui.horizontal(|ui| {
-        ui.add(widgets::text_input(&mut dialog.client, "Found automatically").desired_width(560.0));
+        ui.add(
+            widgets::text_input(&mut dialog.client, "Downloaded or found automatically")
+                .desired_width(560.0),
+        );
         if widgets::button(ui, Tone::Secondary, Some(Icon::FolderOpen), "Choose…").clicked()
             && let Some(folder) = rfd::FileDialog::new()
                 .set_title("Folder with the client programs")
@@ -951,6 +1025,31 @@ fn files(
         Link::Online(server) => Some(server.version.as_str()),
         _ => None,
     };
+    match env.tools {
+        Some(Tools::Downloading { label, size }) => {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(14.0).color(palette.accent));
+                ui.label(
+                    RichText::new(format!("Downloading {label} ({})…", bytes(*size)))
+                        .color(palette.secondary),
+                );
+            });
+            ui.ctx().request_repaint_after(Duration::from_millis(250));
+        }
+        Some(Tools::Failed(error)) => {
+            notice(
+                ui,
+                Icon::CircleAlert,
+                palette.warning,
+                &format!("The client programs could not be downloaded: {error}"),
+                palette,
+            );
+            if widgets::button(ui, Tone::Secondary, Some(Icon::Refresh), "Try again").clicked() {
+                actions.push(Action::RetryTools(dialog.driver.clone()));
+            }
+        }
+        None => {}
+    }
     match &dialog.programs {
         None => {
             ui.label(RichText::new("Looking for the programs…").color(palette.dim));

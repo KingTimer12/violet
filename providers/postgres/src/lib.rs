@@ -11,7 +11,7 @@ mod tools;
 mod types;
 mod wire;
 
-use violet_sdk::tools::{Request, Task, TaskKind, ToolCommand};
+use violet_sdk::tools::{Download, Task};
 use violet_sdk::{Capabilities, ConnectParams, DbError, Provider, ProviderInfo, Result};
 
 pub use session::PgSession;
@@ -45,8 +45,8 @@ impl Provider for Postgres {
         tools::tasks()
     }
 
-    fn command(kind: TaskKind, request: Request) -> Result<ToolCommand> {
-        tools::command(kind, request)
+    fn downloads() -> Vec<Download> {
+        tools::downloads()
     }
 
     fn inspect(head: &[u8], entries: &[String], directory: bool) -> Vec<(String, String)> {

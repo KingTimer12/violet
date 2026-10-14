@@ -102,6 +102,8 @@ pub enum Action {
     TaskCancel,
     TaskAgain,
     TaskClose,
+    /// Downloads a provider's client programs again.
+    RetryTools(DriverId),
     /// Shows a file in the system's file manager.
     Reveal(PathBuf),
 }

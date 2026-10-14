@@ -1,33 +1,98 @@
 //! Backup and restore through the database's own client programs.
 //!
-//! A provider cannot start programs. It describes its [`Task`]s, and
-//! [`crate::Provider::command`] turns the settings the user chose into a
-//! [`ToolCommand`]; Violet finds the program, shows the command and runs it,
-//! passing the password in [`ToolCommand::password_env`].
+//! A provider cannot start programs, and does not build command lines: it
+//! declares each [`Task`] with its settings and a [`Command`] template.
+//! Violet fills the template, passes the profile's connection the way
+//! [`Connection`] says (the password only through
+//! [`Connection::password_env`]), finds the program, shows the whole
+//! command and runs it. [`Download`]s name client programs Violet fetches
+//! with the provider, so backups work without installing anything.
 //!
 //! ```ignore
+//! use violet_sdk::tools::*;
+//!
 //! fn tasks() -> Vec<Task> {
 //!     vec![Task::new(TaskKind::Backup, &["litedump"])
-//!         .locations(&["/opt/lite/*/bin"])
+//!         .connection(Connection::env("LITE_HOST", "LITE_PORT", "LITE_USER", "LITE_DB")
+//!             .password("LITE_PASSWORD"))
 //!         .field(Field::choice("format", "Format", "Output", "sql", &[
 //!             ("sql", "SQL script"),
 //!             ("bin", "Binary"),
 //!         ]))
 //!         .field(Field::flag("data", "Include data", "Content", true))
-//!         .field(Field::number("level", "Compression", "Output", 0..=9, 6)
-//!             .when("format", &["bin"]))
 //!         .target(Target::file("sql").when("format", &["sql"]))
-//!         .target(Target::file("lite"))]
+//!         .target(Target::file("lite"))
+//!         .command(Command::new("litedump")
+//!             .arg([text("--format="), value("format")])
+//!             .flag("data", false, "--no-data")
+//!             .arg([text("--out="), path()]))]
 //! }
 //! ```
 
 pub use crate::bindings::exports::violet::provider::tools::{
-    Choice, Condition, Field, FieldKind, NumberRange, ObjectRef, PathKind, Request, Target, Task,
-    TaskKind, ToolCommand,
+    Argument, Binding, Choice, Command, CommandPart, Condition, Connection, Download, Field,
+    FieldKind, NumberRange, ObjectArguments, PathKind, Piece, Quoting, Target, Task, TaskKind,
+    ValuePiece, Variable,
 };
 
+/// Fixed text.
+#[must_use]
+pub fn text(text: &str) -> Piece {
+    Piece::Text(text.to_owned())
+}
+
+/// A setting's value.
+#[must_use]
+pub fn value(field: &str) -> Piece {
+    mapped(field, &[])
+}
+
+/// A setting's value, with listed values replaced (`custom` → `c`).
+#[must_use]
+pub fn mapped(field: &str, replace: &[(&str, &str)]) -> Piece {
+    Piece::Value(ValuePiece {
+        field: field.to_owned(),
+        replace: replace
+            .iter()
+            .map(|(from, to)| ((*from).to_owned(), (*to).to_owned()))
+            .collect(),
+    })
+}
+
+/// The file or folder the user chose.
+#[must_use]
+pub fn path() -> Piece {
+    Piece::Path
+}
+
+/// Holds when `field` has one of `values`. `@ssl` is the profile's TLS
+/// mode: `disable`, `prefer` or `require`.
+#[must_use]
+pub fn is(field: &str, values: &[&str]) -> Condition {
+    Condition {
+        field: field.to_owned(),
+        values: values.iter().map(|v| (*v).to_owned()).collect(),
+        except: false,
+    }
+}
+
+/// Holds when `field` has none of `values`.
+#[must_use]
+pub fn not(field: &str, values: &[&str]) -> Condition {
+    Condition {
+        except: true,
+        ..is(field, values)
+    }
+}
+
+/// Holds when a flag is on.
+#[must_use]
+pub fn on(field: &str) -> Condition {
+    is(field, &["true"])
+}
+
 impl Task {
-    /// A task running `programs`, with no settings yet.
+    /// A task running `programs`, with nothing declared yet.
     #[must_use]
     pub fn new(kind: TaskKind, programs: &[&str]) -> Self {
         Self {
@@ -38,11 +103,20 @@ impl Task {
             fields: Vec::new(),
             objects: false,
             targets: Vec::new(),
+            connection: Connection {
+                host: None,
+                port: None,
+                user: None,
+                database: None,
+                password_env: None,
+                database_field: None,
+            },
+            commands: Vec::new(),
         }
     }
 
-    /// Folders the programs usually live in; `*` stands for one folder
-    /// name, such as a version.
+    /// Folders the programs usually live in; `*` stands for part of one
+    /// folder name, such as a version.
     #[must_use]
     pub fn locations(mut self, locations: &[&str]) -> Self {
         self.locations
@@ -56,17 +130,183 @@ impl Task {
         self
     }
 
-    /// Lets the user pick schemas and relations.
+    /// Lets the user pick schemas and relations; see [`Command::objects`].
     #[must_use]
     pub fn with_objects(mut self) -> Self {
         self.objects = true;
         self
     }
 
-    /// What it writes or reads; the first whose condition holds applies.
+    /// What it writes or reads; the first whose conditions hold applies.
     #[must_use]
     pub fn target(mut self, target: Target) -> Self {
         self.targets.push(target);
+        self
+    }
+
+    #[must_use]
+    pub fn connection(mut self, connection: Connection) -> Self {
+        self.connection = connection;
+        self
+    }
+
+    /// A command line; the first whose conditions hold runs.
+    #[must_use]
+    pub fn command(mut self, command: Command) -> Self {
+        self.commands.push(command);
+        self
+    }
+}
+
+impl Connection {
+    /// Host, port, user and database through these environment variables.
+    #[must_use]
+    pub fn env(host: &str, port: &str, user: &str, database: &str) -> Self {
+        let env = |name: &str| Some(Binding::Env(name.to_owned()));
+        Self {
+            host: env(host),
+            port: env(port),
+            user: env(user),
+            database: env(database),
+            password_env: None,
+            database_field: None,
+        }
+    }
+
+    /// The variable that carries the password.
+    #[must_use]
+    pub fn password(mut self, name: &str) -> Self {
+        self.password_env = Some(name.to_owned());
+        self
+    }
+
+    /// A text field naming another database to use instead of the
+    /// profile's, when filled.
+    #[must_use]
+    pub fn database_field(mut self, field: &str) -> Self {
+        self.database_field = Some(field.to_owned());
+        self
+    }
+}
+
+impl Command {
+    #[must_use]
+    pub fn new(program: &str) -> Self {
+        Self {
+            program: program.to_owned(),
+            when: Vec::new(),
+            parts: Vec::new(),
+            variables: Vec::new(),
+            stdout_to_path: false,
+            stdin_from_path: false,
+        }
+    }
+
+    /// Runs only while `condition` holds.
+    #[must_use]
+    pub fn when(mut self, condition: Condition) -> Self {
+        self.when.push(condition);
+        self
+    }
+
+    /// An argument, its pieces joined.
+    #[must_use]
+    pub fn arg(self, pieces: impl IntoIterator<Item = Piece>) -> Self {
+        self.arg_when(&[], pieces)
+    }
+
+    /// An argument added while every condition holds.
+    #[must_use]
+    pub fn arg_when(mut self, when: &[Condition], pieces: impl IntoIterator<Item = Piece>) -> Self {
+        self.parts.push(CommandPart::Argument(Argument {
+            when: when.to_vec(),
+            pieces: pieces.into_iter().collect(),
+            each: None,
+        }));
+        self
+    }
+
+    /// `argument` when the flag `field` is `set`.
+    #[must_use]
+    pub fn flag(self, field: &str, set: bool, argument: &str) -> Self {
+        self.arg_when(
+            &[is(field, &[if set { "true" } else { "false" }])],
+            [text(argument)],
+        )
+    }
+
+    /// An argument per comma-separated item of the text field `field`,
+    /// the item standing for its [`value`].
+    #[must_use]
+    pub fn each(
+        mut self,
+        when: &[Condition],
+        field: &str,
+        pieces: impl IntoIterator<Item = Piece>,
+    ) -> Self {
+        self.parts.push(CommandPart::Argument(Argument {
+            when: when.to_vec(),
+            pieces: pieces.into_iter().collect(),
+            each: Some(field.to_owned()),
+        }));
+        self
+    }
+
+    /// An argument per schema or relation the user picked. With
+    /// `schema_tables`, whole schemas picked alongside relations are
+    /// written as `table_prefix`, the schema and it (`.*`), for programs
+    /// that ignore schemas once tables are named.
+    #[must_use]
+    pub fn objects(
+        mut self,
+        schema_prefix: &str,
+        table_prefix: &str,
+        quoting: Quoting,
+        schema_tables: Option<&str>,
+    ) -> Self {
+        self.parts.push(CommandPart::Objects(ObjectArguments {
+            schema_prefix: schema_prefix.to_owned(),
+            table_prefix: table_prefix.to_owned(),
+            quoting,
+            schema_tables: schema_tables.map(str::to_owned),
+        }));
+        self
+    }
+
+    /// The arguments the user typed in the text field `field`.
+    #[must_use]
+    pub fn extra(mut self, field: &str) -> Self {
+        self.parts.push(CommandPart::Extra(field.to_owned()));
+        self
+    }
+
+    /// An environment variable, set while every condition holds.
+    #[must_use]
+    pub fn env(
+        mut self,
+        when: &[Condition],
+        name: &str,
+        pieces: impl IntoIterator<Item = Piece>,
+    ) -> Self {
+        self.variables.push(Variable {
+            when: when.to_vec(),
+            name: name.to_owned(),
+            pieces: pieces.into_iter().collect(),
+        });
+        self
+    }
+
+    /// Violet writes standard output to the path.
+    #[must_use]
+    pub fn stdout_to_path(mut self) -> Self {
+        self.stdout_to_path = true;
+        self
+    }
+
+    /// Violet feeds the path to standard input.
+    #[must_use]
+    pub fn stdin_from_path(mut self) -> Self {
+        self.stdin_from_path = true;
         self
     }
 }
@@ -80,7 +320,7 @@ impl Field {
             section: section.to_owned(),
             kind,
             default,
-            when: None,
+            when: Vec::new(),
         }
     }
 
@@ -137,10 +377,11 @@ impl Field {
         self
     }
 
-    /// Shown only while `field` has one of `values`.
+    /// Shown only while `field` has one of `values` (and any other
+    /// condition holds).
     #[must_use]
     pub fn when(mut self, field: &str, values: &[&str]) -> Self {
-        self.when = Some(condition(field, values));
+        self.when.push(is(field, values));
         self
     }
 }
@@ -150,7 +391,7 @@ impl Target {
     #[must_use]
     pub fn file(extension: &str) -> Self {
         Self {
-            when: None,
+            when: Vec::new(),
             kind: PathKind::File,
             extension: extension.to_owned(),
         }
@@ -159,7 +400,7 @@ impl Target {
     #[must_use]
     pub fn directory() -> Self {
         Self {
-            when: None,
+            when: Vec::new(),
             kind: PathKind::Directory,
             extension: String::new(),
         }
@@ -167,137 +408,7 @@ impl Target {
 
     #[must_use]
     pub fn when(mut self, field: &str, values: &[&str]) -> Self {
-        self.when = Some(condition(field, values));
+        self.when.push(is(field, values));
         self
-    }
-}
-
-fn condition(field: &str, values: &[&str]) -> Condition {
-    Condition {
-        field: field.to_owned(),
-        values: values.iter().map(|v| (*v).to_owned()).collect(),
-    }
-}
-
-impl Request {
-    /// A setting's value; Violet sends every field the task declares.
-    #[must_use]
-    pub fn setting(&self, id: &str) -> &str {
-        self.settings
-            .iter()
-            .find(|(k, _)| k == id)
-            .map_or("", |(_, v)| v.as_str())
-    }
-
-    /// A flag field.
-    #[must_use]
-    pub fn flag(&self, id: &str) -> bool {
-        self.setting(id) == "true"
-    }
-
-    /// A number field.
-    #[must_use]
-    pub fn number(&self, id: &str) -> Option<i64> {
-        self.setting(id).parse().ok()
-    }
-}
-
-impl ToolCommand {
-    /// `program` with no arguments yet.
-    #[must_use]
-    pub fn new(program: &str) -> Self {
-        Self {
-            program: program.to_owned(),
-            args: Vec::new(),
-            env: Vec::new(),
-            password_env: None,
-            stdout_to_path: false,
-            stdin_from_path: false,
-        }
-    }
-
-    #[must_use]
-    pub fn arg(mut self, arg: impl Into<String>) -> Self {
-        self.args.push(arg.into());
-        self
-    }
-
-    /// Adds `arg` when `on`.
-    #[must_use]
-    pub fn arg_if(self, on: bool, arg: impl Into<String>) -> Self {
-        if on { self.arg(arg) } else { self }
-    }
-
-    #[must_use]
-    pub fn env(mut self, name: &str, value: impl Into<String>) -> Self {
-        self.env.push((name.to_owned(), value.into()));
-        self
-    }
-
-    /// The variable Violet puts the password in.
-    #[must_use]
-    pub fn password_env(mut self, name: &str) -> Self {
-        self.password_env = Some(name.to_owned());
-        self
-    }
-}
-
-/// Splits extra arguments the user typed as a shell would, without running
-/// one: whitespace separates, quotes group, a backslash escapes the next
-/// character outside single quotes.
-#[must_use]
-pub fn split_args(text: &str) -> Vec<String> {
-    let mut args = Vec::new();
-    let mut current = String::new();
-    let mut started = false;
-    let mut chars = text.chars();
-    let mut quote: Option<char> = None;
-    while let Some(c) = chars.next() {
-        match (quote, c) {
-            (Some(q), c) if c == q => quote = None,
-            (Some('\''), c) => current.push(c),
-            (_, '\\') => {
-                if let Some(next) = chars.next() {
-                    current.push(next);
-                }
-                started = true;
-            }
-            (Some(_), c) => current.push(c),
-            (None, '\'' | '"') => {
-                quote = Some(c);
-                started = true;
-            }
-            (None, c) if c.is_whitespace() => {
-                if started || !current.is_empty() {
-                    args.push(std::mem::take(&mut current));
-                }
-                started = false;
-            }
-            (None, c) => current.push(c),
-        }
-    }
-    if started || !current.is_empty() {
-        args.push(current);
-    }
-    args
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn extra_arguments_split_like_a_shell() {
-        assert_eq!(
-            split_args(r#"--exclude-table='a b' -t "x\"y"  --lock-wait-timeout=5s "" "#),
-            [
-                "--exclude-table=a b",
-                "-t",
-                "x\"y",
-                "--lock-wait-timeout=5s",
-                ""
-            ]
-        );
-        assert!(split_args("   ").is_empty());
     }
 }

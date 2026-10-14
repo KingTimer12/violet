@@ -70,6 +70,14 @@ impl ExecOptions {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RequestId(u64);
 
+/// What a driver offers for backup and restore.
+#[derive(Clone, Debug)]
+pub struct Offer {
+    pub tasks: Vec<Task>,
+    /// The client programs it downloads for this machine.
+    pub download: Option<violet_core::Download>,
+}
+
 /// Identifies one running backup or restore.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TaskId(u64);
@@ -139,7 +147,7 @@ pub enum Event {
     /// The backups and restores a driver offers.
     Tasks {
         driver: DriverId,
-        result: Result<Vec<Task>>,
+        result: Result<Offer>,
     },
     /// Where a task's programs are on this machine.
     ProgramsFound {
@@ -156,6 +164,18 @@ pub enum Event {
     InputInspected {
         path: PathBuf,
         result: Result<TaskSettings>,
+    },
+    /// A provider's client programs are being downloaded.
+    ToolsDownloading {
+        driver: DriverId,
+        label: String,
+        size: u64,
+    },
+    /// They are in (`None` when none is offered for this machine), or the
+    /// download failed.
+    ToolsReady {
+        driver: DriverId,
+        result: Result<Option<PathBuf>>,
     },
     /// Lines a running task's program printed.
     TaskOutput {
@@ -210,24 +230,25 @@ impl Shared {
 
     /// The program and command for `request`, checked and found.
     async fn task_command(
-        &self,
+        self: &Arc<Self>,
         profile: &ConnectionProfile,
         request: &TaskRequest,
         folder: Option<&Path>,
     ) -> Result<(PathBuf, ToolCommand)> {
         let driver = self.driver(&profile.driver).await?;
         let task = self.task(&driver, request.kind).await?;
-        let mut request = request.clone();
-        request.settings = task.normalize(&request.settings);
-        let command = driver.task_command(profile, &request).await?;
-        command.check(&task)?;
-        let folders = tasks::search_folders(&task, folder);
+        // Violet fills the provider's template: the connection comes from
+        // the profile, whatever the provider would like.
+        let command = task.build(profile, request)?;
+        let downloaded = self.providers.tools(&profile.driver);
+        let folders = tasks::search_folders(&task, folder, downloaded.as_deref());
         let program = tasks::find(&command.program, &folders).ok_or_else(|| {
             DbError::new(
                 ErrorKind::Other,
                 format!(
-                    "{} was not found. Install the database's client tools, or pick the \
-                     folder they are in.",
+                    "{} was not found. Violet downloads it with the provider where it can; \
+                     otherwise install the database's client tools, or pick the folder \
+                     they are in.",
                     command.program
                 ),
             )
@@ -274,9 +295,44 @@ impl Shared {
         Ok(Credentials { password })
     }
 
+    /// Downloads the client programs a driver's provider asks for, in the
+    /// background, unless they are in already.
+    fn ensure_tools(self: &Arc<Self>, id: DriverId, driver: Arc<dyn Driver>) {
+        let shared = Arc::clone(self);
+        tokio::spawn(async move {
+            let downloads = match driver.downloads().await {
+                Ok(downloads) => downloads,
+                Err(error) => {
+                    shared.emit(Event::ToolsReady {
+                        driver: id,
+                        result: Err(error),
+                    });
+                    return;
+                }
+            };
+            let Some(download) = violet_core::Download::this_platform()
+                .and_then(|platform| downloads.iter().find(|d| d.platform == platform))
+            else {
+                return;
+            };
+            let have = shared.providers.tools(&id).is_some();
+            if !have {
+                shared.emit(Event::ToolsDownloading {
+                    driver: id.clone(),
+                    label: download.label.clone(),
+                    size: download.size,
+                });
+            }
+            let result = shared.providers.install_tools(&id, downloads).await;
+            if !have || result.is_err() {
+                shared.emit(Event::ToolsReady { driver: id, result });
+            }
+        });
+    }
+
     /// The driver for `id`, installing its provider first if needed.
     #[hotpath::measure]
-    async fn driver(&self, id: &DriverId) -> Result<Arc<dyn Driver>> {
+    async fn driver(self: &Arc<Self>, id: &DriverId) -> Result<Arc<dyn Driver>> {
         if let Some(driver) = self.registry.get(id) {
             return Ok(driver);
         }
@@ -284,6 +340,8 @@ impl Shared {
         let result = self.providers.install(id).await;
         if let Ok(driver) = &result {
             self.registry.add(Arc::clone(driver));
+            // Its client programs follow, without holding the connection.
+            self.ensure_tools(id.clone(), Arc::clone(driver));
         }
         self.emit(Event::ProviderInstalled {
             id: id.clone(),
@@ -527,7 +585,18 @@ impl Backend {
     pub fn load_tasks(&self, driver: DriverId) {
         let shared = Arc::clone(&self.shared);
         self.runtime.spawn(async move {
-            let result = async { shared.driver(&driver).await?.tasks().await }.await;
+            let result = async {
+                let found = shared.driver(&driver).await?;
+                // Providers installed before they offered downloads get
+                // them now.
+                shared.ensure_tools(driver.clone(), Arc::clone(&found));
+                let tasks = found.tasks().await?;
+                let downloads = found.downloads().await?;
+                let download = violet_core::Download::this_platform()
+                    .and_then(|platform| downloads.into_iter().find(|d| d.platform == platform));
+                Ok(Offer { tasks, download })
+            }
+            .await;
             shared.emit(Event::Tasks { driver, result });
         });
     }
@@ -536,7 +605,8 @@ impl Backend {
     pub fn find_programs(&self, driver: DriverId, task: Task, folder: Option<PathBuf>) {
         let shared = Arc::clone(&self.shared);
         self.runtime.spawn(async move {
-            let programs = tasks::locate(&task, folder.as_deref()).await;
+            let downloaded = shared.providers.tools(&driver);
+            let programs = tasks::locate(&task, folder.as_deref(), downloaded.as_deref()).await;
             shared.emit(Event::ProgramsFound {
                 driver,
                 kind: task.kind,
@@ -832,6 +902,7 @@ impl Backend {
             let result = shared.providers.install(&id).await;
             if let Ok(driver) = &result {
                 shared.registry.add(Arc::clone(driver));
+                shared.ensure_tools(id.clone(), Arc::clone(driver));
             }
             let result = result.map(|driver| driver.info());
             shared.emit(Event::ProviderInstalled { id, result });

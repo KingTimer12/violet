@@ -32,7 +32,7 @@ use std::time::{Duration, Instant, SystemTime};
 use egui::{Frame, Id, Panel, Stroke};
 use violet_app::{Backend, CachePolicy, Event, ExecOptions, ProfileService, TaskId};
 use violet_core::ports::{HistoryEntry, QueryHistory};
-use violet_core::{ConnectionId, DriverId, ErrorKind, Page, Task};
+use violet_core::{ConnectionId, DriverId, ErrorKind, Page};
 use violet_storage::JsonFile;
 
 use crate::completion::{self, Need};
@@ -103,7 +103,9 @@ pub struct VioletApp {
     /// Panel sizes measured this frame.
     layout: Layout,
     /// Each driver's backups and restores, once asked for.
-    tasks: HashMap<DriverId, Loadable<Vec<Task>>>,
+    tasks: HashMap<DriverId, Loadable<violet_app::Offer>>,
+    /// Client programs being downloaded, or why they could not be.
+    tools: HashMap<DriverId, task_flow::Tools>,
     task_dialog: Option<tasks::TaskDialog>,
     /// Backups and restores still running.
     started: HashMap<TaskId, task_flow::Started>,
@@ -143,6 +145,7 @@ impl VioletApp {
             session_checked: Instant::now(),
             layout: Layout::default(),
             tasks: HashMap::new(),
+            tools: HashMap::new(),
             task_dialog: None,
             started: HashMap::new(),
             #[cfg(debug_assertions)]
@@ -595,6 +598,8 @@ impl VioletApp {
                 self.load_providers();
             }
             event @ (Event::Tasks { .. }
+            | Event::ToolsDownloading { .. }
+            | Event::ToolsReady { .. }
             | Event::ProgramsFound { .. }
             | Event::TaskPreview { .. }
             | Event::InputInspected { .. }
@@ -1189,6 +1194,7 @@ impl VioletApp {
             | Action::TaskCancel
             | Action::TaskAgain
             | Action::TaskClose
+            | Action::RetryTools(_)
             | Action::Reveal(_)) => self.task_action(ctx, action),
         }
     }

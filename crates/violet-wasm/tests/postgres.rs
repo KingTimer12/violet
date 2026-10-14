@@ -101,7 +101,7 @@ async fn the_version_comes_from_the_crate() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn backups_and_restores_are_described_and_built_without_the_password() {
+async fn backups_and_restores_are_declared_and_filled_by_violet() {
     let Some(driver) = driver().await else {
         return;
     };
@@ -116,28 +116,80 @@ async fn backups_and_restores_are_described_and_built_without_the_password() {
     profile.host = "db.example.com".into();
     profile.username = "app".into();
     profile.database = "shop".into();
+    profile.ssl = SslMode::Require;
     let mut settings = backup.defaults();
     settings.insert("format".into(), "directory".into());
     settings.insert("jobs".into(), "4".into());
+    settings.insert("exclude-data".into(), "logs.*, audit".into());
     let request = TaskRequest {
         kind: TaskKind::Backup,
-        settings: backup.normalize(&settings),
+        settings,
         objects: vec![ObjectRef {
             schema: "public".into(),
             name: Some("orders".into()),
         }],
         path: "/tmp/shop".into(),
     };
-    let command = driver
-        .task_command(&profile, &request)
-        .await
-        .expect("command");
+    let command = backup.build(&profile, &request).expect("command");
     assert_eq!(command.program, "pg_dump");
     assert_eq!(command.password_env.as_deref(), Some("PGPASSWORD"));
-    for arg in ["--format=d", "--jobs=4", "--table=\"public\".\"orders\""] {
-        assert!(command.args.iter().any(|a| a == arg), "{arg}");
+    for arg in [
+        "--format=d",
+        "--jobs=4",
+        "--compress=6",
+        "--file=/tmp/shop",
+        "--exclude-table-data=logs.*",
+        "--exclude-table-data=audit",
+        "--table=\"public\".\"orders\"",
+        "--verbose",
+    ] {
+        assert!(
+            command.args.iter().any(|a| a == arg),
+            "{arg} in {:?}",
+            command.args
+        );
     }
-    assert!(command.args[0].contains("sslmode=verify-full"));
+    let env = |name: &str| {
+        command
+            .env
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    };
+    assert_eq!(env("PGHOST"), Some("db.example.com"));
+    assert_eq!(env("PGDATABASE"), Some("shop"));
+    assert_eq!(env("PGSSLMODE"), Some("verify-full"));
+    assert_eq!(env("PGSSLROOTCERT"), Some("system"));
+
+    // Restores: psql for plain SQL, pg_restore with --dbname otherwise, into
+    // another database when asked.
+    let restore = &tasks[1];
+    let mut settings = restore.defaults();
+    settings.insert("database".into(), "copy".into());
+    settings.insert("format".into(), "plain".into());
+    let mut request = TaskRequest {
+        kind: TaskKind::Restore,
+        settings,
+        objects: Vec::new(),
+        path: "/tmp/shop.sql".into(),
+    };
+    let psql = restore.build(&profile, &request).expect("psql");
+    assert_eq!(psql.program, "psql");
+    assert!(psql.args.contains(&"--dbname=copy".to_owned()));
+    assert!(psql.args.contains(&"--file=/tmp/shop.sql".to_owned()));
+    request.settings.insert("format".into(), "custom".into());
+    let pg_restore = restore.build(&profile, &request).expect("pg_restore");
+    assert_eq!(pg_restore.program, "pg_restore");
+    let n = pg_restore.args.len();
+    assert_eq!(pg_restore.args[n - 2..], ["--", "/tmp/shop.sql"]);
+    // A database typed as a connection string is refused, not followed.
+    request
+        .settings
+        .insert("database".into(), "host=evil dbname=x".into());
+    assert!(restore.build(&profile, &request).is_err());
+
+    let downloads = driver.downloads().await.expect("downloads");
+    assert!(downloads.iter().any(|d| d.platform == "macos-aarch64"));
 
     let format = driver
         .inspect_input(b"PGDMP\x01", &[], false)

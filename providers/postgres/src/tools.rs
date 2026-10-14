@@ -2,9 +2,9 @@
 //! (plain SQL), with the options DBeaver offers and a few more.
 
 use violet_sdk::tools::{
-    Field, ObjectRef, Request, Target, Task, TaskKind, ToolCommand, split_args,
+    Command, Connection, Download, Field, Quoting, Target, Task, TaskKind, is, mapped, not, on,
+    path, text, value,
 };
-use violet_sdk::{ConnectParams, DbError, Result, SslMode};
 
 /// Where PostgreSQL's client programs usually are, besides `PATH`.
 const LOCATIONS: &[&str] = &[
@@ -169,6 +169,10 @@ fn backup() -> Task {
                 .when("content", &["data"]),
         );
     targets(advanced(task))
+        .connection(
+            Connection::env("PGHOST", "PGPORT", "PGUSER", "PGDATABASE").password("PGPASSWORD"),
+        )
+        .command(backup_command())
 }
 
 fn restore() -> Task {
@@ -237,7 +241,15 @@ fn restore() -> Task {
                 .help("While data loads. Needs a superuser.")
                 .when("content", &["data"]),
         );
+    // pg_restore writes a script instead of restoring without --dbname.
+    let mut connection = Connection::env("PGHOST", "PGPORT", "PGUSER", "PGDATABASE")
+        .password("PGPASSWORD")
+        .database_field("database");
+    connection.database = Some(violet_sdk::tools::Binding::Prefix("--dbname=".into()));
     targets(advanced(task))
+        .connection(connection)
+        .command(psql_command())
+        .command(pg_restore_command())
 }
 
 /// Settings both tasks share.
@@ -269,225 +281,233 @@ fn advanced(task: Task) -> Task {
     )
 }
 
-pub fn command(kind: TaskKind, request: Request) -> Result<ToolCommand> {
-    match kind {
-        TaskKind::Backup => backup_command(&request),
-        TaskKind::Restore => restore_command(&request),
-    }
+const FORMAT_LETTERS: &[(&str, &str)] = &[
+    ("custom", "c"),
+    ("directory", "d"),
+    ("tar", "t"),
+    ("plain", "p"),
+];
+
+/// TLS as libpq takes it: from the profile's mode, verifying the server
+/// certificate against the system's roots when asked.
+fn tls(command: Command) -> Command {
+    let require = is("@ssl", &["require"]);
+    command
+        .env(&[is("@ssl", &["disable"])], "PGSSLMODE", [text("disable")])
+        .env(&[is("@ssl", &["prefer"])], "PGSSLMODE", [text("prefer")])
+        .env(
+            &[require.clone(), on("verify-tls")],
+            "PGSSLMODE",
+            [text("verify-full")],
+        )
+        .env(
+            &[require.clone(), on("verify-tls")],
+            "PGSSLROOTCERT",
+            [text("system")],
+        )
+        .env(
+            &[require, is("verify-tls", &["false"])],
+            "PGSSLMODE",
+            [text("require")],
+        )
+        .env(&[], "PGAPPNAME", [text("Violet")])
+        .env(&[], "PGCONNECT_TIMEOUT", [text("15")])
 }
 
-fn backup_command(request: &Request) -> Result<ToolCommand> {
-    let format = request.setting("format");
-    let letter = match format {
-        "custom" => "c",
-        "directory" => "d",
-        "tar" => "t",
-        "plain" => "p",
-        other => return Err(DbError::unsupported(format!("Unknown format {other}"))),
-    };
-    let content = request.setting("content");
-    let data = content != "schema";
-    let inserts = data && request.setting("data-as") != "copy";
-    let plain = format == "plain";
+/// The log, the lock timeout and what the user typed, shared by every
+/// command.
+fn tail(command: Command) -> Command {
+    command
+        .flag("verbose", true, "--verbose")
+        .arg_when(
+            &[not("lock-wait-timeout", &[""])],
+            [text("--lock-wait-timeout="), value("lock-wait-timeout")],
+        )
+        .extra("extra")
+}
 
-    let mut command = connection(ToolCommand::new("pg_dump"), request, None)
-        .arg(format!("--format={letter}"))
-        .arg(format!("--file={}", request.path));
-    if matches!(format, "custom" | "directory") {
-        let level = request.number("compression").unwrap_or(6);
-        command = command.arg(format!("--compress={level}"));
-    }
-    if format == "directory" {
-        let jobs = request.number("jobs").unwrap_or(1);
-        command = command.arg_if(jobs > 1, format!("--jobs={jobs}"));
-    }
-    let encoding = request.setting("encoding").trim();
-    command = command.arg_if(!encoding.is_empty(), format!("--encoding={encoding}"));
-    command = match content {
-        "schema" => command.arg("--schema-only"),
-        "data" => command.arg("--data-only"),
-        _ => command,
-    };
-    if inserts {
-        command = command.arg(if request.setting("data-as") == "column-inserts" {
-            "--column-inserts"
-        } else {
-            "--inserts"
-        });
-        let rows = request.number("rows-per-insert").unwrap_or(1);
-        command = command
-            .arg_if(rows > 1, format!("--rows-per-insert={rows}"))
-            .arg_if(request.flag("on-conflict"), "--on-conflict-do-nothing");
-    }
-    command = command.arg_if(request.flag("large-objects"), "--blobs");
-    for pattern in patterns(request.setting("exclude-tables")) {
-        command = command.arg(format!("--exclude-table={pattern}"));
-    }
-    if data {
-        for pattern in patterns(request.setting("exclude-data")) {
-            command = command.arg(format!("--exclude-table-data={pattern}"));
-        }
-    }
-    command = command
-        .arg_if(request.flag("no-owner"), "--no-owner")
-        .arg_if(request.flag("no-privileges"), "--no-privileges")
-        .arg_if(
-            request.flag("set-session-authorization"),
+fn backup_command() -> Command {
+    let data = not("content", &["schema"]);
+    let inserts = is("data-as", &["inserts", "column-inserts"]);
+    let command = Command::new("pg_dump")
+        // Never wait for a password prompt nobody can answer.
+        .arg([text("--no-password")])
+        .arg([text("--format="), mapped("format", FORMAT_LETTERS)])
+        .arg([text("--file="), path()])
+        .arg_when(
+            &[is("format", &["custom", "directory"])],
+            [text("--compress="), value("compression")],
+        )
+        .arg_when(
+            &[is("format", &["directory"]), not("jobs", &["1"])],
+            [text("--jobs="), value("jobs")],
+        )
+        .arg_when(
+            &[not("encoding", &[""])],
+            [text("--encoding="), value("encoding")],
+        )
+        .arg_when(&[is("content", &["schema"])], [text("--schema-only")])
+        .arg_when(&[is("content", &["data"])], [text("--data-only")])
+        .arg_when(
+            &[data.clone(), is("data-as", &["inserts"])],
+            [text("--inserts")],
+        )
+        .arg_when(
+            &[data.clone(), is("data-as", &["column-inserts"])],
+            [text("--column-inserts")],
+        )
+        .arg_when(
+            &[
+                data.clone(),
+                inserts.clone(),
+                not("rows-per-insert", &["1"]),
+            ],
+            [text("--rows-per-insert="), value("rows-per-insert")],
+        )
+        .arg_when(
+            &[data.clone(), inserts, on("on-conflict")],
+            [text("--on-conflict-do-nothing")],
+        )
+        .flag("large-objects", true, "--blobs")
+        .each(
+            &[],
+            "exclude-tables",
+            [text("--exclude-table="), value("exclude-tables")],
+        )
+        .each(
+            &[data],
+            "exclude-data",
+            [text("--exclude-table-data="), value("exclude-data")],
+        )
+        .flag("no-owner", true, "--no-owner")
+        .flag("no-privileges", true, "--no-privileges")
+        .flag(
+            "set-session-authorization",
+            true,
             "--use-set-session-authorization",
         )
-        .arg_if(request.flag("no-tablespaces"), "--no-tablespaces")
-        .arg_if(request.flag("no-comments"), "--no-comments");
-    if plain {
-        let clean = request.flag("clean");
-        command = command
-            .arg_if(clean, "--clean")
-            .arg_if(clean && request.flag("if-exists"), "--if-exists")
-            .arg_if(request.flag("create"), "--create");
-    }
-    command = command.arg_if(
-        content == "data" && request.flag("disable-triggers"),
-        "--disable-triggers",
-    );
-    for object in &request.objects {
-        command = command.arg(object_arg(object));
-    }
-    Ok(tail(command, request))
+        .flag("no-tablespaces", true, "--no-tablespaces")
+        .flag("no-comments", true, "--no-comments")
+        .arg_when(&[is("format", &["plain"]), on("clean")], [text("--clean")])
+        .arg_when(
+            &[is("format", &["plain"]), on("clean"), on("if-exists")],
+            [text("--if-exists")],
+        )
+        .arg_when(
+            &[is("format", &["plain"]), on("create")],
+            [text("--create")],
+        )
+        .arg_when(
+            &[is("content", &["data"]), on("disable-triggers")],
+            [text("--disable-triggers")],
+        )
+        // pg_dump ignores --schema once --table is given.
+        .objects("--schema=", "--table=", Quoting::Double, Some(".*"));
+    tls(tail(command))
 }
 
-fn restore_command(request: &Request) -> Result<ToolCommand> {
-    let format = request.setting("format");
-    let database = request.setting("database").trim();
-    let database = (!database.is_empty()).then_some(database);
-    let single = request.flag("single-transaction");
-    let exit_on_error = request.flag("exit-on-error");
+/// Plain SQL runs in psql, without ~/.psqlrc.
+fn psql_command() -> Command {
+    let command = Command::new("psql")
+        .when(is("format", &["plain"]))
+        .arg([text("--no-password")])
+        .arg([text("--no-psqlrc")])
+        .flag("exit-on-error", true, "--set=ON_ERROR_STOP=1")
+        .flag("single-transaction", true, "--single-transaction")
+        .flag("verbose", true, "--echo-errors")
+        .arg([text("--file="), path()])
+        .extra("extra");
+    tls(command)
+}
 
-    if format == "plain" {
-        let command = connection(ToolCommand::new("psql"), request, database)
-            // No ~/.psqlrc: only the file runs.
-            .arg("--no-psqlrc")
-            .arg_if(exit_on_error, "--set=ON_ERROR_STOP=1")
-            .arg_if(single, "--single-transaction")
-            .arg_if(request.flag("verbose"), "--echo-errors")
-            .arg(format!("--file={}", request.path));
-        return Ok(extra(command, request));
-    }
-    let letter = match format {
-        "custom" => "c",
-        "directory" => "d",
-        "tar" => "t",
-        other => return Err(DbError::unsupported(format!("Unknown format {other}"))),
+fn pg_restore_command() -> Command {
+    let command = Command::new("pg_restore")
+        .when(not("format", &["plain"]))
+        .arg([text("--no-password")])
+        .arg([text("--format="), mapped("format", FORMAT_LETTERS)])
+        .arg_when(&[is("content", &["schema"])], [text("--schema-only")])
+        .arg_when(&[is("content", &["data"])], [text("--data-only")])
+        .flag("clean", true, "--clean")
+        .arg_when(&[on("clean"), on("if-exists")], [text("--if-exists")])
+        .flag("create", true, "--create")
+        .flag("single-transaction", true, "--single-transaction")
+        .flag("exit-on-error", true, "--exit-on-error")
+        .flag("no-owner", true, "--no-owner")
+        .flag("no-privileges", true, "--no-privileges")
+        .arg_when(
+            &[is("content", &["data"]), on("disable-triggers")],
+            [text("--disable-triggers")],
+        )
+        .arg_when(
+            &[
+                not("jobs", &["1"]),
+                is("single-transaction", &["false"]),
+                is("format", &["custom", "directory"]),
+            ],
+            [text("--jobs="), value("jobs")],
+        )
+        .arg_when(&[not("role", &[""])], [text("--role="), value("role")]);
+    // The archive last, after `--`, so no name reads as an option.
+    tls(tail(command)).arg([text("--")]).arg([path()])
+}
+
+/// PostgreSQL's client programs, from theseus-rs/postgresql-binaries:
+/// relocatable builds of PostgreSQL 18.6 (whose pg_dump reads servers back
+/// to 9.2), of which only pg_dump, pg_restore, psql and their libraries
+/// are kept.
+pub fn downloads() -> Vec<Download> {
+    const BASE: &str = "https://github.com/theseus-rs/postgresql-binaries/releases/download/18.6.0";
+    let unix = |platform: &str, triple: &str, sha256: &str, size: u64| Download {
+        platform: platform.into(),
+        url: format!("{BASE}/postgresql-18.6.0-{triple}.tar.gz"),
+        sha256: sha256.into(),
+        size,
+        label: "PostgreSQL 18.6 client".into(),
+        root: format!("postgresql-18.6.0-{triple}"),
+        extract: vec![
+            "bin/pg_dump".into(),
+            "bin/pg_restore".into(),
+            "bin/psql".into(),
+            "lib/".into(),
+        ],
+        bin: "bin".into(),
     };
-    let mut command = connection(ToolCommand::new("pg_restore"), request, database)
-        .arg(format!("--format={letter}"));
-    command = match request.setting("content") {
-        "schema" => command.arg("--schema-only"),
-        "data" => command.arg("--data-only"),
-        _ => command,
-    };
-    let clean = request.flag("clean");
-    command = command
-        .arg_if(clean, "--clean")
-        .arg_if(clean && request.flag("if-exists"), "--if-exists")
-        .arg_if(request.flag("create"), "--create")
-        .arg_if(single, "--single-transaction")
-        .arg_if(exit_on_error, "--exit-on-error")
-        .arg_if(request.flag("no-owner"), "--no-owner")
-        .arg_if(request.flag("no-privileges"), "--no-privileges")
-        .arg_if(
-            request.setting("content") == "data" && request.flag("disable-triggers"),
-            "--disable-triggers",
-        );
-    let jobs = request.number("jobs").unwrap_or(1);
-    command = command.arg_if(
-        jobs > 1 && !single && format != "tar",
-        format!("--jobs={jobs}"),
-    );
-    let role = request.setting("role").trim();
-    command = command.arg_if(!role.is_empty(), format!("--role={role}"));
-    let mut command = tail(command, request);
-    // The archive goes last, after `--` so no name reads as an option.
-    command = command.arg("--").arg(request.path.clone());
-    Ok(command)
-}
-
-/// The connection, as one conninfo string: host, port, user, database and
-/// TLS, with the password left to `PGPASSWORD`.
-fn connection(command: ToolCommand, request: &Request, database: Option<&str>) -> ToolCommand {
-    let params = &request.params;
-    let mut info = Vec::new();
-    if !params.host.trim().is_empty() {
-        info.push(format!("host={}", quote(params.host.trim())));
-    }
-    info.push(format!("port={}", params.port));
-    if !params.username.is_empty() {
-        info.push(format!("user={}", quote(&params.username)));
-    }
-    let database = database.unwrap_or(&params.database);
-    if !database.is_empty() {
-        info.push(format!("dbname={}", quote(database)));
-    }
-    info.push(format!(
-        "sslmode={}",
-        sslmode(params, request.flag("verify-tls"))
-    ));
-    if params.ssl == SslMode::Require && request.flag("verify-tls") {
-        info.push("sslrootcert=system".to_owned());
-    }
-    info.push("application_name=Violet".to_owned());
-    info.push("connect_timeout=15".to_owned());
-    command
-        .arg(format!("--dbname={}", info.join(" ")))
-        // Never wait for a password prompt nobody can answer.
-        .arg("--no-password")
-        .password_env("PGPASSWORD")
-}
-
-fn sslmode(params: &ConnectParams, verify: bool) -> &'static str {
-    match params.ssl {
-        SslMode::Disable => "disable",
-        SslMode::Prefer => "prefer",
-        SslMode::Require if verify => "verify-full",
-        SslMode::Require => "require",
-    }
-}
-
-/// Shared ending: the log, the lock timeout and what the user typed.
-fn tail(command: ToolCommand, request: &Request) -> ToolCommand {
-    let timeout = request.setting("lock-wait-timeout").trim();
-    let command = command.arg_if(request.flag("verbose"), "--verbose").arg_if(
-        !timeout.is_empty(),
-        format!("--lock-wait-timeout={timeout}"),
-    );
-    extra(command, request)
-}
-
-fn extra(mut command: ToolCommand, request: &Request) -> ToolCommand {
-    for arg in split_args(request.setting("extra")) {
-        command = command.arg(arg);
-    }
-    command
-}
-
-/// A conninfo value, single-quoted with `\` and `'` escaped.
-fn quote(value: &str) -> String {
-    format!("'{}'", value.replace('\\', r"\\").replace('\'', r"\'"))
-}
-
-/// A pg_dump name pattern matching `name` exactly: double-quoted, so case
-/// and wildcard characters are taken literally.
-fn exact(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-fn object_arg(object: &ObjectRef) -> String {
-    match &object.name {
-        Some(name) => format!("--table={}.{}", exact(&object.schema), exact(name)),
-        None => format!("--schema={}", exact(&object.schema)),
-    }
-}
-
-fn patterns(text: &str) -> impl Iterator<Item = &str> {
-    text.split(',').map(str::trim).filter(|p| !p.is_empty())
+    vec![
+        unix(
+            "macos-aarch64",
+            "aarch64-apple-darwin",
+            "a257bcdb8aa3301a13d6a5bcec48f8c9517045b7cbae71e50788b2615539e95b",
+            13_081_312,
+        ),
+        unix(
+            "macos-x86_64",
+            "x86_64-apple-darwin",
+            "f8918fbe747e0d79bda58ad8f8afcf23ac384b847ff3af18856f0825ba54b031",
+            13_435_995,
+        ),
+        unix(
+            "linux-x86_64",
+            "x86_64-unknown-linux-gnu",
+            "bb3d09f876b2383e25a8c9ce09e32d185a03656a23d074f5195542b1b1b3ca61",
+            12_184_736,
+        ),
+        unix(
+            "linux-aarch64",
+            "aarch64-unknown-linux-gnu",
+            "5d2b5e8be9e96bfc3d7f22090057a836ec36d5d092542d8d3b93cc145cf4ee13",
+            11_979_851,
+        ),
+        Download {
+            // On Windows the libraries sit beside the programs.
+            extract: vec!["bin/".into()],
+            ..unix(
+                "windows-x86_64",
+                "x86_64-pc-windows-msvc",
+                "7da44c2dbcda3b49688ea08ce8cf99cfe677adf565f53a9145bf9002c74db7d5",
+                54_068_902,
+            )
+        },
+    ]
 }
 
 /// The format of a backup, from its first bytes or a folder's files.
@@ -528,145 +548,43 @@ fn looks_like_text(head: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use violet_sdk::tools::{CommandPart, Piece};
 
-    fn request(settings: &[(&str, &str)], objects: Vec<ObjectRef>) -> Request {
-        let task = backup();
-        let mut all: Vec<(String, String)> = task
-            .fields
-            .iter()
-            .map(|f| (f.id.clone(), f.default.clone()))
-            .collect();
-        for (k, v) in settings {
-            if let Some(slot) = all.iter_mut().find(|(id, _)| id == k) {
-                slot.1 = (*v).to_owned();
-            } else {
-                all.push(((*k).to_owned(), (*v).to_owned()));
+    /// Every condition and value names a declared setting (Violet refuses
+    /// the task otherwise; this catches it before release).
+    #[test]
+    fn templates_name_declared_settings() {
+        for task in tasks() {
+            let ids: Vec<&str> = task.fields.iter().map(|f| f.id.as_str()).collect();
+            let known = |field: &str| field == "@ssl" || ids.contains(&field);
+            for command in &task.commands {
+                assert!(task.programs.contains(&command.program));
+                for condition in command
+                    .when
+                    .iter()
+                    .chain(command.variables.iter().flat_map(|v| &v.when))
+                {
+                    assert!(known(&condition.field), "{}", condition.field);
+                }
+                for part in &command.parts {
+                    match part {
+                        CommandPart::Argument(argument) => {
+                            for condition in &argument.when {
+                                assert!(known(&condition.field), "{}", condition.field);
+                            }
+                            for piece in &argument.pieces {
+                                if let Piece::Value(value) = piece {
+                                    assert!(known(&value.field), "{}", value.field);
+                                }
+                            }
+                        }
+                        CommandPart::Extra(field) => assert!(known(field)),
+                        CommandPart::Objects(_) => {}
+                    }
+                }
             }
         }
-        Request {
-            params: ConnectParams {
-                host: "db.example.com".into(),
-                port: 5432,
-                database: "shop".into(),
-                username: "o'neil".into(),
-                password: None,
-                ssl: SslMode::Require,
-                options: Vec::new(),
-            },
-            settings: all,
-            objects,
-            path: "/backups/shop.dump".into(),
-        }
-    }
-
-    #[test]
-    fn backups_pass_the_connection_without_the_password() {
-        let command = backup_command(&request(&[], Vec::new())).expect("command");
-        assert_eq!(command.program, "pg_dump");
-        assert_eq!(command.password_env.as_deref(), Some("PGPASSWORD"));
-        assert_eq!(
-            command.args[0],
-            "--dbname=host='db.example.com' port=5432 user='o\\'neil' dbname='shop' \
-             sslmode=verify-full sslrootcert=system application_name=Violet connect_timeout=15"
-        );
-        assert!(command.args.contains(&"--no-password".to_owned()));
-        assert!(command.args.contains(&"--format=c".to_owned()));
-        assert!(command.args.contains(&"--compress=6".to_owned()));
-        assert!(
-            command
-                .args
-                .contains(&"--file=/backups/shop.dump".to_owned())
-        );
-        assert!(command.args.contains(&"--verbose".to_owned()));
-        assert!(!command.args.iter().any(|a| a.contains("clean")));
-    }
-
-    #[test]
-    fn backup_options_map_to_pg_dump_flags() {
-        let objects = vec![
-            ObjectRef {
-                schema: "Sales".into(),
-                name: None,
-            },
-            ObjectRef {
-                schema: "public".into(),
-                name: Some("odd\"name".into()),
-            },
-        ];
-        let command = backup_command(&request(
-            &[
-                ("format", "plain"),
-                ("content", "data"),
-                ("data-as", "column-inserts"),
-                ("rows-per-insert", "100"),
-                ("clean", "true"),
-                ("no-owner", "true"),
-                ("disable-triggers", "true"),
-                ("exclude-data", "logs.*, audit"),
-                ("extra", "--lock-wait-timeout=5s '--exclude-schema=a b'"),
-                ("verify-tls", "false"),
-            ],
-            objects,
-        ))
-        .expect("command");
-        let args = &command.args;
-        for expected in [
-            "--format=p",
-            "--data-only",
-            "--column-inserts",
-            "--rows-per-insert=100",
-            "--clean",
-            "--if-exists",
-            "--no-owner",
-            "--disable-triggers",
-            "--exclude-table-data=logs.*",
-            "--exclude-table-data=audit",
-            "--schema=\"Sales\"",
-            "--table=\"public\".\"odd\"\"name\"",
-            "--exclude-schema=a b",
-        ] {
-            assert!(
-                args.contains(&expected.to_owned()),
-                "{expected} in {args:?}"
-            );
-        }
-        assert!(args[0].contains("sslmode=require "));
-        assert!(!args.iter().any(|a| a.starts_with("--compress")));
-    }
-
-    #[test]
-    fn restores_pick_the_program_by_format() {
-        let mut request = request(&[("format", "plain")], Vec::new());
-        let task = restore();
-        request.settings = task
-            .fields
-            .iter()
-            .map(|f| (f.id.clone(), f.default.clone()))
-            .collect();
-        request.settings.retain(|(k, _)| k != "format");
-        request.settings.push(("format".into(), "plain".into()));
-        let command = restore_command(&request).expect("command");
-        assert_eq!(command.program, "psql");
-        assert!(command.args.contains(&"--set=ON_ERROR_STOP=1".to_owned()));
-        assert!(
-            command
-                .args
-                .contains(&"--file=/backups/shop.dump".to_owned())
-        );
-
-        request
-            .settings
-            .retain(|(k, _)| !matches!(k.as_str(), "format" | "jobs" | "database"));
-        request.settings.push(("format".into(), "directory".into()));
-        request.settings.push(("jobs".into(), "4".into()));
-        request.settings.push(("database".into(), "copy".into()));
-        let command = restore_command(&request).expect("command");
-        assert_eq!(command.program, "pg_restore");
-        assert!(command.args[0].contains("dbname='copy'"));
-        assert!(command.args.contains(&"--jobs=4".to_owned()));
-        assert!(command.args.contains(&"--exit-on-error".to_owned()));
-        let n = command.args.len();
-        assert_eq!(command.args[n - 2..], ["--", "/backups/shop.dump"]);
+        assert_eq!(downloads().len(), 5);
     }
 
     #[test]

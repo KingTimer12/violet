@@ -95,13 +95,12 @@ pub trait Provider: 'static {
         Vec::new()
     }
 
-    /// The command line for one of [`Provider::tasks`]. `request.params`
-    /// carries no password: name the variable for it with
-    /// [`tools::ToolCommand::password_env`]. Violet checks the command
-    /// runs one of the task's programs and shows it before it runs.
-    fn command(kind: tools::TaskKind, request: tools::Request) -> Result<tools::ToolCommand> {
-        let _ = (kind, request);
-        Err(DbError::unsupported("Backup and restore are not supported"))
+    /// Client programs Violet downloads with the provider, per platform,
+    /// so [`Provider::tasks`] work without installing anything (see
+    /// [`tools::Download`]). None by default: Violet then looks for the
+    /// programs on the machine.
+    fn downloads() -> Vec<tools::Download> {
+        Vec::new()
     }
 
     /// Settings that suit restoring from a path, such as its format, from a
@@ -391,12 +390,9 @@ macro_rules! export_provider {
                 <$provider as $crate::Provider>::tasks()
             }
 
-            fn command(
-                kind: $crate::tools::TaskKind,
-                request: $crate::tools::Request,
-            ) -> ::std::result::Result<$crate::tools::ToolCommand, $crate::DbError> {
+            fn downloads() -> ::std::vec::Vec<$crate::tools::Download> {
                 $crate::logging::install();
-                <$provider as $crate::Provider>::command(kind, request)
+                <$provider as $crate::Provider>::downloads()
             }
 
             fn inspect(

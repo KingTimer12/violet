@@ -553,11 +553,9 @@ impl VioletApp {
                 let waited = snapshot.started.elapsed() > Duration::from_millis(2_500);
                 if env("VIOLET_SCENE_RUN").is_some() {
                     if ready && waited {
+                        // The action itself: the dialog's second click for a
+                        // restore is the button's business.
                         self.actions.push(Action::TaskStart);
-                        if dialog.kind == TaskKind::Restore {
-                            // The second click a restore asks for.
-                            self.actions.push(Action::TaskStart);
-                        }
                         snapshot.step += 1;
                         snapshot.started = Instant::now();
                     }

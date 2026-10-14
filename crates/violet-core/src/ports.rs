@@ -125,4 +125,23 @@ pub trait ProviderStore: Send + Sync + 'static {
     async fn install(&self, id: &DriverId) -> Result<Arc<dyn Driver>>;
 
     async fn remove(&self, id: &DriverId) -> Result<()>;
+
+    /// The folder with the client programs downloaded for `id`, when they
+    /// are in.
+    fn tools(&self, id: &DriverId) -> Option<std::path::PathBuf> {
+        let _ = id;
+        None
+    }
+
+    /// Downloads, verifies and unpacks the client programs `downloads`
+    /// offers for this machine, unless they are in already. `None` when
+    /// none is for this machine.
+    async fn install_tools(
+        &self,
+        id: &DriverId,
+        downloads: Vec<crate::tools::Download>,
+    ) -> Result<Option<std::path::PathBuf>> {
+        let _ = (id, downloads);
+        Ok(None)
+    }
 }

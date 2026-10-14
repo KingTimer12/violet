@@ -42,11 +42,20 @@ fn file_name(name: &str) -> String {
     }
 }
 
-/// The folders to look in, in order: the user's, the task's usual
-/// locations (a `*` expanded, highest name first) and `PATH`.
+/// The folders to look in, in order: the user's, the programs Violet
+/// downloaded with the provider, the task's usual locations (a `*`
+/// expanded, highest name first) and `PATH`.
 #[must_use]
-pub fn search_folders(task: &Task, folder: Option<&Path>) -> Vec<PathBuf> {
-    let mut folders: Vec<PathBuf> = folder.map(Path::to_path_buf).into_iter().collect();
+pub fn search_folders(
+    task: &Task,
+    folder: Option<&Path>,
+    downloaded: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut folders: Vec<PathBuf> = folder
+        .into_iter()
+        .chain(downloaded)
+        .map(Path::to_path_buf)
+        .collect();
     for location in &task.locations {
         folders.extend(expand(location).into_iter().filter(|f| trusted_folder(f)));
     }
@@ -187,8 +196,8 @@ fn is_executable(path: &Path) -> bool {
 }
 
 /// Finds each of the task's programs and asks it its version.
-pub async fn locate(task: &Task, folder: Option<&Path>) -> Vec<Program> {
-    let folders = search_folders(task, folder);
+pub async fn locate(task: &Task, folder: Option<&Path>, downloaded: Option<&Path>) -> Vec<Program> {
+    let folders = search_folders(task, folder, downloaded);
     let mut programs = Vec::with_capacity(task.programs.len());
     for name in &task.programs {
         let path = find(name, &folders);
@@ -507,8 +516,10 @@ mod tests {
             fields: Vec::new(),
             objects: false,
             targets: Vec::new(),
+            connection: violet_core::Connection::default(),
+            commands: Vec::new(),
         };
-        let folders = search_folders(&task, Some(Path::new("/tmp/picked")));
+        let folders = search_folders(&task, Some(Path::new("/tmp/picked")), None);
         // The user's own pick stays; the shared location does not.
         assert_eq!(folders[0], Path::new("/tmp/picked"));
         assert!(!folders[1..].iter().any(|f| f.starts_with("/tmp")));

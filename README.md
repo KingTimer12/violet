@@ -184,33 +184,41 @@ written so far; **Stop** ends it. When it finishes, **Show in folder** opens
 the backup, and a restore refreshes the tree. The options, folders and
 client programs used last are remembered.
 
-Programs are looked for in the folder you pick, then the usual places
-(Homebrew, Postgres.app, EnterpriseDB, `/usr/lib/postgresql/*/bin`,
-`C:\Program Files\PostgreSQL\*\bin`), then `PATH`; their versions are
-shown, with a warning when the client is older than the server.
+**No client to install.** A provider may name client programs to download
+with it, per platform; PostgreSQL's brings `pg_dump`, `pg_restore` and
+`psql` 18.6 (about 13 MB, from
+[theseus-rs/postgresql-binaries](https://github.com/theseus-rs/postgresql-binaries)),
+fetched in the background right after the provider installs. The archive
+is checked against the SHA-256 the provider declares and only the
+programs and their libraries are kept, under `providers/.tools/`. A folder
+you pick comes first; then the downloaded programs, the usual places
+(Homebrew, Postgres.app, EnterpriseDB, `/usr/lib/postgresql/*/bin`...)
+and `PATH`. Versions show, with a warning when the client is older than
+the server.
 
 **What runs, and with what.** Unlike providers, these programs run outside
 the sandbox, as you: they read and write files and connect to the server
 themselves. So:
 
+- a provider does not build command lines. It declares each command up
+  front as a template (fixed text, setting values, the chosen path), and
+  Violet fills it in; nothing the provider computes later reaches a
+  command line;
+- the connection is Violet's: host, port, user, database and password come
+  from the profile, through the variables or options the provider names
+  for them (`PGHOST`, `PGPASSWORD`...), and the template may not set those
+  any other way. Values that a client would read as a whole connection
+  string (`host=...`, `postgresql://...`) are refused;
 - the first backup or restore with a provider asks whether it may run its
-  programs at all;
-- a provider may only run the programs it declared, never a shell, an
-  interpreter or a launcher, and may not set variables that change what
-  runs or what it loads (`PATH`, `LD_*`, `DYLD_*`, `*FILE`, `*PATH`...);
-- the full command shows before it starts and can be copied;
-- the password is never on the command line: it goes in the variable the
-  provider names (`PGPASSWORD`), and TLS connections verify the server
-  certificate against the system's roots (`sslmode=verify-full`,
-  `sslrootcert=system`, PostgreSQL 16 clients or later; it can be turned
-  off);
-- programs start directly, without a shell.
+  programs, listing everything it may put on a command line and what it
+  downloads;
+- templates may only name the programs they declare, never a shell, an
+  interpreter or a launcher, nor variables that change what runs (`PATH`,
+  `LD_*`, `DYLD_*`, `*FILE`...), and their fixed text may not hold pipes or
+  console commands (`\!`, `\o`, `\copy`...);
+- the full command shows before it starts, and runs without a shell.
 
-These checks catch mistakes and the obvious tricks (pipes, `\!` and other
-`psql` meta-commands), but a provider you allowed can still build a
-harmful command from the programs it declared, such as one that connects
-somewhere else with the password. Allowing a provider means trusting it
-like any program you install; read the command before you start.
+What you type yourself (extra arguments, patterns) goes through as typed.
 
 Plain SQL restores run in `psql`, which also runs meta-commands written in
 the file (including `\!`, a shell command): only restore files you trust.

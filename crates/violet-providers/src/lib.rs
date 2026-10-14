@@ -14,6 +14,7 @@
 pub mod folder;
 pub mod index;
 pub mod source;
+pub mod tools;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,7 +22,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 use violet_core::ports::{ProviderListing, ProviderStore};
-use violet_core::{DbError, Driver, DriverId, ErrorKind, Result};
+use violet_core::{DbError, Download, Driver, DriverId, ErrorKind, Result};
 use violet_wasm::{Runtime, WasmDriver};
 
 pub use folder::{Folder, Manifest};
@@ -54,6 +55,8 @@ pub struct Providers {
     /// One install at a time, so two connections asking for the same
     /// provider download it once.
     installing: Mutex<()>,
+    /// One tools download at a time.
+    tools_lock: Mutex<()>,
 }
 
 impl Providers {
@@ -65,12 +68,18 @@ impl Providers {
             runtime,
             index,
             installing: Mutex::new(()),
+            tools_lock: Mutex::new(()),
         }
     }
 
     #[must_use]
     pub fn folder(&self) -> &Folder {
         &self.folder
+    }
+
+    fn tools_folder(&self, id: &DriverId) -> Option<tools::ToolsFolder> {
+        violet_wasm::valid_id(id.as_str())
+            .then(|| tools::ToolsFolder::new(self.folder.root(), id.as_str()))
     }
 
     fn driver(&self, manifest: Manifest) -> Arc<dyn Driver> {
@@ -208,8 +217,58 @@ impl ProviderStore for Providers {
     async fn remove(&self, id: &DriverId) -> Result<()> {
         let _one_at_a_time = self.installing.lock().await;
         let folder = self.folder.clone();
+        let tools = self.tools_folder(id);
         let id = id.as_str().to_owned();
-        blocking(move || folder.remove(&id)).await
+        blocking(move || {
+            if let Some(tools) = tools {
+                tools.remove();
+            }
+            folder.remove(&id)
+        })
+        .await
+    }
+
+    fn tools(&self, id: &DriverId) -> Option<PathBuf> {
+        let folder = self.tools_folder(id)?;
+        folder.installed().map(|installed| folder.bin(&installed))
+    }
+
+    async fn install_tools(
+        &self,
+        id: &DriverId,
+        downloads: Vec<Download>,
+    ) -> Result<Option<PathBuf>> {
+        let Some(download) = tools::for_this_platform(&downloads).cloned() else {
+            return Ok(None);
+        };
+        download.check()?;
+        let folder = self
+            .tools_folder(id)
+            .ok_or_else(|| error(format!("Invalid provider id {id}")))?;
+        let _one_at_a_time = self.tools_lock.lock().await;
+        if let Some(installed) = folder.installed()
+            && installed.sha256 == download.sha256
+        {
+            return Ok(Some(folder.bin(&installed)));
+        }
+        let source = Source::parse(&download.url)?;
+        log::info!(
+            "downloading {} for provider {id} from {}",
+            download.label,
+            download.url
+        );
+        let size = download.size;
+        let expected = download.sha256.clone();
+        let archive = blocking(move || source.read(size)).await?;
+        if archive.len() as u64 != size || sha256(&archive) != expected {
+            return Err(error(format!(
+                "The downloaded {} does not match the provider's digest; it was not installed",
+                download.label
+            )));
+        }
+        let bin = blocking(move || folder.install(&download, &archive)).await?;
+        log::info!("client programs for {id} in {}", bin.display());
+        Ok(Some(bin))
     }
 }
 
