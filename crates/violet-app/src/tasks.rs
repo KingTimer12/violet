@@ -48,14 +48,55 @@ fn file_name(name: &str) -> String {
 pub fn search_folders(task: &Task, folder: Option<&Path>) -> Vec<PathBuf> {
     let mut folders: Vec<PathBuf> = folder.map(Path::to_path_buf).into_iter().collect();
     for location in &task.locations {
-        folders.extend(expand(location));
+        folders.extend(expand(location).into_iter().filter(|f| trusted_folder(f)));
     }
     if let Some(path) = std::env::var_os("PATH") {
-        folders.extend(std::env::split_paths(&path));
+        // Relative entries (`.`, empty) would run whatever sits in the
+        // current folder.
+        folders
+            .extend(std::env::split_paths(&path).filter(|f| f.is_absolute() && trusted_folder(f)));
     }
     let mut seen = std::collections::HashSet::new();
     folders.retain(|folder| seen.insert(folder.clone()));
     folders
+}
+
+/// Folders anyone can drop a program into never count: temporary and
+/// shared folders, and folders (or their parents) writable by everyone.
+/// The folder the user picks is taken as they chose it.
+fn trusted_folder(folder: &Path) -> bool {
+    const SHARED: &[&str] = &[
+        "/tmp",
+        "/var/tmp",
+        "/private/tmp",
+        "/private/var/tmp",
+        "/dev/shm",
+        "/Users/Shared",
+    ];
+    if SHARED.iter().any(|shared| folder.starts_with(shared)) {
+        return false;
+    }
+    if let Some(temp) = std::env::var_os("TMPDIR").or_else(|| std::env::var_os("TEMP"))
+        && folder.starts_with(PathBuf::from(temp))
+    {
+        return false;
+    }
+    !folder.ancestors().any(world_writable)
+}
+
+#[cfg(unix)]
+fn world_writable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|meta| {
+        let mode = meta.permissions().mode();
+        // The sticky bit (as on /tmp) still lets anyone add files.
+        mode & 0o002 != 0
+    })
+}
+
+#[cfg(not(unix))]
+fn world_writable(_path: &Path) -> bool {
+    false
 }
 
 /// The folders a location names. A `*` matches part of one folder name;
@@ -135,7 +176,9 @@ fn is_executable(path: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+        let mode = meta.permissions().mode();
+        // A program anyone could have rewritten is not run.
+        meta.is_file() && mode & 0o111 != 0 && mode & 0o002 == 0
     }
     #[cfg(not(unix))]
     {
@@ -448,6 +491,27 @@ mod tests {
         assert_eq!(names, ["pg-other", "pg-17", "pg-16", "pg-9"]);
         assert!(expand(&format!("{}/nothing-*/bin", root.display())).is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_and_world_writable_folders_are_skipped() {
+        assert!(!trusted_folder(Path::new("/tmp/pg/bin")));
+        assert!(!trusted_folder(Path::new("/private/tmp/x")));
+        assert!(trusted_folder(Path::new("/usr/bin")));
+        let task = Task {
+            kind: violet_core::TaskKind::Backup,
+            programs: vec!["pg_dump".into()],
+            locations: vec!["/tmp/*/bin".into()],
+            version_arg: None,
+            fields: Vec::new(),
+            objects: false,
+            targets: Vec::new(),
+        };
+        let folders = search_folders(&task, Some(Path::new("/tmp/picked")));
+        // The user's own pick stays; the shared location does not.
+        assert_eq!(folders[0], Path::new("/tmp/picked"));
+        assert!(!folders[1..].iter().any(|f| f.starts_with("/tmp")));
     }
 
     #[test]
