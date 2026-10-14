@@ -85,6 +85,7 @@ impl Providers {
 
     /// The catalogue: fetched fresh, or the copy from last time when it
     /// cannot be reached.
+    #[hotpath::measure]
     pub async fn index(&self) -> Result<Index> {
         let source = self.index.clone();
         let fetched = blocking(move || source.read(index::MAX_INDEX_SIZE)).await;
@@ -111,6 +112,7 @@ impl Providers {
 
     /// Checks and installs a component that is already at hand: one just
     /// downloaded, or one a developer built (`violet-provider install`).
+    #[hotpath::measure]
     pub async fn install_component(
         &self,
         component: Vec<u8>,
@@ -200,6 +202,21 @@ impl ProviderStore for Providers {
     }
 
     async fn install(&self, id: &DriverId) -> Result<Arc<dyn Driver>> {
+        self.download(id).await
+    }
+
+    async fn remove(&self, id: &DriverId) -> Result<()> {
+        let _one_at_a_time = self.installing.lock().await;
+        let folder = self.folder.clone();
+        let id = id.as_str().to_owned();
+        blocking(move || folder.remove(&id)).await
+    }
+}
+
+impl Providers {
+    /// Installs `id` from the catalogue, unless that version is already in.
+    #[hotpath::measure]
+    async fn download(&self, id: &DriverId) -> Result<Arc<dyn Driver>> {
         let _one_at_a_time = self.installing.lock().await;
         let index = self.index().await?;
         let entry = index.get(id.as_str()).cloned().ok_or_else(|| {
@@ -234,12 +251,5 @@ impl ProviderStore for Providers {
             )));
         }
         self.install_component(component, Some(&entry.id)).await
-    }
-
-    async fn remove(&self, id: &DriverId) -> Result<()> {
-        let _one_at_a_time = self.installing.lock().await;
-        let folder = self.folder.clone();
-        let id = id.as_str().to_owned();
-        blocking(move || folder.remove(&id)).await
     }
 }

@@ -32,6 +32,7 @@ pub(crate) struct Instance {
 
 impl Instance {
     /// Instantiates `provider`, allowed to reach `target` only.
+    #[hotpath::measure]
     pub(crate) async fn start(provider: &Provider, target: Option<Target>) -> Result<Self> {
         let kill = Arc::new(Kill::default());
         let mut store = Store::new(&provider.engine, HostState::new(target, Arc::clone(&kill)));
@@ -112,6 +113,7 @@ struct CancelPlan {
 }
 
 impl WasmSession {
+    #[hotpath::measure]
     pub(crate) async fn open(
         provider: Arc<Provider>,
         target: Target,
@@ -162,6 +164,7 @@ impl WasmSession {
     /// session.
     async fn with<T>(
         &self,
+        label: &'static str,
         call: impl AsyncFnOnce(
             &mut Store<HostState>,
             &ProviderWorld,
@@ -176,7 +179,11 @@ impl WasmSession {
             return Err(gone());
         };
         refuel(&mut instance.store);
-        match call(&mut instance.store, &instance.world, *session).await {
+        let outcome = hotpath::measure_block!(
+            label,
+            call(&mut instance.store, &instance.world, *session).await
+        );
+        match outcome {
             Ok(result) => result.map_err(convert::error),
             Err(error) => {
                 self.broken.store(true, Ordering::SeqCst);
@@ -184,7 +191,7 @@ impl WasmSession {
                 if self.kill.fired() {
                     Err(DbError::new(ErrorKind::Cancelled, "The session was closed"))
                 } else {
-                    log::error!(target: "violet::provider", "instance trapped: {error:#}");
+                    log::error!(target: "violet::provider", "instance trapped in {label}: {error:#}");
                     Err(crashed(&error))
                 }
             }
@@ -202,7 +209,7 @@ fn gone() -> DbError {
 #[async_trait]
 impl Session for WasmSession {
     async fn server_info(&self) -> Result<ServerInfo> {
-        self.with(async |store, world, session| {
+        self.with("WasmSession::server_info", async |store, world, session| {
             world
                 .violet_provider_provider()
                 .session()
@@ -214,7 +221,7 @@ impl Session for WasmSession {
     }
 
     async fn databases(&self) -> Result<Vec<String>> {
-        self.with(async |store, world, session| {
+        self.with("WasmSession::databases", async |store, world, session| {
             world
                 .violet_provider_provider()
                 .session()
@@ -225,7 +232,7 @@ impl Session for WasmSession {
     }
 
     async fn schemas(&self) -> Result<Vec<String>> {
-        self.with(async |store, world, session| {
+        self.with("WasmSession::schemas", async |store, world, session| {
             world
                 .violet_provider_provider()
                 .session()
@@ -237,7 +244,7 @@ impl Session for WasmSession {
 
     async fn objects(&self, schema: &str) -> Result<Vec<DbObject>> {
         let objects = self
-            .with(async |store, world, session| {
+            .with("WasmSession::objects", async |store, world, session| {
                 world
                     .violet_provider_provider()
                     .session()
@@ -253,7 +260,7 @@ impl Session for WasmSession {
 
     async fn columns(&self, schema: &str, relation: &str) -> Result<Vec<ColumnInfo>> {
         let columns = self
-            .with(async |store, world, session| {
+            .with("WasmSession::columns", async |store, world, session| {
                 world
                     .violet_provider_provider()
                     .session()
@@ -267,7 +274,7 @@ impl Session for WasmSession {
     async fn execute(&self, sql: &str, limits: ExecLimits) -> Result<Vec<ResultSet>> {
         let max_rows = u32::try_from(limits.max_rows).unwrap_or(u32::MAX);
         let sets = self
-            .with(async |store, world, session| {
+            .with("WasmSession::execute", async |store, world, session| {
                 world
                     .violet_provider_provider()
                     .session()
@@ -289,13 +296,16 @@ impl Session for WasmSession {
     }
 
     async fn change_token(&self) -> Result<Option<String>> {
-        self.with(async |store, world, session| {
-            world
-                .violet_provider_provider()
-                .session()
-                .call_change_token(store, session)
-                .await
-        })
+        self.with(
+            "WasmSession::change_token",
+            async |store, world, session| {
+                world
+                    .violet_provider_provider()
+                    .session()
+                    .call_change_token(store, session)
+                    .await
+            },
+        )
         .await
     }
 

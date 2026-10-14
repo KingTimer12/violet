@@ -36,6 +36,7 @@ impl Highlighter {
     }
 }
 
+#[hotpath::measure]
 fn highlight(text: &str, palette: &Palette, error_at: Option<usize>) -> LayoutJob {
     let syntax = palette.syntax;
     let font = theme::mono(FONT_SIZE);
@@ -78,6 +79,7 @@ fn byte_offset(text: &str, cursor: CCursor) -> usize {
 }
 
 /// Draws `tab`'s editor filling the available space.
+#[hotpath::measure]
 pub fn show(ui: &mut Ui, tab: &mut QueryTab) {
     let palette = Palette::current(ui.ctx());
     let error_at = tab.error_offset();

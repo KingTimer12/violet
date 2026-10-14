@@ -146,6 +146,7 @@ impl<'a> Row<'a> {
 }
 
 /// Draws the sidebar and returns what the user asked for.
+#[hotpath::measure]
 pub fn show(
     ui: &mut Ui,
     profiles: &[ConnectionProfile],

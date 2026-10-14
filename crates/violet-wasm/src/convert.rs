@@ -157,6 +157,7 @@ pub(crate) fn column(column: wit::ColumnInfo) -> ColumnInfo {
     }
 }
 
+#[hotpath::measure]
 pub(crate) fn result_set(set: wit::ResultSet) -> Result<ResultSet, DbError> {
     let width = set.columns.len();
     let rows = Rows::from_text(width, set.rows.text, &set.rows.ends)

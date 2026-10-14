@@ -23,6 +23,7 @@ use violet_storage::{
 use settings::Settings;
 use ui::{Services, VioletApp};
 
+#[hotpath::main]
 fn main() -> eframe::Result {
     // `VIOLET_HOME` keeps everything under one directory: portable installs,
     // and runs that must not touch the user's own connections.

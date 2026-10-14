@@ -421,6 +421,7 @@ impl VioletApp {
 
     // ---- running queries ------------------------------------------------
 
+    #[hotpath::measure]
     fn run(&mut self, ctx: &egui::Context, tab_id: TabId, scope: RunScope) {
         let is_data = self
             .workspace
@@ -656,6 +657,7 @@ impl VioletApp {
     }
 
     #[allow(clippy::too_many_lines)]
+    #[hotpath::measure]
     fn apply(&mut self, ctx: &egui::Context, action: Action) {
         match action {
             Action::NewConnection => {
@@ -1000,11 +1002,13 @@ impl eframe::App for VioletApp {
         }
     }
 
+    #[hotpath::measure]
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_events(ctx);
         self.shortcuts(ctx);
     }
 
+    #[hotpath::measure]
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let palette = Palette::current(&ctx);

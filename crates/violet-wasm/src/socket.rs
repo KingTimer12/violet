@@ -131,6 +131,7 @@ fn killed() -> DbError {
 
 impl Socket {
     /// Opens TCP to `target`.
+    #[hotpath::measure]
     pub(crate) async fn connect(
         target: &Target,
         kill: Arc<Kill>,
@@ -216,6 +217,7 @@ impl Socket {
         }
     }
 
+    #[hotpath::measure]
     pub(crate) async fn read(&mut self, max: u32) -> Result<Vec<u8>, DbError> {
         let mut buffer = vec![0; max.clamp(1, MAX_READ) as usize];
         let kill = Arc::clone(&self.kill);
@@ -236,6 +238,7 @@ impl Socket {
         Ok(buffer)
     }
 
+    #[hotpath::measure]
     pub(crate) async fn write(&mut self, bytes: &[u8]) -> Result<(), DbError> {
         if let Some(budget) = &self.plain_budget
             && !budget.spend(bytes.len())
@@ -265,6 +268,7 @@ impl Socket {
         }
     }
 
+    #[hotpath::measure]
     pub(crate) async fn start_tls(&mut self) -> Result<(), DbError> {
         let Transport::Tcp(_) = &self.transport else {
             return Err(error(

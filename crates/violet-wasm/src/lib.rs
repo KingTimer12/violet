@@ -101,6 +101,7 @@ impl Runtime {
 
     /// Compiles a provider and checks it fits the contract. Takes a while
     /// for a large component (unless cached); run it off async threads.
+    #[hotpath::measure]
     pub fn load(&self, wasm: &[u8]) -> Result<Provider> {
         let component = Component::new(&self.engine, wasm).map_err(|error| {
             DbError::new(
@@ -130,6 +131,7 @@ impl Runtime {
     }
 
     /// Compiles a provider and asks it to describe itself.
+    #[hotpath::measure]
     pub async fn inspect(&self, wasm: Vec<u8>) -> Result<Description> {
         let runtime = self.clone();
         let provider = tokio::task::spawn_blocking(move || runtime.load(&wasm))
@@ -147,6 +149,7 @@ pub struct Provider {
 
 impl Provider {
     /// The provider's own description, checked.
+    #[hotpath::measure]
     pub async fn describe(&self) -> Result<Description> {
         let mut instance = session::Instance::start(self, None).await?;
         let info = instance.info().await?;

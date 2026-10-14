@@ -162,6 +162,7 @@ fn weight(key: &CacheKey, value: &CachedOutput) -> usize {
 }
 
 impl ResultCache for MemoryResultCache {
+    #[hotpath::measure]
     fn get(&self, key: &CacheKey) -> Option<CachedOutput> {
         let mut store = self.store();
         let value = store.get(key)?;
@@ -172,6 +173,7 @@ impl ResultCache for MemoryResultCache {
         Some(value)
     }
 
+    #[hotpath::measure]
     fn put(&self, key: CacheKey, value: CachedOutput) {
         let weight = weight(&key, &value);
         self.store().put(key, value, weight);

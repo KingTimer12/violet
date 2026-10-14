@@ -430,6 +430,7 @@ fn number_end(bytes: &[u8], at: usize) -> usize {
 /// Byte ranges of the statements in `source`, split on top-level `;`, with
 /// surrounding whitespace trimmed. Empty statements are left out.
 #[must_use]
+#[hotpath::measure]
 pub fn statements(source: &str) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
     let mut start = 0;
@@ -568,6 +569,7 @@ pub struct Plan {
 /// Decides whether `source` may be cached and paged. It errs on the side of
 /// running: anything unclear is neither.
 #[must_use]
+#[hotpath::measure]
 pub fn plan(source: &str) -> Plan {
     let ranges = statements(source);
     if ranges.is_empty() {

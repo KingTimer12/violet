@@ -75,6 +75,7 @@ impl Source {
     }
 
     /// Reads it whole, refusing more than `limit` bytes. Blocking.
+    #[hotpath::measure]
     pub fn read(&self, limit: u64) -> Result<Vec<u8>> {
         match self {
             Self::File(path) => {

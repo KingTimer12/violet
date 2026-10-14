@@ -177,5 +177,27 @@ VIOLET_TEST_PG=localhost:55499:violet:violet:violet cargo test -p violet-wasm
 VIOLET_HOME=/tmp/v VIOLET_SNAPSHOT=/tmp/shot.png VIOLET_SCENE=welcome cargo run
 ```
 
+### Profiling
+
+Violet is instrumented with [hotpath](https://hotpath.rs): frames and
+the grid, queries end to end, every provider call, socket reads and
+writes, provider compilation and downloads, the result cache. Without the
+feature the macros compile to the plain code.
+
+```sh
+# Report on exit: time per function (calls, avg, P95, total).
+cargo run --release --features hotpath
+# Allocations too:
+cargo run --release --features hotpath-alloc
+# Live, while Violet runs (another terminal):
+cargo install hotpath --features tui --version '^0.28'
+hotpath
+```
+
+`HOTPATH_OUTPUT_PATH=report.txt` writes the report to a file (release
+builds on Windows have no console); `HOTPATH_OUTPUT_FORMAT=json-pretty`
+for JSON; `HOTPATH_FOCUS=WasmSession` to show some functions only. The
+live data is served on `localhost:6770`.
+
 The egui and winit forks fastframe needs are patched in the root
 `Cargo.toml` (`[patch.crates-io]`).

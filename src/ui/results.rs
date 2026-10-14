@@ -20,6 +20,7 @@ const ROW_HEIGHT: f32 = 26.0;
 /// Characters shown per cell; the full value is a click away.
 const CELL_PREVIEW: usize = 300;
 
+#[hotpath::measure]
 pub fn show(ui: &mut Ui, tab: &mut QueryTab, actions: &mut Vec<Action>) {
     let palette = Palette::current(ui.ctx());
     // Fetching another page keeps the rows on screen; the footer shows it.
@@ -286,6 +287,7 @@ fn format_age(age: std::time::Duration) -> String {
     }
 }
 
+#[hotpath::measure]
 fn grid(
     ui: &mut Ui,
     tab: u64,
@@ -615,6 +617,7 @@ fn write_field(out: &mut String, value: &str, separator: char) {
 
 /// The set as CSV (or TSV), header first, built in one buffer sized up
 /// front.
+#[hotpath::measure]
 pub fn to_delimited(set: &ResultSet, separator: char) -> String {
     let cells = set.rows.len() * set.columns.len();
     let mut out = String::with_capacity(set.rows.text_len() + cells + 64);

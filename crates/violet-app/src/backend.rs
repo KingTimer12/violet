@@ -188,6 +188,7 @@ impl Shared {
     }
 
     /// The driver for `id`, installing its provider first if needed.
+    #[hotpath::measure]
     async fn driver(&self, id: &DriverId) -> Result<Arc<dyn Driver>> {
         if let Some(driver) = self.registry.get(id) {
             return Ok(driver);
@@ -207,6 +208,7 @@ impl Shared {
         result
     }
 
+    #[hotpath::measure]
     async fn open(
         self: &Arc<Self>,
         profile: &ConnectionProfile,
@@ -220,6 +222,7 @@ impl Shared {
     }
 
     /// Runs `sql` on `id`'s session as `options` say, through the cache.
+    #[hotpath::measure]
     async fn query(
         &self,
         request: RequestId,

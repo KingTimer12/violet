@@ -37,6 +37,7 @@ impl WasmDriver {
         }
     }
 
+    #[hotpath::measure]
     async fn provider(&self) -> Result<Arc<Provider>> {
         self.provider
             .get_or_try_init(|| async {

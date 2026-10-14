@@ -20,6 +20,9 @@ violet-wasm = { path = "crates/violet-wasm" }
 
 async-trait = "0.1"
 directories = "6"
+# Profiling (hotpath.rs). Without the `hotpath` feature its macros expand
+# to the code they wrap: nothing is measured and nothing is linked.
+hotpath = { version = "0.28.6", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
@@ -52,6 +55,7 @@ violet-app.workspace = true
 violet-providers.workspace = true
 violet-wasm.workspace = true
 violet-storage.workspace = true
+hotpath.workspace = true
 log.workspace = true
 serde.workspace = true
 zeroize.workspace = true
@@ -67,6 +71,13 @@ fastframe-fonts = { git = "https://github.com/crmne/fastframe", tag = "v0.2.3" }
 fastframe-icons = { git = "https://github.com/crmne/fastframe", tag = "v0.2.3" }
 fastframe-log = { git = "https://github.com/crmne/fastframe", tag = "v0.2.3" }
 fastframe-macos = { git = "https://github.com/crmne/fastframe", tag = "v0.2.3" }
+
+[features]
+# `cargo run --features hotpath`: times the hot paths (frames, queries,
+# provider calls, downloads) and prints a report on exit; meanwhile the
+# `hotpath` TUI shows it live. `hotpath-alloc` adds allocations.
+hotpath = ["hotpath/hotpath", "hotpath/threads"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
 
 [lints]
 workspace = true
