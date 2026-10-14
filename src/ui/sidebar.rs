@@ -513,6 +513,22 @@ fn database_node(
                 }
             }
         }
+        ui.separator();
+        if menu_item(ui, Icon::Archive, "Backup…") {
+            actions.push(Action::DatabaseTask(
+                parent,
+                database.to_owned(),
+                TaskKind::Backup,
+            ));
+        }
+        if menu_item(ui, Icon::ArchiveRestore, "Restore…") {
+            actions.push(Action::DatabaseTask(
+                parent,
+                database.to_owned(),
+                TaskKind::Restore,
+            ));
+        }
+        ui.separator();
         if menu_item(ui, Icon::Copy, "Copy name") {
             actions.push(Action::Copy(database.to_owned()));
         }

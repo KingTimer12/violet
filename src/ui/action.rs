@@ -36,6 +36,9 @@ pub enum Action {
     /// Opens a database of a connection that shows them all, in a session
     /// of its own.
     OpenDatabase(ConnectionId, String),
+    /// Opens the backup or restore dialog for a database of a connection
+    /// that shows them all, whether or not it is open.
+    DatabaseTask(ConnectionId, String, TaskKind),
     Refresh(ConnectionId),
     LoadObjects(ConnectionId, String),
     LoadColumns(ConnectionId, String, String),

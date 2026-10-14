@@ -1179,6 +1179,11 @@ impl VioletApp {
                 self.backend.disconnect(id);
             }
             Action::OpenDatabase(parent, database) => self.open_database(parent, database),
+            Action::DatabaseTask(parent, database, kind) => {
+                if let Some(id) = self.database_session(parent, &database) {
+                    self.open_task(id, kind, Vec::new());
+                }
+            }
             Action::Refresh(id) => {
                 self.explorer.forget(id);
                 self.explorer.schemas.insert(id, Loadable::Loading);
