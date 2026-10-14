@@ -8,6 +8,7 @@ mod connection_form;
 #[cfg(debug_assertions)]
 mod devtools;
 mod editor;
+mod fonts;
 pub mod icons;
 mod providers;
 mod results;
@@ -61,6 +62,9 @@ pub struct VioletApp {
     /// Runs waiting for their tab's connection to open.
     queued: Vec<(TabId, RunScope)>,
     actions: Vec<Action>,
+    fonts: fonts::Fallbacks,
+    /// Connection names not yet checked against the fonts.
+    names_unchecked: bool,
     #[cfg(debug_assertions)]
     snapshot: Option<devtools::Snapshot>,
 }
@@ -87,6 +91,8 @@ impl VioletApp {
             confirm_delete: None,
             queued: Vec::new(),
             actions: Vec::new(),
+            fonts: fonts::Fallbacks::default(),
+            names_unchecked: true,
             #[cfg(debug_assertions)]
             snapshot: devtools::Snapshot::from_env(),
         };
@@ -139,6 +145,7 @@ impl VioletApp {
     }
 
     fn handle_event(&mut self, ctx: &egui::Context, event: Event) {
+        self.fonts.cover_event(ctx, &event);
         match event {
             Event::Connected { id, server } => {
                 self.toasts.push(
@@ -744,6 +751,7 @@ impl VioletApp {
                 let reconnect = self.backend.is_connected(id);
                 match self.profiles.upsert(profile, password.as_ref()) {
                     Ok(()) => {
+                        self.names_unchecked = true;
                         if connect || reconnect {
                             self.explorer.expanded.insert(NodeKey::Connection(id));
                             self.explorer.links.remove(&id);
@@ -1006,6 +1014,15 @@ impl eframe::App for VioletApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_events(ctx);
         self.shortcuts(ctx);
+        if std::mem::take(&mut self.names_unchecked) {
+            for profile in self.profiles.all() {
+                self.fonts.cover(ctx, &profile.name);
+            }
+        }
+        if let Some(tab) = self.workspace.active() {
+            self.fonts.cover_editor(ctx, &tab.sql);
+        }
+        self.fonts.poll(ctx);
     }
 
     #[hotpath::measure]

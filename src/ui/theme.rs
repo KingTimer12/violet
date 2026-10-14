@@ -187,13 +187,20 @@ impl Palette {
     }
 }
 
-/// Installs fonts, text styles and both themes' visuals. Call once, before
-/// the first frame.
+/// The interface's fonts, with or without the system's faces for other
+/// scripts (see [`super::fonts`]).
+pub fn font_definitions(system_fallbacks: bool) -> egui::FontDefinitions {
+    let mut fonts = FontSetup::default()
+        .system_fallbacks(system_fallbacks)
+        .definitions();
+    fastframe_text::detect().apply_to(&mut fonts);
+    fonts
+}
+
+/// Installs the bundled fonts, text styles and both themes' visuals. Call
+/// once, before the first frame.
 pub fn install(ctx: &egui::Context, preference: egui::ThemePreference) {
-    let mut fonts = FontSetup::default().definitions();
-    let rendering = fastframe_text::detect();
-    rendering.apply_to(&mut fonts);
-    ctx.set_fonts(fonts);
+    ctx.set_fonts(font_definitions(false));
 
     for theme in [Theme::Dark, Theme::Light] {
         let palette = Palette::of(theme);
@@ -223,6 +230,7 @@ pub fn install(ctx: &egui::Context, preference: egui::ThemePreference) {
         });
     }
     // fastframe-text runs after the app's own visuals, for both themes.
+    let rendering = fastframe_text::detect();
     ctx.all_styles_mut(|style| rendering.apply_to_visuals(&mut style.visuals));
     ctx.set_theme(preference);
 }
