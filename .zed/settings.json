@@ -1,0 +1,12 @@
+// Project settings for Zed.
+{
+  "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        // Providers are separate workspaces (built for wasm32-wasip2), so
+        // rust-analyzer has to be told about them.
+        "linkedProjects": ["Cargo.toml", "providers/postgres/Cargo.toml"]
+      }
+    }
+  }
+}
