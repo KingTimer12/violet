@@ -282,8 +282,11 @@ pub fn complete(
     let mut scope = Scope::read(text, statement);
     // The word being typed is no table yet.
     scope.relations.retain(|r| r.at != qualified_start);
+    // Where the whole name goes: `FROM schema.ta|` is still a table slot.
+    let slot = context(text, &before, &scope);
+    let alias_tables = matches!(slot, Context::Relation { alias: true, .. });
     let context = if qualifiers.is_empty() {
-        context(text, &before, &scope)
+        slot
     } else {
         Context::Qualified(qualifiers)
     };
@@ -294,6 +297,7 @@ pub fn complete(
         script: &script,
         scope: &scope,
         cursor: qualified_start,
+        alias_tables,
         items: Vec::new(),
         needs: Vec::new(),
         prefix: &text[start..cursor],
@@ -947,8 +951,11 @@ enum Context {
     /// The start of a statement.
     Start,
     /// A table goes here; after `JOIN`, joins along foreign keys too.
+    /// In `FROM` and `JOIN` (`alias`) the table comes with an alias, as in
+    /// DBeaver.
     Relation {
         join: bool,
+        alias: bool,
     },
     /// Right after a table: an alias or the next clause.
     AfterRelation,
@@ -994,10 +1001,24 @@ fn context(text: &str, before: &[&Token], scope: &Scope) -> Context {
         return Context::Type;
     }
     match word(text, last).as_deref() {
-        Some("FROM" | "UPDATE" | "INTO" | "TABLE" | "TRUNCATE" | "ONLY") => {
-            return Context::Relation { join: false };
+        Some("FROM") => {
+            return Context::Relation {
+                join: false,
+                alias: true,
+            };
         }
-        Some("JOIN") => return Context::Relation { join: true },
+        Some("UPDATE" | "INTO" | "TABLE" | "TRUNCATE" | "ONLY") => {
+            return Context::Relation {
+                join: false,
+                alias: false,
+            };
+        }
+        Some("JOIN") => {
+            return Context::Relation {
+                join: true,
+                alias: true,
+            };
+        }
         Some("ON") => return Context::JoinOn,
         _ => {}
     }
@@ -1030,7 +1051,10 @@ fn context(text: &str, before: &[&Token], scope: &Scope) -> Context {
         Some("FROM" | "JOIN" | "UPDATE" | "INTO" | "TABLE")
     );
     if is(text, last, ",") && clause.as_deref() == Some("FROM") {
-        return Context::Relation { join: false };
+        return Context::Relation {
+            join: false,
+            alias: true,
+        };
     }
     if after_relation && (name(text, last).is_some() || is(text, last, ")")) {
         // `FROM t a` then a new word is the next clause; so is a word after
@@ -1063,6 +1087,8 @@ struct Builder<'a> {
     scope: &'a Scope,
     /// Where the qualified word starts.
     cursor: usize,
+    /// Tables are inserted with an alias: `usuarios u`.
+    alias_tables: bool,
     items: Vec<Item>,
     needs: Vec<Need>,
     prefix: &'a str,
@@ -1072,7 +1098,7 @@ impl<'a> Builder<'a> {
     fn fill(&mut self, context: &Context) {
         match context {
             Context::Start => self.keywords(STARTS),
-            Context::Relation { join } => {
+            Context::Relation { join, .. } => {
                 if *join {
                     self.joins();
                 }
@@ -1297,9 +1323,10 @@ impl<'a> Builder<'a> {
                 Some(schema) => format!("{}.{}", self.ident(schema), self.ident(&created.name)),
                 None => self.ident(&created.name),
             };
+            let (label, insert) = self.aliased(created.name.clone(), insert, &created.name);
             self.push_keyed(
                 kind,
-                created.name.clone(),
+                label,
                 insert,
                 "in script".to_owned(),
                 created.name.clone(),
@@ -1310,7 +1337,8 @@ impl<'a> Builder<'a> {
             for object in self.objects(schema).unwrap_or_default().to_vec() {
                 if let Some(kind) = relation_kind(object.kind) {
                     let insert = self.ident(&object.name);
-                    self.push(kind, object.name, insert, schema.clone());
+                    let (label, insert) = self.aliased(object.name.clone(), insert, &object.name);
+                    self.push_keyed(kind, label, insert, schema.clone(), object.name);
                 }
             }
         }
@@ -1325,6 +1353,7 @@ impl<'a> Builder<'a> {
                         let insert =
                             format!("{}.{}", self.ident(&schema), self.ident(&object.name));
                         let label = format!("{schema}.{}", object.name);
+                        let (label, insert) = self.aliased(label, insert, &object.name);
                         self.push_keyed(kind, label, insert, schema.clone(), object.name);
                     }
                 }
@@ -1334,6 +1363,23 @@ impl<'a> Builder<'a> {
             let insert = self.ident(&schema);
             self.push(Kind::Schema, schema, insert, "schema".to_owned());
         }
+    }
+
+    /// A table's label and text with an alias after it, when the slot
+    /// takes one: `usuarios` as `usuarios u`, avoiding the statement's other
+    /// aliases.
+    fn aliased(&self, label: String, insert: String, table: &str) -> (String, String) {
+        if !self.alias_tables {
+            return (label, insert);
+        }
+        let taken: Vec<String> = self
+            .scope
+            .relations
+            .iter()
+            .map(|r| r.handle().to_lowercase())
+            .collect();
+        let alias = short_alias(table, &taken);
+        (format!("{label} {alias}"), format!("{insert} {alias}"))
     }
 
     fn expression(&mut self) {
@@ -1415,6 +1461,10 @@ impl<'a> Builder<'a> {
                     self.columns_of(&relation, None);
                 } else if let Some(schema) = self.schema_named(handle) {
                     for object in self.objects(&schema).unwrap_or_default().to_vec() {
+                        // Sequences are read through functions, not by name.
+                        if object.kind == ObjectKind::Sequence {
+                            continue;
+                        }
                         let kind = relation_kind(object.kind).unwrap_or(Kind::Function);
                         let (label, insert) = if kind == Kind::Function {
                             (
@@ -1422,7 +1472,8 @@ impl<'a> Builder<'a> {
                                 format!("{}()", self.ident(&object.name)),
                             )
                         } else {
-                            (object.name.clone(), self.ident(&object.name))
+                            let insert = self.ident(&object.name);
+                            self.aliased(object.name.clone(), insert, &object.name)
                         };
                         self.push_keyed(
                             kind,
@@ -1913,7 +1964,9 @@ mod tests {
     fn tables_follow_from_and_columns_follow_select() {
         let shop = shop();
         let tables = at(&shop, "SELECT * FROM ord|");
-        assert_eq!(inserts(&tables)[..2], ["orders", "order_items"]);
+        assert_eq!(inserts(&tables)[..2], ["orders o", "order_items oi"]);
+        // No alias where SQL takes none.
+        assert_eq!(inserts(&at(&shop, "INSERT INTO ord|"))[0], "orders");
         assert_eq!(tables.prefix, "ord");
 
         let columns = at(&shop, "SELECT na| FROM customers");
@@ -1940,11 +1993,22 @@ mod tests {
         let alias = at(&shop, "SELECT o.| FROM orders o");
         assert_eq!(inserts(&alias), ["id", "customer_id", "total"]);
         let schema = at(&shop, "SELECT * FROM sales.|");
-        assert_eq!(inserts(&schema), ["targets"]);
+        assert_eq!(inserts(&schema), ["targets t"]);
+        // As in DBeaver: the alias comes with the table, and works at once.
+        let joined = at(
+            &shop,
+            "SELECT * FROM \"public\".\"orders\" t JOIN sales.tar|",
+        );
+        assert_eq!(inserts(&joined), ["targets t2"]);
+        let alias = at(
+            &shop,
+            "SELECT * FROM \"public\".\"customers\" c JOIN sales.targets t ON t.customer_id = c.id\nWHERE c.|",
+        );
+        assert_eq!(inserts(&alias), ["id", "name", "country"]);
         let full = at(&shop, "SELECT public.customers.na| FROM public.customers");
         assert_eq!(inserts(&full), ["name"]);
         // Other schemas' tables come qualified.
-        assert!(inserts(&at(&shop, "SELECT * FROM targ|")).contains(&"sales.targets"));
+        assert!(inserts(&at(&shop, "SELECT * FROM targ|")).contains(&"sales.targets t"));
     }
 
     #[test]
@@ -1998,7 +2062,7 @@ mod tests {
             &shop,
             "CREATE VIEW recent AS SELECT id FROM orders;\nSELECT * FROM rec|",
         );
-        assert_eq!(inserts(&tables)[0], "recent");
+        assert_eq!(inserts(&tables)[0], "recent r");
     }
 
     #[test]
@@ -2062,7 +2126,7 @@ mod tests {
             .push(object("Order Log", ObjectKind::Table));
         let found = at(&shop, "SELECT * FROM log|");
         assert!(
-            inserts(&found).contains(&"\"Order Log\""),
+            inserts(&found).contains(&"\"Order Log\" ol"),
             "{:?}",
             inserts(&found)
         );

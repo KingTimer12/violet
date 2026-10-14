@@ -93,6 +93,8 @@ offers depends on where the cursor is:
 
 - after `FROM`, `JOIN`, `UPDATE`, `INTO`: tables and views (unqualified
   from the search path, `schema.table` from the others), CTEs and schemas;
+  in `FROM` and `JOIN` a table comes with an alias, as in DBeaver
+  (`seguranca.usuarios u`), and `u.` lists its columns right away;
 - after `JOIN`, whole joins along foreign keys first:
   `orders o ON o.customer_id = c.id`; after `ON`, the conditions alone;
 - in `SELECT`, `WHERE`, `ORDER BY`...: the columns of the tables the
