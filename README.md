@@ -206,6 +206,12 @@ themselves. So:
   off);
 - programs start directly, without a shell.
 
+These checks catch mistakes and the obvious tricks (pipes, `\!` and other
+`psql` meta-commands), but a provider you allowed can still build a
+harmful command from the programs it declared, such as one that connects
+somewhere else with the password. Allowing a provider means trusting it
+like any program you install; read the command before you start.
+
 Plain SQL restores run in `psql`, which also runs meta-commands written in
 the file (including `\!`, a shell command): only restore files you trust.
 

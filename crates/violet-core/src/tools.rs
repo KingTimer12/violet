@@ -469,29 +469,40 @@ impl ToolCommand {
 /// through pipes: `psql`'s `\!`, `\o |cmd`, `\copy ... program`,
 /// `--output=|cmd`, and the like in other clients.
 fn runs_commands(arg: &str) -> bool {
-    const META: &[&str] = &["o", "g", "w", "i", "ir", "copy", "setenv", "gexec", "out"];
+    const META: &[&str] = &[
+        "o", "g", "w", "i", "ir", "copy", "setenv", "gexec", "out", "gx", "gset", "cd", "e",
+        "edit", "ef", "ev", "include", "write",
+    ];
     let lower = arg.to_ascii_lowercase();
+    // No client option needs a pipe, so none may carry one.
+    if lower.contains('|') || lower.contains("\\!") || lower.contains("program ") {
+        return true;
+    }
+    if lower
+        .split(|c: char| c == '=' || c.is_whitespace())
+        .any(|word| word == "system")
+    {
+        return true;
+    }
+    // Backslash meta-commands anywhere, except inside a Windows path: an
+    // argument with a drive (`C:\`) is a path, and paths go through the
+    // request's path, which the user chose.
     let value = lower.split_once('=').map_or(lower.as_str(), |(_, v)| v);
-    if lower.starts_with('|') || value.trim_start().starts_with('|') || lower.contains("\\!") {
-        return true;
-    }
-    if lower.contains("program '") || value.trim_start().starts_with("system ") {
-        return true;
-    }
-    // A meta-command is a backslash word at the start or after a space or
-    // `=`, then a space or the end: `\o |sh`, `\copy t to ...`. Windows
-    // paths (`C:\Users\insert.sql`) have letters after the word.
-    lower.match_indices('\\').any(|(at, _)| {
-        let before = lower[..at].chars().next_back();
-        let word: String = lower[at + 1..]
-            .chars()
-            .take_while(char::is_ascii_alphabetic)
-            .collect();
-        let after = lower[at + 1 + word.len()..].chars().next();
-        before.is_none_or(|c| c.is_whitespace() || c == '=')
-            && META.contains(&word.as_str())
-            && after.is_none_or(|c| c.is_whitespace() || c == '|')
-    })
+    let bytes = value.as_bytes();
+    let windows_path = bytes.len() > 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes[2] == b'\\'
+        && !value.contains(char::is_whitespace)
+        && !value.contains(';');
+    !windows_path
+        && lower.match_indices('\\').any(|(at, _)| {
+            let word: String = lower[at + 1..]
+                .chars()
+                .take_while(char::is_ascii_alphabetic)
+                .collect();
+            META.contains(&word.as_str())
+        })
 }
 
 fn invalid(message: String) -> DbError {
@@ -737,6 +748,11 @@ mod tests {
             "|curl x",
             "-c \\copy t to program 'sh'",
             "--command=\\o |sh",
+            "-o|sh",
+            "--command=x;\\o\tfile",
+            "--command=\\gexec",
+            "--execute=system rm -rf ~",
+            "--command=C:\\ \\gexec",
         ] {
             command.args = vec![arg.into()];
             assert!(command.check(&task).is_err(), "{arg}");
