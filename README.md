@@ -6,6 +6,23 @@ Databases come as **providers**: WebAssembly components Violet downloads
 the first time a connection needs one, and runs in a sandbox. PostgreSQL is
 the first; anyone can write another with the [SDK](crates/violet-sdk).
 
+## Compared with DBeaver
+
+| | Violet 0.1.0 | DBeaver 26.0.3 |
+| --- | --- | --- |
+| Size on disk | 23.7 MB + 0.3 MB PostgreSQL provider | 202 MB |
+| Launch to main window | 166 ms | 3070 ms |
+| Memory when idle (footprint) | 82 MB | 561 MB |
+| CPU when idle | 0.1 % | 2.3 % |
+
+Apple M4, 24 GB, macOS 15.7.3; median of 3 runs, measured on
+2026-10-14 with [`scripts/bench-dbeaver.sh`](scripts/bench-dbeaver.sh).
+Both are measured with no connection open, 15 s after the main window
+shows; DBeaver with its own bundled Java runtime and an existing
+workspace, Violet with an empty one. Memory is macOS's footprint, what
+Activity Monitor shows as "Memory". Run the script to compare on your
+machine.
+
 ## Architecture
 
 ```
