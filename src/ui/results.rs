@@ -2,8 +2,15 @@
 //! the progress of a running query.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
-use egui::{Align, CornerRadius, Layout, RichText, Sense, Stroke, Ui, Vec2};
+use egui::text::{LayoutJob, TextWrapping};
+use egui::{
+    Align, Color32, CornerRadius, Galley, Layout, Pos2, RichText, Sense, Stroke, TextFormat, Ui,
+    Vec2,
+};
 use egui_extras::{Column, TableBuilder};
 use violet_core::{DbError, OrderBy, ResultSet};
 
@@ -19,6 +26,86 @@ use crate::sql;
 const ROW_HEIGHT: f32 = 26.0;
 /// Characters shown per cell; the full value is a click away.
 const CELL_PREVIEW: usize = 300;
+/// Room between a cell's edge and its text.
+const CELL_PADDING: f32 = 6.0;
+/// Laid-out cells kept before the cache starts over.
+const MAX_CACHED_CELLS: usize = 16_384;
+
+/// The grid's cells, laid out once and kept between frames: drawing a
+/// visible cell that has not changed allocates nothing.
+#[derive(Default)]
+pub struct CellCache {
+    cells: HashMap<(usize, usize), (u64, Arc<Galley>)>,
+}
+
+/// What a cell shows.
+#[derive(Clone, Copy, Hash)]
+enum Cell<'a> {
+    Value(&'a str),
+    Null,
+    RowNumber(usize),
+}
+
+impl CellCache {
+    /// `cell` at `key`, laid out to fit `width`. Layouts are reused while
+    /// the text, the width and the scale stay the same, so the cache needs
+    /// no invalidation when results change.
+    fn galley(&mut self, ui: &Ui, key: (usize, usize), cell: Cell<'_>, width: f32) -> Arc<Galley> {
+        let mut hasher = std::hash::DefaultHasher::new();
+        cell.hash(&mut hasher);
+        width.to_bits().hash(&mut hasher);
+        ui.ctx().pixels_per_point().to_bits().hash(&mut hasher);
+        let stamp = hasher.finish();
+        if let Some((cached, galley)) = self.cells.get(&key)
+            && *cached == stamp
+        {
+            return Arc::clone(galley);
+        }
+
+        // The colour is left to the painter, so theme changes reuse it.
+        let mut format = TextFormat::simple(theme::mono(12.5), Color32::PLACEHOLDER);
+        let text = match cell {
+            Cell::Value(text) => preview(text).into_owned(),
+            Cell::Null => {
+                format.font_id = theme::mono(11.5);
+                format.italics = true;
+                "NULL".to_owned()
+            }
+            Cell::RowNumber(row) => {
+                format.font_id = theme::mono(11.0);
+                (row + 1).to_string()
+            }
+        };
+        let mut job = LayoutJob::single_section(text, format);
+        job.wrap = TextWrapping::truncate_at_width(width.max(0.0));
+        let galley = ui.painter().layout_job(job);
+        if self.cells.len() >= MAX_CACHED_CELLS {
+            self.cells.clear();
+        }
+        self.cells.insert(key, (stamp, Arc::clone(&galley)));
+        galley
+    }
+
+    /// Paints `cell` in the cell `ui` stands for, centred vertically.
+    fn paint(
+        &mut self,
+        ui: &Ui,
+        key: (usize, usize),
+        cell: Cell<'_>,
+        right_aligned: bool,
+        color: Color32,
+    ) {
+        let rect = ui.max_rect();
+        let galley = self.galley(ui, key, cell, rect.width() - 2.0 * CELL_PADDING);
+        let x = if right_aligned {
+            rect.right() - CELL_PADDING - galley.size().x
+        } else {
+            rect.left() + CELL_PADDING
+        };
+        let y = rect.center().y - galley.size().y / 2.0;
+        ui.painter().galley(Pos2::new(x, y), galley, color);
+    }
+}
 
 #[hotpath::measure]
 pub fn show(ui: &mut Ui, tab: &mut QueryTab, actions: &mut Vec<Action>) {
@@ -190,7 +277,15 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, actions: &mut Vec<Action>) {
                     TabKind::Data(view) => Some(view.order.as_ref()),
                     TabKind::Script => None,
                 };
-                grid(ui, tab.id, set, sort, &mut tab.selected_cell, actions);
+                grid(
+                    ui,
+                    tab.id,
+                    set,
+                    sort,
+                    &mut tab.selected_cell,
+                    &mut tab.cells,
+                    actions,
+                );
             } else {
                 let affected = set.affected.unwrap_or(0);
                 widgets::empty_state(
@@ -294,6 +389,7 @@ fn grid(
     set: &ResultSet,
     sort: Option<Option<&OrderBy>>,
     selected: &mut Option<(usize, usize)>,
+    cells_cache: &mut CellCache,
     actions: &mut Vec<Action>,
 ) {
     let palette = Palette::current(ui.ctx());
@@ -389,14 +485,13 @@ fn grid(
                         let index = row.index();
                         row.set_selected(selected.is_some_and(|(r, _)| r == index));
                         row.col(|ui| {
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.add_space(6.0);
-                                ui.label(
-                                    RichText::new((index + 1).to_string())
-                                        .font(theme::mono(11.0))
-                                        .color(palette.dim),
-                                );
-                            });
+                            cells_cache.paint(
+                                ui,
+                                (index, usize::MAX),
+                                Cell::RowNumber(index),
+                                true,
+                                palette.dim,
+                            );
                         });
                         let Some(cells) = set.rows.row(index) else {
                             return;
@@ -414,38 +509,11 @@ fn grid(
                                         egui::StrokeKind::Inside,
                                     );
                                 }
-                                ui.add_space(6.0);
-                                let layout = if meta.numeric {
-                                    Layout::right_to_left(Align::Center)
-                                } else {
-                                    Layout::left_to_right(Align::Center)
+                                let (cell, color) = match value {
+                                    None => (Cell::Null, palette.dim),
+                                    Some(text) => (Cell::Value(text), palette.text),
                                 };
-                                ui.with_layout(layout, |ui| {
-                                    if meta.numeric {
-                                        ui.add_space(6.0);
-                                    }
-                                    match value {
-                                        None => {
-                                            ui.label(
-                                                RichText::new("NULL")
-                                                    .font(theme::mono(11.5))
-                                                    .italics()
-                                                    .color(palette.dim),
-                                            );
-                                        }
-                                        Some(text) => {
-                                            ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(preview(text))
-                                                        .font(theme::mono(12.5))
-                                                        .color(palette.text),
-                                                )
-                                                .truncate()
-                                                .selectable(false),
-                                            );
-                                        }
-                                    }
-                                });
+                                cells_cache.paint(ui, (index, column), cell, meta.numeric, color);
                             });
                             let response = response.interact(Sense::click());
                             if response.clicked() {

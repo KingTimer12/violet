@@ -7,6 +7,7 @@ use violet_app::{ExecOptions, RequestId};
 use violet_core::{ConnectionId, DbError, OrderBy, QueryOutput};
 
 use super::editor::Highlighter;
+use super::results::CellCache;
 
 pub type TabId = u64;
 
@@ -122,6 +123,7 @@ pub struct QueryTab {
     /// The last run, for refreshing it.
     pub last_run: Option<(Executed, ExecOptions)>,
     pub highlighter: Highlighter,
+    pub cells: CellCache,
 }
 
 impl QueryTab {
@@ -185,6 +187,7 @@ impl Workspace {
             paging: None,
             last_run: None,
             highlighter: Highlighter::default(),
+            cells: CellCache::default(),
         });
         self.active = Some(id);
         id
