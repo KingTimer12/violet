@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Violet
+GenericName=Database Client
+Comment=A modern, fast database client
+Exec=violet
+Icon=violet
+Terminal=false
+Categories=Development;Database;
+Keywords=database;sql;postgresql;
+StartupWMClass=dev.violet.Violet

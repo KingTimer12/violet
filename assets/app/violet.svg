@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- The title bar's logo (assets/icons/logo.svg on the accent), on the
+       macOS icon grid: an 824 px rounded square with room for the shadow. -->
+  <defs>
+    <linearGradient id="fill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9D74F8"/>
+      <stop offset="1" stop-color="#7C3AED"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#fill)"/>
+  <g transform="translate(280 280) scale(19.333)" fill="none" stroke="#ffffff"
+     stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M4 4l8 16 8-16"/><path d="M8.5 4 12 11l3.5-7"/>
+  </g>
+</svg>

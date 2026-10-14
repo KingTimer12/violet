@@ -155,17 +155,25 @@ cargo run --release
 
 ### Releases
 
-`.github/workflows/release.yml` builds the Windows app and the providers.
-Push a tag to publish both as a GitHub release:
+`.github/workflows/release.yml` builds Violet for every platform, and the
+providers. Push a tag to publish them as a GitHub release:
 
 ```sh
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
-The release carries `violet-<tag>-windows-x64.zip` (with its SHA-256) and,
-at its top level, `providers.json` and each provider's `.wasm`, where
-Violet's default catalogue URL finds them. Running the workflow by hand
-builds the same files as artifacts without publishing.
+| Platform | File | Install |
+| --- | --- | --- |
+| Windows x64 | `violet-<tag>-windows-x64.zip` | Unzip and run `violet.exe` |
+| macOS 11+ (Apple silicon and Intel) | `violet-<tag>-macos-universal.dmg` | Drag Violet to Applications; the first time, right click it > Open (the app is not notarized) |
+| Linux x86_64 / aarch64 | `violet-<tag>-linux-<arch>.tar.gz` | Unpack and run `./install.sh` (to `~/.local`), or `./violet` in place |
+
+Each comes with its SHA-256 (`.sha256`). At the release's top level sit
+`providers.json` and each provider's `.wasm`, where Violet's default
+catalogue URL finds them. Running the workflow by hand builds the same
+files as artifacts without publishing. The packages are made by
+`scripts/package-{macos,linux}.sh`, which work the same locally; the app
+icons come from `assets/app/violet.svg` (`scripts/app-icons.sh`).
 
 | Shortcut | Action |
 | --- | --- |
