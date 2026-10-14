@@ -148,6 +148,56 @@ latest GitHub release by default), or point Violet at the catalogue:
 VIOLET_PROVIDER_INDEX=$PWD/dist/providers.json cargo run
 ```
 
+## Backup and restore
+
+A provider may also describe backups and restores run by the database's
+own client programs (`pg_dump`, `mysqldump`...). It cannot start programs
+itself: it returns [`tools::Task`]s, with their settings, and turns the
+settings the user chose into a [`tools::ToolCommand`]. Violet finds the
+program, asks the user once whether the provider may run programs, shows
+each command in full and runs it, with the password in the variable the
+command names.
+
+```rust
+use violet_sdk::tools::{Field, Request, Target, Task, TaskKind, ToolCommand};
+
+impl Provider for Lite {
+    // ...
+    fn tasks() -> Vec<Task> {
+        vec![
+            Task::new(TaskKind::Backup, &["litedump"])
+                .locations(&["/opt/lite/*/bin"])
+                .with_objects()
+                .field(Field::choice("format", "Format", "Output", "sql", &[
+                    ("sql", "SQL script"),
+                    ("bin", "Binary"),
+                ]))
+                .field(Field::flag("data", "Include data", "Content", true))
+                .target(Target::file("sql").when("format", &["sql"]))
+                .target(Target::file("lite")),
+        ]
+    }
+
+    fn command(kind: TaskKind, request: Request) -> Result<ToolCommand> {
+        Ok(ToolCommand::new("litedump")
+            .arg(format!("--host={}", request.params.host))
+            .arg_if(!request.flag("data"), "--no-data")
+            .arg(format!("--out={}", request.path))
+            .password_env("LITE_PASSWORD"))
+    }
+
+    fn inspect(head: &[u8], _entries: &[String], _directory: bool) -> Vec<(String, String)> {
+        let format = if head.starts_with(b"LITE") { "bin" } else { "sql" };
+        vec![("format".into(), format.into())]
+    }
+}
+```
+
+Violet refuses tasks and commands that name undeclared programs, shells,
+interpreters or launchers, set variables that change what runs (`PATH`,
+`LD_*`, `*FILE`...), or are oversized. Providers built before this
+interface still load, without backup and restore.
+
 ## The contract
 
 The interface is [`wit/provider.wit`](wit/provider.wit), a WebAssembly

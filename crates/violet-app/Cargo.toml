@@ -10,7 +10,7 @@ license.workspace = true
 violet-core.workspace = true
 hotpath.workspace = true
 log.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["process", "io-util", "fs"] }
 
 [dev-dependencies]
 async-trait.workspace = true

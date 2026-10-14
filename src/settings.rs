@@ -1,5 +1,7 @@
 //! Interface preferences kept between runs.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +42,16 @@ pub struct Settings {
     pub sidebar_width: f32,
     /// How much of an editor tab the results take, from 0 to 1.
     pub results_share: f32,
+    /// Providers the user let run their client programs, by id.
+    pub trusted_tools: BTreeSet<String>,
+    /// The folder with each provider's client programs, when picked.
+    pub client_folders: BTreeMap<String, String>,
+    /// The settings each backup and restore last ran with, by
+    /// `provider/task`.
+    pub task_settings: BTreeMap<String, BTreeMap<String, String>>,
+    /// Where backups went last, and how they were named.
+    pub backup_folder: String,
+    pub backup_name: String,
 }
 
 impl Default for Settings {
@@ -49,6 +61,11 @@ impl Default for Settings {
             sidebar: true,
             sidebar_width: 280.0,
             results_share: 0.5,
+            trusted_tools: BTreeSet::new(),
+            client_folders: BTreeMap::new(),
+            task_settings: BTreeMap::new(),
+            backup_folder: String::new(),
+            backup_name: String::new(),
         }
     }
 }

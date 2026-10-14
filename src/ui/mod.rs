@@ -16,20 +16,23 @@ mod results;
 mod shortcuts;
 mod sidebar;
 mod state;
+mod task_flow;
+mod tasks;
 pub mod theme;
 mod toasts;
 mod widgets;
 mod workspace;
 
+use std::collections::HashMap;
 use std::hash::{Hash as _, Hasher as _};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use egui::{Frame, Id, Panel, Stroke};
-use violet_app::{Backend, CachePolicy, Event, ExecOptions, ProfileService};
+use violet_app::{Backend, CachePolicy, Event, ExecOptions, ProfileService, TaskId};
 use violet_core::ports::{HistoryEntry, QueryHistory};
-use violet_core::{ConnectionId, ErrorKind, Page};
+use violet_core::{ConnectionId, DriverId, ErrorKind, Page, Task};
 use violet_storage::JsonFile;
 
 use crate::completion::{self, Need};
@@ -99,6 +102,11 @@ pub struct VioletApp {
     session_checked: Instant,
     /// Panel sizes measured this frame.
     layout: Layout,
+    /// Each driver's backups and restores, once asked for.
+    tasks: HashMap<DriverId, Loadable<Vec<Task>>>,
+    task_dialog: Option<tasks::TaskDialog>,
+    /// Backups and restores still running.
+    started: HashMap<TaskId, task_flow::Started>,
     #[cfg(debug_assertions)]
     snapshot: Option<devtools::Snapshot>,
 }
@@ -134,6 +142,9 @@ impl VioletApp {
             session_saved: 0,
             session_checked: Instant::now(),
             layout: Layout::default(),
+            tasks: HashMap::new(),
+            task_dialog: None,
+            started: HashMap::new(),
             #[cfg(debug_assertions)]
             snapshot: devtools::Snapshot::from_env(),
         };
@@ -583,6 +594,12 @@ impl VioletApp {
                 }
                 self.load_providers();
             }
+            event @ (Event::Tasks { .. }
+            | Event::ProgramsFound { .. }
+            | Event::TaskPreview { .. }
+            | Event::InputInspected { .. }
+            | Event::TaskOutput { .. }
+            | Event::TaskFinished { .. }) => self.task_event(ctx, event),
             Event::TestFinished { request, result } => {
                 if let Some(form) = &mut self.form
                     && matches!(form.test, TestState::Running(r) if r == request)
@@ -1163,6 +1180,16 @@ impl VioletApp {
                 ),
             },
             Action::InsertSql(text) => self.insert_sql(ctx, &text),
+            action @ (Action::OpenTask { .. }
+            | Action::TrustTools(_)
+            | Action::TaskFindPrograms
+            | Action::TaskPreview
+            | Action::TaskInspect(_)
+            | Action::TaskStart
+            | Action::TaskCancel
+            | Action::TaskAgain
+            | Action::TaskClose
+            | Action::Reveal(_)) => self.task_action(ctx, action),
         }
     }
 
@@ -1198,7 +1225,8 @@ impl VioletApp {
         let modal_open = self.form.is_some()
             || self.prompt.is_some()
             || self.confirm_delete.is_some()
-            || self.history_view.is_some();
+            || self.history_view.is_some()
+            || self.task_dialog.is_some();
         if modal_open {
             return;
         }
@@ -1379,6 +1407,7 @@ impl VioletApp {
                 self.history_view = None;
             }
         }
+        self.task_modal(ctx);
         if let Some(id) = self.confirm_delete {
             let name = self.profile_name(id);
             match connection_form::confirm_delete(ctx, &name) {

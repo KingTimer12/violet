@@ -108,6 +108,41 @@ const DENIED_ENV: &[&str] = &[
 /// Prefixes of denied environment variables.
 const DENIED_ENV_PREFIXES: &[&str] = &["LD_", "DYLD_", "MALLOC", "GCONV", "LOCPATH"];
 
+/// Parts of variable names that point programs at files, folders or code
+/// to load (`PGPASSFILE`, `PGSERVICEFILE`, `PGSSLKEY`, `JAVA_OPTIONS`...).
+const DENIED_ENV_PARTS: &[&str] = &[
+    "FILE", "PATH", "DIR", "LIB", "HOME", "PRELOAD", "RC", "KEY", "CERT", "CRL", "EDITOR", "PAGER",
+    "SHELL", "OPT", "PLUGIN", "MODULE", "SCRIPT", "EXEC", "CMD", "COMMAND", "HOOK", "SERVICE",
+    "CONF",
+];
+
+/// Program names starting with these are interpreters whatever their
+/// version suffix (`python3.12`, `perl5.30`, `node20`).
+const DENIED_PROGRAM_PREFIXES: &[&str] = &[
+    "python",
+    "perl",
+    "ruby",
+    "node",
+    "php",
+    "lua",
+    "pwsh",
+    "powershell",
+    "bash",
+    "zsh",
+    "java",
+    "osascript",
+    "wscript",
+    "cscript",
+    "tcl",
+    "wish",
+    "guile",
+    "racket",
+    "irb",
+    "jshell",
+    "busybox",
+    "toybox",
+];
+
 /// How much of a file [`crate::Driver::inspect_input`] is shown.
 pub const INSPECT_HEAD: usize = 4096;
 /// How many of a folder's entries it is shown.
@@ -448,6 +483,9 @@ pub fn program_name_ok(name: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'+'))
         && !DENIED_PROGRAMS.contains(&stem.as_str())
+        && !DENIED_PROGRAM_PREFIXES
+            .iter()
+            .any(|prefix| stem.starts_with(prefix))
 }
 
 /// An absolute folder without `..`, with at most one `*`, standing for
@@ -477,6 +515,9 @@ fn env_name_ok(name: &str) -> bool {
         && !DENIED_ENV_PREFIXES
             .iter()
             .any(|prefix| upper.starts_with(prefix))
+        && !upper
+            .split('_')
+            .any(|word| DENIED_ENV_PARTS.iter().any(|part| word.contains(part)))
 }
 
 /// A schema, or a relation in one.
@@ -604,6 +645,10 @@ mod tests {
         assert!(bad.check().is_err());
         bad.programs = vec!["PowerShell.exe".into()];
         assert!(bad.check().is_err());
+        for interpreter in ["python3.12", "perl5.30", "node20", "busybox"] {
+            bad.programs = vec![interpreter.into()];
+            assert!(bad.check().is_err(), "{interpreter}");
+        }
 
         let mut bad = task();
         bad.locations = vec!["relative/bin".into()];

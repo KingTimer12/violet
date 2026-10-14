@@ -61,6 +61,7 @@ serde.workspace = true
 zeroize.workspace = true
 # Local times in the query history. Already in the tree via fastframe-log.
 jiff = "0.2"
+rfd = "0.17"
 # Debug-only screenshots (src/ui/devtools.rs). Already in the tree via arboard.
 image = { version = "0.25", default-features = false, features = ["png"] }
 

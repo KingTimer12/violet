@@ -57,6 +57,10 @@ fastframe_icons::icons! {
         Lock => lucide "lock",
         Clock => lucide "clock",
         PanelLeft => lucide "panel-left",
+        Archive => "archive",
+        ArchiveRestore => "archive-restore",
+        FolderOpen => "folder-open",
+        ShieldAlert => "shield-alert",
     }
 }
 

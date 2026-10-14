@@ -2,7 +2,7 @@
 //! columns, loaded as they are expanded.
 
 use egui::{Align2, Color32, CornerRadius, Response, Sense, Ui, Vec2};
-use violet_core::{ConnectionProfile, DbObject, ObjectKind};
+use violet_core::{ConnectionProfile, DbObject, ObjectKind, ObjectRef, TaskKind};
 
 use super::action::Action;
 use super::icons::Icon;
@@ -304,6 +304,21 @@ fn connection(
             actions.push(Action::Connect(id));
         }
         ui.separator();
+        if menu_item(ui, Icon::Archive, "Backup…") {
+            actions.push(Action::OpenTask {
+                connection: id,
+                kind: TaskKind::Backup,
+                objects: Vec::new(),
+            });
+        }
+        if menu_item(ui, Icon::ArchiveRestore, "Restore…") {
+            actions.push(Action::OpenTask {
+                connection: id,
+                kind: TaskKind::Restore,
+                objects: Vec::new(),
+            });
+        }
+        ui.separator();
         if menu_item(ui, Icon::Pencil, "Edit connection…") {
             actions.push(Action::EditConnection(id));
         }
@@ -378,6 +393,24 @@ fn schema_node(
         }
         if menu_item(ui, Icon::Copy, "Copy name") {
             actions.push(Action::Copy(schema.to_owned()));
+        }
+        ui.separator();
+        if menu_item(ui, Icon::Archive, "Backup schema…") {
+            actions.push(Action::OpenTask {
+                connection: id,
+                kind: TaskKind::Backup,
+                objects: vec![ObjectRef {
+                    schema: schema.to_owned(),
+                    name: None,
+                }],
+            });
+        }
+        if menu_item(ui, Icon::ArchiveRestore, "Restore…") {
+            actions.push(Action::OpenTask {
+                connection: id,
+                kind: TaskKind::Restore,
+                objects: Vec::new(),
+            });
         }
     });
     if !expanded {
@@ -530,6 +563,19 @@ fn object_node(
                 quote(&object.schema),
                 quote(&object.name)
             )));
+        }
+        if relation {
+            ui.separator();
+            if menu_item(ui, Icon::Archive, "Backup table…") {
+                actions.push(Action::OpenTask {
+                    connection: id,
+                    kind: TaskKind::Backup,
+                    objects: vec![ObjectRef {
+                        schema: object.schema.clone(),
+                        name: Some(object.name.clone()),
+                    }],
+                });
+            }
         }
     });
 

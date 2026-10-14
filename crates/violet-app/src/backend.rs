@@ -1,22 +1,26 @@
 //! Running database work off the interface thread.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use tokio::runtime::Runtime;
+use tokio::sync::watch;
 use violet_core::ports::{
     CacheKey, CachedOutput, ProviderListing, ProviderStore, ResultCache, SecretStore,
 };
 use violet_core::{
     Canceller, ColumnInfo, ConnectionId, ConnectionProfile, Credentials, DbError, DbObject, Driver,
     DriverId, DriverInfo, ErrorKind, ExecLimits, ForeignKey, OrderBy, Page, PageInfo, QueryOutput,
-    Result, ResultSet, Secret, ServerInfo, Session,
+    Result, ResultSet, Secret, ServerInfo, Session, Task, TaskKind, TaskRequest, TaskSettings,
+    ToolCommand,
 };
 
 use crate::registry::DriverRegistry;
+use crate::tasks::{self, Program, TaskSummary};
 
 /// Wakes the interface when events are waiting. The egui app implements it
 /// with `Context::request_repaint`.
@@ -65,6 +69,10 @@ impl ExecOptions {
 /// cancel it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RequestId(u64);
+
+/// Identifies one running backup or restore.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TaskId(u64);
 
 /// What the backend reports.
 #[derive(Debug)]
@@ -128,10 +136,41 @@ pub enum Event {
         id: DriverId,
         result: Result<()>,
     },
+    /// The backups and restores a driver offers.
+    Tasks {
+        driver: DriverId,
+        result: Result<Vec<Task>>,
+    },
+    /// Where a task's programs are on this machine.
+    ProgramsFound {
+        driver: DriverId,
+        kind: TaskKind,
+        programs: Vec<Program>,
+    },
+    /// The command a task would run, to show before it does.
+    TaskPreview {
+        request: RequestId,
+        result: Result<(PathBuf, ToolCommand)>,
+    },
+    /// Settings that suit restoring from a path.
+    InputInspected {
+        path: PathBuf,
+        result: Result<TaskSettings>,
+    },
+    /// Lines a running task's program printed.
+    TaskOutput {
+        task: TaskId,
+        lines: Vec<String>,
+    },
+    TaskFinished {
+        task: TaskId,
+        result: Result<TaskSummary>,
+    },
 }
 
 type Sessions = HashMap<ConnectionId, Arc<dyn Session>>;
 type Running = HashMap<RequestId, Arc<dyn Canceller>>;
+type RunningTasks = HashMap<TaskId, watch::Sender<bool>>;
 
 /// Shared between the backend handle and the tasks it spawns.
 struct Shared {
@@ -141,6 +180,7 @@ struct Shared {
     cache: Arc<dyn ResultCache>,
     sessions: Mutex<Sessions>,
     running: Mutex<Running>,
+    tasks: Mutex<RunningTasks>,
     events: Mutex<Sender<Event>>,
     notify: Box<dyn Notify>,
 }
@@ -152,6 +192,47 @@ impl Shared {
 
     fn running(&self) -> MutexGuard<'_, Running> {
         self.running.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn tasks(&self) -> MutexGuard<'_, RunningTasks> {
+        self.tasks.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The driver's task of `kind`.
+    async fn task(&self, driver: &Arc<dyn Driver>, kind: TaskKind) -> Result<Task> {
+        driver
+            .tasks()
+            .await?
+            .into_iter()
+            .find(|task| task.kind == kind)
+            .ok_or_else(|| DbError::unsupported(format!("No {kind} for this database")))
+    }
+
+    /// The program and command for `request`, checked and found.
+    async fn task_command(
+        &self,
+        profile: &ConnectionProfile,
+        request: &TaskRequest,
+        folder: Option<&Path>,
+    ) -> Result<(PathBuf, ToolCommand)> {
+        let driver = self.driver(&profile.driver).await?;
+        let task = self.task(&driver, request.kind).await?;
+        let mut request = request.clone();
+        request.settings = task.normalize(&request.settings);
+        let command = driver.task_command(profile, &request).await?;
+        command.check(&task)?;
+        let folders = tasks::search_folders(&task, folder);
+        let program = tasks::find(&command.program, &folders).ok_or_else(|| {
+            DbError::new(
+                ErrorKind::Other,
+                format!(
+                    "{} was not found. Install the database's client tools, or pick the \
+                     folder they are in.",
+                    command.program
+                ),
+            )
+        })?;
+        Ok((program, command))
     }
 
     fn session(&self, id: ConnectionId) -> Result<Arc<dyn Session>> {
@@ -385,6 +466,7 @@ impl Backend {
                 cache,
                 sessions: Mutex::default(),
                 running: Mutex::default(),
+                tasks: Mutex::default(),
                 events: Mutex::new(sender),
                 notify: Box::new(notify),
             }),
@@ -438,6 +520,155 @@ impl Backend {
 
     fn request(&self) -> RequestId {
         RequestId(self.next_request.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Asks a driver for its backup and restore tasks, installing its
+    /// provider if needed.
+    pub fn load_tasks(&self, driver: DriverId) {
+        let shared = Arc::clone(&self.shared);
+        self.runtime.spawn(async move {
+            let result = async { shared.driver(&driver).await?.tasks().await }.await;
+            shared.emit(Event::Tasks { driver, result });
+        });
+    }
+
+    /// Looks for a task's programs, in `folder` first.
+    pub fn find_programs(&self, driver: DriverId, task: Task, folder: Option<PathBuf>) {
+        let shared = Arc::clone(&self.shared);
+        self.runtime.spawn(async move {
+            let programs = tasks::locate(&task, folder.as_deref()).await;
+            shared.emit(Event::ProgramsFound {
+                driver,
+                kind: task.kind,
+                programs,
+            });
+        });
+    }
+
+    /// Builds the command a task would run, without running it.
+    pub fn preview_task(
+        &self,
+        profile: ConnectionProfile,
+        request: TaskRequest,
+        folder: Option<PathBuf>,
+    ) -> RequestId {
+        let id = self.request();
+        let shared = Arc::clone(&self.shared);
+        self.runtime.spawn(async move {
+            let result = shared
+                .task_command(&profile, &request, folder.as_deref())
+                .await;
+            shared.emit(Event::TaskPreview {
+                request: id,
+                result,
+            });
+        });
+        id
+    }
+
+    /// Reads the start of a file (or a folder's names) for the driver to
+    /// suggest restore settings.
+    pub fn inspect_input(&self, driver: DriverId, path: PathBuf) {
+        let shared = Arc::clone(&self.shared);
+        self.runtime.spawn(async move {
+            let result = async {
+                let peek_path = path.clone();
+                let (head, entries, directory) =
+                    tokio::task::spawn_blocking(move || tasks::peek(&peek_path))
+                        .await
+                        .map_err(|error| DbError::new(ErrorKind::Other, error.to_string()))?
+                        .map_err(|error| DbError::new(ErrorKind::Other, error.to_string()))?;
+                shared
+                    .driver(&driver)
+                    .await?
+                    .inspect_input(&head, &entries, directory)
+                    .await
+            }
+            .await;
+            shared.emit(Event::InputInspected { path, result });
+        });
+    }
+
+    /// Runs a backup or restore. The password is the one typed, else the
+    /// keychain's; it reaches the program only through the variable the
+    /// command names.
+    pub fn run_task(
+        &self,
+        profile: ConnectionProfile,
+        request: TaskRequest,
+        folder: Option<PathBuf>,
+        password: Option<Secret>,
+    ) -> TaskId {
+        let task = TaskId(self.next_request.fetch_add(1, Ordering::Relaxed));
+        let (stop, cancel) = watch::channel(false);
+        self.shared.tasks().insert(task, stop);
+        let shared = Arc::clone(&self.shared);
+        self.runtime.spawn(async move {
+            let result = async {
+                let (program, command) = shared
+                    .task_command(&profile, &request, folder.as_deref())
+                    .await?;
+                let credentials = shared.credentials(&profile, password).await?;
+                let path = PathBuf::from(&request.path);
+                let batch = Arc::new(Mutex::new(Vec::new()));
+                let pending = Arc::clone(&batch);
+                let flush = {
+                    let shared = Arc::clone(&shared);
+                    move |lines: Vec<String>| {
+                        if !lines.is_empty() {
+                            shared.emit(Event::TaskOutput { task, lines });
+                        }
+                    }
+                };
+                // Lines go out in batches, so a chatty program does not
+                // wake the interface for each one.
+                let ticker = {
+                    let batch = Arc::clone(&batch);
+                    let flush = flush.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            let lines = std::mem::take(
+                                &mut *batch.lock().unwrap_or_else(PoisonError::into_inner),
+                            );
+                            flush(lines);
+                        }
+                    })
+                };
+                let outcome = tasks::run(
+                    tasks::Run {
+                        program,
+                        command,
+                        password: credentials.password,
+                        path,
+                    },
+                    cancel,
+                    move |line| {
+                        pending
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push(line);
+                    },
+                )
+                .await;
+                ticker.abort();
+                flush(std::mem::take(
+                    &mut *batch.lock().unwrap_or_else(PoisonError::into_inner),
+                ));
+                outcome
+            }
+            .await;
+            shared.tasks().remove(&task);
+            shared.emit(Event::TaskFinished { task, result });
+        });
+        task
+    }
+
+    /// Stops a running backup or restore.
+    pub fn cancel_task(&self, task: TaskId) {
+        if let Some(stop) = self.shared.tasks().get(&task) {
+            let _ = stop.send(true);
+        }
     }
 
     /// Opens a session for `profile`, replacing one already open.

@@ -13,7 +13,8 @@
 //! (the providers dialog), `complete` (completion at the `|` of
 //! `VIOLET_SCENE_SQL`), `explain` (`EXPLAIN ANALYZE` of a join),
 //! `history` (a run, then the history dialog), `restore` (the editors
-//! saved last time). Add `VIOLET_THEME=light` for the light theme.
+//! saved last time), `task` (the backup or restore dialog: see
+//! [`VioletApp::task_scene`]). Add `VIOLET_THEME=light` for the light theme.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -146,7 +147,8 @@ impl VioletApp {
                 settle && matches!(self.providers.listing, super::providers::Listing::Ready(_))
             }
             (
-                "browse" | "error" | "data" | "menu" | "page" | "complete" | "explain" | "history",
+                "browse" | "error" | "data" | "menu" | "page" | "complete" | "explain" | "history"
+                | "task",
                 0,
             ) => {
                 if let Some(id) = first {
@@ -435,7 +437,148 @@ impl VioletApp {
                 snapshot.step >= 10 && settle
             }
             ("menu", _) => snapshot.step >= 10 && settle,
+            ("task", _) => self.task_scene(snapshot, first),
             _ => settle,
+        }
+    }
+
+    /// The `task` scene, from environment variables:
+    ///
+    /// - `VIOLET_SCENE_TASK`: `backup` (default) or `restore`;
+    /// - `VIOLET_SCENE_PAGE`: `objects`, `settings` or `files`;
+    /// - `VIOLET_SCENE_OBJECTS`: `schema` or `schema.table`, comma separated;
+    /// - `VIOLET_SCENE_FOLDER`, `VIOLET_SCENE_NAME`, `VIOLET_SCENE_INPUT`,
+    ///   `VIOLET_SCENE_CLIENT`: the output folder and name, the file to
+    ///   restore and the client programs' folder;
+    /// - `VIOLET_SCENE_SET`: settings as `id=value`, comma separated;
+    /// - `VIOLET_SCENE_CONSENT`: show the first-use question instead of
+    ///   allowing the provider;
+    /// - `VIOLET_SCENE_RUN`: start the task and capture its end;
+    ///   `VIOLET_SCENE_STOP` stops it after that many milliseconds.
+    fn task_scene(
+        &mut self,
+        snapshot: &mut Snapshot,
+        first: Option<violet_core::ConnectionId>,
+    ) -> bool {
+        use violet_core::{ObjectRef, TaskKind};
+        let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+        let Some(id) = first else { return true };
+        match snapshot.step {
+            1 => {
+                let online = self.explorer.link(id).is_online()
+                    && matches!(
+                        self.explorer.schemas.get(&id),
+                        Some(super::state::Loadable::Ready(_))
+                    );
+                if !online {
+                    return false;
+                }
+                let kind = if env("VIOLET_SCENE_TASK").as_deref() == Some("restore") {
+                    TaskKind::Restore
+                } else {
+                    TaskKind::Backup
+                };
+                let objects: Vec<ObjectRef> = env("VIOLET_SCENE_OBJECTS")
+                    .map(|text| {
+                        text.split(',')
+                            .map(|item| match item.split_once('.') {
+                                Some((schema, name)) => ObjectRef {
+                                    schema: schema.to_owned(),
+                                    name: Some(name.to_owned()),
+                                },
+                                None => ObjectRef {
+                                    schema: item.to_owned(),
+                                    name: None,
+                                },
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if let Some(profile) = self.profiles.get(id)
+                    && env("VIOLET_SCENE_CONSENT").is_none()
+                {
+                    self.settings
+                        .trusted_tools
+                        .insert(profile.driver.to_string());
+                }
+                for object in &objects {
+                    self.actions
+                        .push(Action::LoadObjects(id, object.schema.clone()));
+                }
+                self.open_task(id, kind, objects);
+                if let Some(dialog) = &mut self.task_dialog {
+                    if let Some(folder) = env("VIOLET_SCENE_FOLDER") {
+                        dialog.folder = folder;
+                    }
+                    if let Some(name) = env("VIOLET_SCENE_NAME") {
+                        dialog.name = name;
+                    }
+                    if let Some(input) = env("VIOLET_SCENE_INPUT") {
+                        dialog.input = input;
+                    }
+                    if let Some(client) = env("VIOLET_SCENE_CLIENT") {
+                        dialog.client = client;
+                    }
+                    if let Some(page) = env("VIOLET_SCENE_PAGE") {
+                        dialog.set_page(&page);
+                    }
+                }
+                snapshot.step += 1;
+                false
+            }
+            2 => {
+                // Settings apply once the provider described its tasks.
+                let Some(dialog) = &mut self.task_dialog else {
+                    return true;
+                };
+                if dialog.settings.is_empty() && env("VIOLET_SCENE_CONSENT").is_none() {
+                    return false;
+                }
+                for pair in env("VIOLET_SCENE_SET").unwrap_or_default().split(',') {
+                    if let Some((key, value)) = pair.split_once('=') {
+                        dialog
+                            .settings
+                            .insert(key.trim().into(), value.trim().into());
+                    }
+                }
+                snapshot.step += 1;
+                snapshot.started = Instant::now();
+                false
+            }
+            3 => {
+                let Some(dialog) = &self.task_dialog else {
+                    return true;
+                };
+                let ready = matches!(dialog.preview, Some(Ok(_))) && dialog.programs.is_some();
+                let waited = snapshot.started.elapsed() > Duration::from_millis(2_500);
+                if env("VIOLET_SCENE_RUN").is_some() {
+                    if ready && waited {
+                        self.actions.push(Action::TaskStart);
+                        if dialog.kind == TaskKind::Restore {
+                            // The second click a restore asks for.
+                            self.actions.push(Action::TaskStart);
+                        }
+                        snapshot.step += 1;
+                        snapshot.started = Instant::now();
+                    }
+                    return false;
+                }
+                waited
+            }
+            _ => {
+                let Some(run) = self.task_dialog.as_ref().and_then(|d| d.run.as_ref()) else {
+                    return snapshot.started.elapsed() > Duration::from_secs(2);
+                };
+                if let Some(stop) = env("VIOLET_SCENE_STOP").and_then(|ms| ms.parse().ok())
+                    && run.result.is_none()
+                    && snapshot.started.elapsed() > Duration::from_millis(stop)
+                    && snapshot.step == 4
+                {
+                    self.actions.push(Action::TaskCancel);
+                    snapshot.step += 1;
+                }
+                run.result.is_some() && run.started.elapsed() > Duration::from_millis(300)
+            }
         }
     }
 }

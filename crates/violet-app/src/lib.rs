@@ -11,7 +11,8 @@
 mod backend;
 mod profiles;
 mod registry;
+pub mod tasks;
 
-pub use backend::{Backend, CachePolicy, Event, ExecOptions, Notify, RequestId};
+pub use backend::{Backend, CachePolicy, Event, ExecOptions, Notify, RequestId, TaskId};
 pub use profiles::ProfileService;
 pub use registry::DriverRegistry;

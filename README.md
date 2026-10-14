@@ -146,6 +146,69 @@ Nothing is lost between runs:
   mode `0600`) and reopened on the next start. Like a `.sql` file you
   save, it keeps the text exactly as typed, passwords included.
 
+## Backup and restore
+
+Right-click a connection (**Backup…**, **Restore…**), a schema (**Backup
+schema…**) or a table (**Backup table…**). As in DBeaver, Violet runs the
+database's own client programs; for PostgreSQL, `pg_dump`, `pg_restore`
+and `psql`. Each provider describes its own options, so every database
+brings its own dialog.
+
+PostgreSQL backups offer DBeaver's options and more:
+
+- **Objects**: the whole database, or any mix of schemas and tables, picked
+  from the tree.
+- **Format**: custom, directory (dumped in parallel jobs), tar or plain
+  SQL; compression level; encoding.
+- **Content**: schema and data, schema only or data only; data as `COPY`,
+  `INSERT` or `INSERT` with column names, several rows per `INSERT`, `ON
+  CONFLICT DO NOTHING`; large objects; tables to skip, or to keep without
+  their rows.
+- **Ownership**: discard owners, privileges, tablespaces or comments; `SET
+  SESSION AUTHORIZATION`.
+- **Script** (plain SQL): drop objects first (with `IF EXISTS`), create the
+  database, disable triggers while data loads.
+- **Advanced**: lock wait timeout, a detailed log, extra arguments.
+- **Output**: a folder and a file name with variables (`${database}`,
+  `${connection}`, `${host}`, `${schema}`, `${date}`, `${time}`,
+  `${timestamp}`).
+
+Restores read the backup's format from the file itself and run
+`pg_restore` (archives) or `psql` (plain SQL), into the connection's
+database or another one: drop objects first, create the database, single
+transaction, stop at the first error, parallel jobs, schema or data only,
+discard owners or privileges, run as a role, disable triggers.
+
+While a task runs, its log streams in, with the time taken and the size
+written so far; **Stop** ends it. When it finishes, **Show in folder** opens
+the backup, and a restore refreshes the tree. The options, folders and
+client programs used last are remembered.
+
+Programs are looked for in the folder you pick, then the usual places
+(Homebrew, Postgres.app, EnterpriseDB, `/usr/lib/postgresql/*/bin`,
+`C:\Program Files\PostgreSQL\*\bin`), then `PATH`; their versions are
+shown, with a warning when the client is older than the server.
+
+**What runs, and with what.** Unlike providers, these programs run outside
+the sandbox, as you: they read and write files and connect to the server
+themselves. So:
+
+- the first backup or restore with a provider asks whether it may run its
+  programs at all;
+- a provider may only run the programs it declared, never a shell, an
+  interpreter or a launcher, and may not set variables that change what
+  runs or what it loads (`PATH`, `LD_*`, `DYLD_*`, `*FILE`, `*PATH`...);
+- the full command shows before it starts and can be copied;
+- the password is never on the command line: it goes in the variable the
+  provider names (`PGPASSWORD`), and TLS connections verify the server
+  certificate against the system's roots (`sslmode=verify-full`,
+  `sslrootcert=system`, PostgreSQL 16 clients or later; it can be turned
+  off);
+- programs start directly, without a shell.
+
+Plain SQL restores run in `psql`, which also runs meta-commands written in
+the file (including `\!`, a shell command): only restore files you trust.
+
 ## Browsing data and the result cache
 
 Clicking a table or view in the tree opens its data tab, as in DBeaver

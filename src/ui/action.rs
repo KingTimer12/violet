@@ -1,7 +1,9 @@
 //! What views ask the app to do. Views only read state and return actions;
 //! the app applies them in one place, after drawing.
 
-use violet_core::{ConnectionId, ConnectionProfile, DriverId, Secret};
+use std::path::PathBuf;
+
+use violet_core::{ConnectionId, ConnectionProfile, DriverId, ObjectRef, Secret, TaskKind};
 
 use super::workspace::TabId;
 use crate::completion::Need;
@@ -84,4 +86,22 @@ pub enum Action {
     ClearHistory,
     /// Puts SQL at the active editor's cursor.
     InsertSql(String),
+    /// Opens the backup or restore dialog, with these objects picked.
+    OpenTask {
+        connection: ConnectionId,
+        kind: TaskKind,
+        objects: Vec<ObjectRef>,
+    },
+    /// Lets a provider run its client programs.
+    TrustTools(DriverId),
+    /// The open task dialog's programs, command and input changed.
+    TaskFindPrograms,
+    TaskPreview,
+    TaskInspect(PathBuf),
+    TaskStart,
+    TaskCancel,
+    TaskAgain,
+    TaskClose,
+    /// Shows a file in the system's file manager.
+    Reveal(PathBuf),
 }
