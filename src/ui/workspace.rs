@@ -1,5 +1,6 @@
 //! Open tabs: SQL editors and table data views.
 
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -132,6 +133,15 @@ pub struct QueryTab {
     /// The file the script is saved in, and its text as last read or
     /// written there.
     pub file: Option<ScriptFile>,
+    /// The table the shown rows were read from, when they map back to it.
+    pub source: Option<crate::sql::TableRef>,
+    /// Cells changed in the grid and not written yet, by row and column:
+    /// the new value, `None` for NULL.
+    pub edits: BTreeMap<(usize, usize), Option<String>>,
+    /// A query's rows sorted by a column (index, descending), and the query
+    /// as written, which the sorted one wraps.
+    pub sort: Option<(usize, bool)>,
+    pub unsorted: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -230,6 +240,10 @@ impl Workspace {
             highlighter: Highlighter::default(),
             popup: Popup::default(),
             file: None,
+            source: None,
+            edits: BTreeMap::new(),
+            sort: None,
+            unsorted: None,
         });
         self.active = Some(id);
         id

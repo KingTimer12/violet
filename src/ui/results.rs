@@ -2,15 +2,17 @@
 //! the progress of a running query.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 
 use egui::text::{LayoutJob, TextWrapping};
 use egui::{
     Align, Color32, CornerRadius, Layout, Pos2, RichText, Sense, Stroke, TextFormat, Ui, Vec2,
 };
 use egui_extras::{Column, TableBuilder};
-use violet_core::{DbError, OrderBy, ResultSet};
+use violet_core::{DbError, ResultSet};
 
 use super::action::Action;
+use super::edit_flow::{EditTarget, Editing};
 use super::icons::Icon;
 use super::theme::{self, Palette};
 use super::widgets::{self, Tone};
@@ -64,7 +66,7 @@ fn paint_cell(ui: &Ui, cell: Cell<'_>, right_aligned: bool, color: Color32) {
 }
 
 #[hotpath::measure]
-pub fn show(ui: &mut Ui, tab: &mut QueryTab, actions: &mut Vec<Action>) {
+pub fn show(ui: &mut Ui, tab: &mut QueryTab, editing: &Editing, actions: &mut Vec<Action>) {
     let palette = Palette::current(ui.ctx());
     // Fetching another page keeps the rows on screen; the footer shows it.
     if let Some(running) = &tab.running
@@ -153,6 +155,9 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, actions: &mut Vec<Action>) {
                                     .color(palette.text),
                             );
                         }
+                        if set.has_rows() {
+                            edit_bar(ui, tab.id, tab.edits.len(), editing, actions);
+                        }
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if set.has_rows()
                                 && widgets::icon_button(ui, Icon::Copy, "Copy all rows as CSV")
@@ -230,10 +235,31 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, actions: &mut Vec<Action>) {
                         .show(ui, |ui| paging_bar(ui, tab.id, paging, fetching, actions));
                 }
                 let sort = match &tab.kind {
-                    TabKind::Data(view) => Some(view.order.as_ref()),
-                    TabKind::Script => None,
+                    TabKind::Data(view) => Sorting::On(view.order.as_ref().and_then(|order| {
+                        set.columns
+                            .iter()
+                            .position(|column| column.name == order.column)
+                            .map(|index| (index, order.descending))
+                    })),
+                    // A single query is read a page at a time; sorting it
+                    // reads it again, sorted by the server.
+                    TabKind::Script if tab.paging.is_some() => Sorting::On(tab.sort),
+                    TabKind::Script => Sorting::Off,
                 };
-                grid(ui, tab.id, set, sort, &mut tab.selected_cell, actions);
+                let target = match editing {
+                    Editing::On(target) => Some(target),
+                    Editing::Off(_) | Editing::Loading => None,
+                };
+                grid(
+                    ui,
+                    tab.id,
+                    set,
+                    sort,
+                    &mut tab.selected_cell,
+                    target,
+                    &tab.edits,
+                    actions,
+                );
             } else {
                 let affected = set.affected.unwrap_or(0);
                 widgets::empty_state(
@@ -331,12 +357,15 @@ fn format_age(age: std::time::Duration) -> String {
 }
 
 #[hotpath::measure]
+#[allow(clippy::too_many_arguments)]
 fn grid(
     ui: &mut Ui,
     tab: u64,
     set: &ResultSet,
-    sort: Option<Option<&OrderBy>>,
+    sort: Sorting,
     selected: &mut Option<(usize, usize)>,
+    target: Option<&EditTarget>,
+    edits: &BTreeMap<(usize, usize), Option<String>>,
     actions: &mut Vec<Action>,
 ) {
     let palette = Palette::current(ui.ctx());
@@ -382,8 +411,9 @@ fn grid(
                     header.col(|ui| {
                         ui.painter().rect_filled(ui.max_rect(), 0.0, palette.panel);
                     });
-                    for column in &set.columns {
-                        let (_, response) = header.col(|ui| {
+                    for (index, column) in set.columns.iter().enumerate() {
+                        let mut head = None;
+                        header.col(|ui| {
                             ui.painter().rect_filled(ui.max_rect(), 0.0, palette.panel);
                             ui.add_space(6.0);
                             ui.label(
@@ -393,10 +423,12 @@ fn grid(
                             );
                             // The sort arrow sits by the name, where narrow
                             // columns still show it.
-                            let direction = sort
-                                .flatten()
-                                .filter(|order| order.column == column.name)
-                                .map(|order| order.descending);
+                            let direction = match sort {
+                                Sorting::On(Some((sorted, descending))) if sorted == index => {
+                                    Some(descending)
+                                }
+                                Sorting::On(_) | Sorting::Off => None,
+                            };
                             if let Some(descending) = direction {
                                 let icon = if descending {
                                     Icon::ArrowDown
@@ -414,17 +446,48 @@ fn grid(
                                         .color(palette.dim),
                                 );
                             }
+                            // The table's own response for a cell has no
+                            // area: the header takes clicks itself.
+                            head = Some(ui.interact(
+                                ui.max_rect(),
+                                ui.id().with("head"),
+                                Sense::click(),
+                            ));
                         });
-                        // Data tabs sort on the server by clicking a header.
-                        if sort.is_some() {
-                            let response = response
-                                .interact(Sense::click())
-                                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                .on_hover_text("Sort by this column");
-                            if response.clicked() {
-                                actions.push(Action::Sort(tab, column.name.clone()));
+                        let Some(head) = head else { continue };
+                        let head = head.on_hover_cursor(egui::CursorIcon::PointingHand);
+                        egui::Popup::menu(&head).show(|ui| {
+                            let Sorting::On(current) = sort else {
+                                ui.label(
+                                    RichText::new(
+                                        "Only the result of a single SELECT can be sorted.",
+                                    )
+                                    .color(palette.dim),
+                                );
+                                return;
+                            };
+                            let now = current
+                                .filter(|(sorted, _)| *sorted == index)
+                                .map(|(_, descending)| descending);
+                            for (icon, label, descending) in [
+                                (Icon::ArrowUp, "Sort ascending", false),
+                                (Icon::ArrowDown, "Sort descending", true),
+                            ] {
+                                let label = if now == Some(descending) {
+                                    format!("{label}  ✓")
+                                } else {
+                                    label.to_owned()
+                                };
+                                if super::sidebar::menu_item(ui, icon, &label) {
+                                    actions.push(Action::SortBy(tab, index, Some(descending)));
+                                }
                             }
-                        }
+                            if now.is_some()
+                                && super::sidebar::menu_item(ui, Icon::Close, "Clear sort")
+                            {
+                                actions.push(Action::SortBy(tab, index, None));
+                            }
+                        });
                     }
                 })
                 .body(|body| {
@@ -439,7 +502,24 @@ fn grid(
                         };
                         for (column, value) in cells.iter().enumerate() {
                             let meta = &set.columns[column];
-                            let (_, response) = row.col(|ui| {
+                            let edited = edits.get(&(index, column));
+                            // A change not saved yet shows instead of the
+                            // server's value.
+                            let value = match edited {
+                                Some(change) => change.as_deref(),
+                                None => value,
+                            };
+                            let editable = target
+                                .is_some_and(|t| t.editable.get(column).copied().unwrap_or(false));
+                            let mut cell = None;
+                            row.col(|ui| {
+                                if edited.is_some() {
+                                    ui.painter().rect_filled(
+                                        ui.max_rect(),
+                                        0.0,
+                                        palette.warning.gamma_multiply(0.22),
+                                    );
+                                }
                                 let is_selected = *selected == Some((index, column));
                                 if is_selected {
                                     ui.painter().rect(
@@ -450,15 +530,28 @@ fn grid(
                                         egui::StrokeKind::Inside,
                                     );
                                 }
-                                let (cell, color) = match value {
+                                let (cell_text, color) = match value {
                                     None => (Cell::Null, palette.dim),
                                     Some(text) => (Cell::Value(text), palette.text),
                                 };
-                                paint_cell(ui, cell, meta.numeric, color);
+                                paint_cell(ui, cell_text, meta.numeric, color);
+                                // The cell is painted, not laid out, and the
+                                // table's own response for it has no area:
+                                // it takes clicks itself.
+                                cell = Some(ui.interact(
+                                    ui.max_rect(),
+                                    ui.id().with("cell"),
+                                    Sense::click(),
+                                ));
                             });
-                            let response = response.interact(Sense::click());
+                            let Some(response) = cell else {
+                                continue;
+                            };
                             if response.clicked() {
                                 *selected = Some((index, column));
+                            }
+                            if response.double_clicked() && editable {
+                                actions.push(Action::EditCell(tab, index, column));
                             }
                             // Long values get a tooltip; only measured when hovered.
                             if response.hovered()
@@ -472,6 +565,25 @@ fn grid(
                             }
                             response.context_menu(|ui| {
                                 *selected = Some((index, column));
+                                if editable {
+                                    if super::sidebar::menu_item(ui, Icon::Pencil, "Edit value…")
+                                    {
+                                        actions.push(Action::EditCell(tab, index, column));
+                                    }
+                                    if super::sidebar::menu_item(ui, Icon::Close, "Set to NULL") {
+                                        actions.push(Action::SetCell(tab, index, column, None));
+                                    }
+                                    if edited.is_some()
+                                        && super::sidebar::menu_item(
+                                            ui,
+                                            Icon::Refresh,
+                                            "Revert change",
+                                        )
+                                    {
+                                        actions.push(Action::RevertCell(tab, index, column));
+                                    }
+                                    ui.separator();
+                                }
                                 if super::sidebar::menu_item(ui, Icon::Copy, "Copy value") {
                                     actions
                                         .push(Action::Copy(value.unwrap_or_default().to_owned()));
@@ -490,6 +602,52 @@ fn grid(
                     });
                 });
         });
+}
+
+/// Whether a grid's columns can be sorted, and by which one now: its
+/// index and whether descending.
+#[derive(Clone, Copy)]
+enum Sorting {
+    Off,
+    On(Option<(usize, bool)>),
+}
+
+/// Changes waiting to be saved, or why the rows cannot change.
+fn edit_bar(ui: &mut Ui, tab: u64, changes: usize, editing: &Editing, actions: &mut Vec<Action>) {
+    let palette = Palette::current(ui.ctx());
+    ui.add_space(8.0);
+    if changes > 0 {
+        widgets::pill(
+            ui,
+            &format!(
+                "{changes} {} changed",
+                if changes == 1 { "cell" } else { "cells" }
+            ),
+            palette.warning,
+            palette.warning.gamma_multiply(0.15),
+        );
+        if matches!(editing, Editing::On(_))
+            && widgets::button(ui, Tone::Primary, Some(Icon::Save), "Save…")
+                .on_hover_text("Review the statements, then apply them")
+                .clicked()
+        {
+            actions.push(Action::ReviewEdits(tab));
+        }
+        if widgets::button(ui, Tone::Ghost, None, "Discard").clicked() {
+            actions.push(Action::DiscardEdits(tab));
+        }
+        return;
+    }
+    match editing {
+        Editing::On(_) => {
+            ui.label(RichText::new("Double-click a cell to edit").color(palette.dim));
+        }
+        Editing::Off(reason) if !reason.is_empty() => {
+            widgets::pill(ui, "Read-only", palette.dim, palette.surface_hover)
+                .on_hover_text(reason);
+        }
+        Editing::Off(_) | Editing::Loading => {}
+    }
 }
 
 /// The first line, at most [`CELL_PREVIEW`] characters. Borrowed in the

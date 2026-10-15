@@ -14,7 +14,12 @@
 //! `VIOLET_SCENE_SQL`), `explain` (`EXPLAIN ANALYZE` of a join),
 //! `history` (a run, then the history dialog), `restore` (the editors
 //! saved last time), `task` (the backup or restore dialog: see
-//! [`VioletApp::task_scene`]). Add `VIOLET_THEME=light` for the light theme.
+//! [`VioletApp::task_scene`]), `edit` (a data tab of `VIOLET_SCENE_TABLE`,
+//! double-clicked at `VIOLET_SCENE_X`, `VIOLET_SCENE_Y`), `sort` (runs
+//! `VIOLET_SCENE_SQL`, clicks a header at `VIOLET_SCENE_X`, `_Y` and a menu
+//! item at `VIOLET_SCENE_APPLY_X`, `_Y`). A profile without
+//! a saved password connects with `VIOLET_SCENE_PASSWORD`. Add
+//! `VIOLET_THEME=light` for the light theme.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -148,12 +153,20 @@ impl VioletApp {
             }
             (
                 "browse" | "error" | "data" | "menu" | "page" | "complete" | "explain" | "history"
-                | "task",
+                | "task" | "edit" | "sort",
                 0,
             ) => {
                 if let Some(id) = first {
                     self.explorer.expanded.insert(NodeKey::Connection(id));
-                    self.actions.push(Action::Connect(id));
+                    // A profile whose password is not saved connects with
+                    // `VIOLET_SCENE_PASSWORD`.
+                    match std::env::var("VIOLET_SCENE_PASSWORD") {
+                        Ok(password) => self.actions.push(Action::ConnectWithPassword(
+                            id,
+                            violet_core::Secret::new(password),
+                        )),
+                        Err(_) => self.actions.push(Action::Connect(id)),
+                    }
                 }
                 snapshot.step += 1;
                 false
@@ -216,6 +229,185 @@ impl VioletApp {
                 }
                 false
             }
+            ("sort", 1) => {
+                let Some(id) = first else { return true };
+                if self.explorer.link(id).is_online() {
+                    let sql = std::env::var("VIOLET_SCENE_SQL")
+                        .unwrap_or_else(|_| "SELECT * FROM customers".into());
+                    self.actions.push(Action::OpenEditor {
+                        connection: Some(id),
+                        sql,
+                    });
+                    snapshot.step += 1;
+                }
+                false
+            }
+            ("sort", 2) => {
+                if let Some(tab) = self.workspace.active {
+                    self.actions.push(Action::Run(tab, RunScope::Script));
+                    snapshot.step += 1;
+                }
+                false
+            }
+            // Click the header at `VIOLET_SCENE_X`, `_Y`, then the menu item
+            // at `VIOLET_SCENE_APPLY_X`, `_Y`, one event a frame.
+            ("sort", step @ 3..=8) => {
+                let done = self.workspace.active().is_some_and(|tab| {
+                    tab.running.is_none() && matches!(tab.outcome, Some(Outcome::Done { .. }))
+                });
+                if !done {
+                    return false;
+                }
+                if step >= 6 && std::env::var("VIOLET_SCENE_APPLY_X").is_err() {
+                    return elapsed > Duration::from_secs(8);
+                }
+                let at = |name: &str| {
+                    std::env::var(name)
+                        .ok()
+                        .and_then(|value| value.parse::<f32>().ok())
+                        .unwrap_or_default()
+                };
+                let pos = if step < 6 {
+                    egui::pos2(at("VIOLET_SCENE_X"), at("VIOLET_SCENE_Y"))
+                } else {
+                    egui::pos2(at("VIOLET_SCENE_APPLY_X"), at("VIOLET_SCENE_APPLY_Y"))
+                };
+                snapshot.events.push(match step % 3 {
+                    0 => egui::Event::PointerMoved(pos),
+                    phase => egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: phase == 1,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                });
+                snapshot.step += 1;
+                false
+            }
+            ("sort", _) => elapsed > Duration::from_secs(10),
+            ("edit", 1) => {
+                let Some(id) = first else { return true };
+                let loaded = self
+                    .explorer
+                    .objects
+                    .contains_key(&(id, "public".to_owned()));
+                if loaded && self.explorer.link(id).is_online() {
+                    let table =
+                        std::env::var("VIOLET_SCENE_TABLE").unwrap_or_else(|_| "customers".into());
+                    self.actions.push(Action::OpenData {
+                        connection: id,
+                        schema: "public".into(),
+                        relation: table,
+                    });
+                    snapshot.step += 1;
+                }
+                false
+            }
+            ("edit", 2) => {
+                // Once the rows can be edited, double-click the first cell
+                // of the second column.
+                let Some(tab) = self.workspace.active else {
+                    return false;
+                };
+                let editing = self.editing(tab);
+                log::info!(
+                    "edit scene: {}",
+                    match &editing {
+                        super::edit_flow::Editing::On(_) => "on".to_owned(),
+                        super::edit_flow::Editing::Loading => "loading".to_owned(),
+                        super::edit_flow::Editing::Off(reason) => format!("off: {reason}"),
+                    }
+                );
+                if matches!(editing, super::edit_flow::Editing::On(_)) {
+                    let x: f32 = std::env::var("VIOLET_SCENE_X")
+                        .ok()
+                        .and_then(|x| x.parse().ok())
+                        .unwrap_or(420.0);
+                    let y: f32 = std::env::var("VIOLET_SCENE_Y")
+                        .ok()
+                        .and_then(|y| y.parse().ok())
+                        .unwrap_or(200.0);
+                    snapshot
+                        .events
+                        .push(egui::Event::PointerMoved(egui::pos2(x, y)));
+                    snapshot.step += 1;
+                }
+                false
+            }
+            // Press, release, press, release: one a frame, as a hand would.
+            ("edit", step @ 3..=6) => {
+                let x: f32 = std::env::var("VIOLET_SCENE_X")
+                    .ok()
+                    .and_then(|x| x.parse().ok())
+                    .unwrap_or(420.0);
+                let y: f32 = std::env::var("VIOLET_SCENE_Y")
+                    .ok()
+                    .and_then(|y| y.parse().ok())
+                    .unwrap_or(200.0);
+                snapshot.events.push(egui::Event::PointerButton {
+                    pos: egui::pos2(x, y),
+                    button: egui::PointerButton::Primary,
+                    pressed: step % 2 == 1,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                snapshot.step += 1;
+                false
+            }
+            // With `VIOLET_SCENE_VALUE`: put it in the cell, review the
+            // change, and click at `VIOLET_SCENE_APPLY_X`, `_Y` (the
+            // review's apply button) when given.
+            ("edit", 7) => {
+                let Ok(value) = std::env::var("VIOLET_SCENE_VALUE") else {
+                    return settle && elapsed > Duration::from_secs(6);
+                };
+                let Some(editor) = self.cell_editor.take() else {
+                    return false;
+                };
+                self.actions.push(Action::SetCell(
+                    editor.tab,
+                    editor.row,
+                    editor.column,
+                    Some(value),
+                ));
+                self.actions.push(Action::ReviewEdits(editor.tab));
+                snapshot.step += 1;
+                false
+            }
+            ("edit", 8) => {
+                let at = |name: &str| {
+                    std::env::var(name)
+                        .ok()
+                        .and_then(|value| value.parse::<f32>().ok())
+                };
+                let (Some(x), Some(y)) = (at("VIOLET_SCENE_APPLY_X"), at("VIOLET_SCENE_APPLY_Y"))
+                else {
+                    return elapsed > Duration::from_secs(8);
+                };
+                if self.edit_review.is_none() {
+                    return false;
+                }
+                let pos = egui::pos2(x, y);
+                snapshot.events.push(egui::Event::PointerMoved(pos));
+                snapshot.step += 1;
+                false
+            }
+            ("edit", step @ 9..=10) => {
+                let at = |name: &str| {
+                    std::env::var(name)
+                        .ok()
+                        .and_then(|value| value.parse::<f32>().ok())
+                        .unwrap_or_default()
+                };
+                snapshot.events.push(egui::Event::PointerButton {
+                    pos: egui::pos2(at("VIOLET_SCENE_APPLY_X"), at("VIOLET_SCENE_APPLY_Y")),
+                    button: egui::PointerButton::Primary,
+                    pressed: step == 9,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                snapshot.step += 1;
+                false
+            }
+            ("edit", _) => elapsed > Duration::from_secs(12),
             ("data" | "menu", 2) => {
                 // Filter and sort once the first page is in.
                 let Some(tab) = self.workspace.active else {

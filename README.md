@@ -250,9 +250,30 @@ Clicking a table or view in the tree opens its data tab, as in DBeaver
 (the chevron still lists its columns). Rows arrive 200 at a time; the
 footer fetches the next page, fetches everything up to the row cap, or
 counts the rows. Type a `WHERE` condition in the filter bar and press
-Enter; click a column header to sort by it (ascending, descending, off).
+Enter; click a column header and pick ascending, descending or no sort.
 Sorting and filtering run on the server. A single `SELECT` run from an
-editor is paged the same way.
+editor is paged the same way, and sorts the same way: Violet reads it
+again as `SELECT * FROM (<query>) ORDER BY <column position>`, so every
+row is sorted, not only the page shown.
+
+### Editing rows
+
+Rows that map back to one table with a primary key can be edited in the
+grid: a data tab, or the result of a `SELECT` of one table's plain
+columns (no joins, grouping, `DISTINCT` or computed columns), primary key
+included. Double-click a cell, or right-click it to set it to NULL or
+revert it. Changes stay in the grid, highlighted, until **Save…** shows
+the `UPDATE` statements they make, one per row and each picking its row
+by primary key, and you apply them. They run as one transaction: if one
+fails, nothing changes and the edits stay. Key columns cannot be edited,
+values holding a backslash or a control character other than line breaks
+and tabs are refused, and reading the rows again with changes pending is
+blocked until they are saved or discarded. Applied changes go to the
+query history.
+
+`UPDATE` and `DELETE` statements without a `WHERE` (in `WITH` queries
+too) ask before they run, naming each table whose every row they would
+change; refreshing such a result never runs them again.
 
 Read-only results are kept in a key-value cache (`ResultCache`, an LRU of
 64 MiB in memory) and shown again without a round trip when nothing

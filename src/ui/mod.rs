@@ -7,6 +7,7 @@ mod chrome;
 mod connection_form;
 #[cfg(debug_assertions)]
 mod devtools;
+mod edit_flow;
 mod editor;
 mod fonts;
 mod history;
@@ -91,6 +92,11 @@ pub struct VioletApp {
     /// The scripts saved for connections, as last listed.
     script_list: Vec<SavedScript>,
     script_prompt: Option<script_flow::ScriptPrompt>,
+    cell_editor: Option<edit_flow::CellEditor>,
+    edit_review: Option<edit_flow::EditReview>,
+    run_review: Option<edit_flow::RunReview>,
+    /// Grid changes being written.
+    applying: HashMap<violet_app::RequestId, edit_flow::Applying>,
     confirm_delete: Option<ConnectionId>,
     /// Runs waiting for their tab's connection to open.
     queued: Vec<(TabId, RunScope)>,
@@ -194,6 +200,10 @@ impl VioletApp {
             scripts: services.scripts,
             script_list: Vec::new(),
             script_prompt: None,
+            cell_editor: None,
+            edit_review: None,
+            run_review: None,
+            applying: HashMap::new(),
             confirm_delete: None,
             queued: Vec::new(),
             actions: Vec::new(),
@@ -520,6 +530,10 @@ impl VioletApp {
                     .insert((id, schema), Loadable::from_result(result));
             }
             Event::QueryFinished { request, result } => {
+                if let Some(applying) = self.applying.remove(&request) {
+                    self.edits_applied(ctx, applying, &result);
+                    return;
+                }
                 let Some(tab) = self.workspace.by_request(request) else {
                     return;
                 };
@@ -798,6 +812,21 @@ impl VioletApp {
 
     #[hotpath::measure]
     fn run(&mut self, ctx: &egui::Context, tab_id: TabId, scope: RunScope) {
+        self.run_checked(ctx, tab_id, scope, false);
+    }
+
+    /// Runs an editor; statements that change every row of a table run
+    /// only once the user has `confirmed` them.
+    fn run_checked(
+        &mut self,
+        ctx: &egui::Context,
+        tab_id: TabId,
+        scope: RunScope,
+        confirmed: bool,
+    ) {
+        if self.keeps_edits(ctx, tab_id) {
+            return;
+        }
         let is_data = self
             .workspace
             .get(tab_id)
@@ -855,6 +884,22 @@ impl VioletApp {
             self.explain(ctx, tab_id, connection, offset, &text, scope);
             return;
         }
+        if !confirmed {
+            let writes = self.unbounded_writes(&text, connection);
+            if !writes.is_empty() {
+                self.run_review = Some(edit_flow::RunReview {
+                    tab: tab_id,
+                    scope,
+                    writes,
+                });
+                return;
+            }
+        }
+        // A new run starts unsorted.
+        if let Some(tab) = self.workspace.get_mut(tab_id) {
+            tab.sort = None;
+            tab.unsorted = None;
+        }
         // Reads may come from the cache, and a single query is read a page
         // at a time, as DBeaver does.
         let plan = sql::plan(&text);
@@ -874,6 +919,94 @@ impl VioletApp {
             shift: 0,
         };
         self.start(tab_id, connection, executed, options, false);
+    }
+
+    /// Reads a tab's rows again, sorted by the server on the column at
+    /// `column`, or unsorted. A data tab sorts its relation; a query is
+    /// wrapped and sorted by the column's position, which holds even when
+    /// two columns share a name.
+    fn sort(
+        &mut self,
+        ctx: &egui::Context,
+        tab_id: TabId,
+        column: usize,
+        descending: Option<bool>,
+    ) {
+        if self.keeps_edits(ctx, tab_id) {
+            return;
+        }
+        let Some(tab) = self.workspace.get_mut(tab_id) else {
+            return;
+        };
+        if tab.running.is_some() {
+            return;
+        }
+        let name = match &tab.outcome {
+            Some(Outcome::Done { output }) => output
+                .sets
+                .first()
+                .and_then(|set| set.columns.get(column))
+                .map(|meta| meta.name.clone()),
+            _ => None,
+        };
+        let Some(name) = name else { return };
+        if let Some(view) = tab.data_mut() {
+            view.order = descending.map(|descending| violet_core::OrderBy {
+                column: name,
+                descending,
+            });
+            self.run_data(ctx, tab_id, CachePolicy::Use);
+            return;
+        }
+        let (Some(connection), Some(paging), Some((last, _))) =
+            (tab.connection, &tab.paging, &tab.last_run)
+        else {
+            return;
+        };
+        let base = tab.unsorted.clone().unwrap_or_else(|| paging.base.clone());
+        const PREFIX: &str = "SELECT * FROM (\n";
+        let (sql, shift) = match descending {
+            Some(descending) => (
+                format!(
+                    "{PREFIX}{base}\n) AS violet_sorted\nORDER BY {} {}",
+                    column + 1,
+                    if descending { "DESC" } else { "ASC" }
+                ),
+                PREFIX.chars().count(),
+            ),
+            None => (base.clone(), 0),
+        };
+        let executed = Executed {
+            offset: last.offset,
+            sql,
+            shift,
+        };
+        let options = ExecOptions {
+            cache: CachePolicy::Use,
+            page: Some(Page::first()),
+        };
+        tab.sort = descending.map(|descending| (column, descending));
+        tab.unsorted = descending.is_some().then_some(base);
+        self.start(tab_id, connection, executed, options, false);
+    }
+
+    /// Whether `tab_id` has changed cells a new read would drop: the user
+    /// saves or discards them first.
+    fn keeps_edits(&mut self, ctx: &egui::Context, tab_id: TabId) -> bool {
+        let pending = self
+            .workspace
+            .get(tab_id)
+            .is_some_and(|tab| !tab.edits.is_empty());
+        if pending {
+            self.toasts.push(
+                ctx,
+                Toast::error(
+                    "Changed cells are not saved",
+                    "Save or discard them before reading the rows again.",
+                ),
+            );
+        }
+        pending
     }
 
     /// Runs one statement under `EXPLAIN`, or `EXPLAIN ANALYZE` when it
@@ -940,6 +1073,25 @@ impl VioletApp {
             .backend
             .execute(connection, executed.sql.clone(), options);
         if !append {
+            // New rows: changes to the old ones are gone with them.
+            tab.edits.clear();
+            tab.source = match &tab.kind {
+                TabKind::Data(view) => Some(sql::TableRef {
+                    schema: Some(sql::Name {
+                        text: view.schema.clone(),
+                        quoted: true,
+                    }),
+                    name: sql::Name {
+                        text: view.relation.clone(),
+                        quoted: true,
+                    },
+                }),
+                // A sorted query wraps the one written, which is the one
+                // that tells the table.
+                TabKind::Script => {
+                    sql::single_table_select(tab.unsorted.as_deref().unwrap_or(&executed.sql))
+                }
+            };
             tab.paging = options.page.map(|_| Paging {
                 base: executed.sql.clone(),
                 options,
@@ -960,6 +1112,9 @@ impl VioletApp {
 
     /// Reads a data tab's first page with its filter and sort.
     fn run_data(&mut self, ctx: &egui::Context, tab_id: TabId, cache: CachePolicy) {
+        if self.keeps_edits(ctx, tab_id) {
+            return;
+        }
         let Some(tab) = self.workspace.get_mut(tab_id) else {
             return;
         };
@@ -1051,6 +1206,9 @@ impl VioletApp {
 
     /// Runs the shown result again, past the cache.
     fn refresh(&mut self, ctx: &egui::Context, tab_id: TabId) {
+        if self.keeps_edits(ctx, tab_id) {
+            return;
+        }
         let Some(tab) = self.workspace.get(tab_id) else {
             return;
         };
@@ -1063,6 +1221,18 @@ impl VioletApp {
             return;
         };
         if tab.running.is_some() || !self.backend.is_connected(connection) {
+            return;
+        }
+        // Changing every row again is asked for from the editor, not
+        // repeated by a refresh.
+        if !sql::unbounded_writes(&executed.sql).is_empty() {
+            self.toasts.push(
+                ctx,
+                Toast::error(
+                    "Not run again",
+                    "It changes every row of a table. Run it from the editor to confirm it.",
+                ),
+            );
             return;
         }
         let cache = match options.cache {
@@ -1254,6 +1424,13 @@ impl VioletApp {
                 self.run_data(ctx, tab, CachePolicy::Use);
             }
             Action::Run(tab, scope) => self.run(ctx, tab, scope),
+            action @ (Action::RunConfirmed(..)
+            | Action::EditCell(..)
+            | Action::SetCell(..)
+            | Action::RevertCell(..)
+            | Action::DiscardEdits(_)
+            | Action::ReviewEdits(_)
+            | Action::ApplyEdits(_)) => self.edit_action(ctx, action),
             action @ (Action::SaveScript(_)
             | Action::SaveScriptAs(_)
             | Action::SaveScriptNamed(..)
@@ -1267,12 +1444,7 @@ impl VioletApp {
                 }
                 self.run_data(ctx, tab, CachePolicy::Use);
             }
-            Action::Sort(tab, column) => {
-                if let Some(view) = self.workspace.get_mut(tab).and_then(|t| t.data_mut()) {
-                    view.cycle_order(&column);
-                }
-                self.run_data(ctx, tab, CachePolicy::Use);
-            }
+            Action::SortBy(tab, column, descending) => self.sort(ctx, tab, column, descending),
             Action::FetchMore(tab) => self.fetch_more(tab, false),
             Action::FetchAll(tab) => self.fetch_more(tab, true),
             Action::CountRows(tab) => self.count_rows(tab),
@@ -1376,6 +1548,9 @@ impl VioletApp {
         let modal_open = self.form.is_some()
             || self.prompt.is_some()
             || self.script_prompt.is_some()
+            || self.cell_editor.is_some()
+            || self.edit_review.is_some()
+            || self.run_review.is_some()
             || self.confirm_delete.is_some()
             || self.history_view.is_some()
             || self.task_dialog.is_some();
@@ -1466,6 +1641,7 @@ impl VioletApp {
         let Some(active) = self.workspace.active else {
             return;
         };
+        let editing = self.editing(active);
         let profiles = &*connections(&self.profiles, &self.explorer);
         let explorer = &self.explorer;
         let actions = &mut self.actions;
@@ -1502,7 +1678,7 @@ impl VioletApp {
                 .show(ui, |ui| chrome::filter_bar(ui, tab, actions));
             egui::CentralPanel::default()
                 .frame(Frame::NONE.fill(palette.window))
-                .show(ui, |ui| results::show(ui, tab, actions));
+                .show(ui, |ui| results::show(ui, tab, &editing, actions));
             return;
         }
 
@@ -1522,7 +1698,7 @@ impl VioletApp {
                 // The panel remembers the height its contents take: they
                 // fill it, or it would shrink to a smaller result each run.
                 ui.set_min_height(ui.available_height());
-                results::show(ui, tab, actions);
+                results::show(ui, tab, &editing, actions);
             });
         self.layout.results = (total > 0.0).then(|| results.response.rect.height() / total);
 
@@ -1568,6 +1744,21 @@ impl VioletApp {
             && !script_flow::show_prompt(ctx, prompt, &mut self.actions)
         {
             self.script_prompt = None;
+        }
+        if let Some(editor) = &mut self.cell_editor
+            && !edit_flow::show_cell_editor(ctx, editor, &mut self.actions)
+        {
+            self.cell_editor = None;
+        }
+        if let Some(review) = &self.edit_review
+            && !edit_flow::show_edit_review(ctx, review, &mut self.actions)
+        {
+            self.edit_review = None;
+        }
+        if let Some(review) = &self.run_review
+            && !edit_flow::show_run_review(ctx, review, &mut self.actions)
+        {
+            self.run_review = None;
         }
         if let Some(view) = &mut self.history_view {
             let active = self.workspace.active();
