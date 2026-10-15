@@ -367,11 +367,14 @@ providers. Push a tag to publish them as a GitHub release:
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
+The tag must be `v` and the version in `Cargo.toml`: the workflow refuses
+any other, as installed copies compare the two.
+
 | Platform | File | Install |
 | --- | --- | --- |
-| Windows x64 | `violet-<tag>-windows-x64.zip` | Unzip and run `violet.exe` |
+| Windows x64 | `violet-<tag>-x86_64-pc-windows-msvc.zip` | Unzip and run `violet.exe` |
 | macOS 11+ (Apple silicon and Intel) | `violet-<tag>-macos-universal.dmg` | Drag Violet to Applications; the first time, right click it > Open (the app is not notarized) |
-| Linux x86_64 / aarch64 | `violet-<tag>-linux-<arch>.tar.gz` | Unpack and run `./install.sh` (to `~/.local`), or `./violet` in place |
+| Linux x86_64 / aarch64 | `violet-<tag>-<arch>-unknown-linux-gnu.tar.gz` | Unpack and run `./install.sh` (to `~/.local`), or `./violet` in place |
 
 Each comes with its SHA-256 (`.sha256`). At the release's top level sit
 `providers.json` and each provider's `.wasm`, where Violet's default
@@ -379,6 +382,31 @@ catalogue URL finds them. Running the workflow by hand builds the same
 files as artifacts without publishing. The packages are made by
 `scripts/package-{macos,linux}.sh`, which work the same locally; the app
 icons come from `assets/app/violet.svg` (`scripts/app-icons.sh`).
+
+#### Updates
+
+Violet updates itself from these releases
+([fastframe-update](https://fastframe.dev/fastframe-update/)): a release
+build checks at start-up and then daily, downloads a newer version in the
+background, and offers **Restart to update** in the title bar. If the new
+version does not start, the previous one comes back. Copies a package
+manager installed (Homebrew, apt, Flatpak...) are left to it, and the
+title bar links to the release instead. `"updates": false` in
+`settings.json` turns checks off.
+
+An update is taken only when `checksums.txt`, which lists every file of
+the release, carries a valid Ed25519 signature (`checksums.txt.sig`) by
+the key `assets/update-public-key.hex` names. The workflow signs with the
+`UPDATE_SIGNING_KEY` secret (the private key, PEM) and fails without it:
+
+```sh
+gh secret set UPDATE_SIGNING_KEY < ~/.config/violet-release/update-signing-key.pem
+```
+
+Keep a copy of that key outside GitHub. Losing it means installed copies
+can no longer update themselves; to replace it, ship a release that also
+trusts the next key (`additional_publisher_keys` in `src/update.rs`)
+before signing with it.
 
 | Shortcut | Action |
 | --- | --- |

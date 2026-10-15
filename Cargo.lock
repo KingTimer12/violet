@@ -1754,6 +1754,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastframe-update"
+version = "0.6.0"
+source = "git+https://github.com/crmne/fastframe?tag=v0.6.0#0d65ca99eb6d00f10ff556bf985249658feed469"
+dependencies = [
+ "anyhow",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "url",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5269,8 +5283,9 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "violet"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
+ "anyhow",
  "eframe",
  "egui",
  "egui_extras",
@@ -5279,23 +5294,26 @@ dependencies = [
  "fastframe-log",
  "fastframe-macos",
  "fastframe-text",
+ "fastframe-update",
  "hotpath",
  "image",
  "jiff",
  "log",
  "rfd",
  "serde",
+ "ureq",
  "violet-app",
  "violet-core",
  "violet-providers",
  "violet-storage",
  "violet-wasm",
+ "winresource",
  "zeroize",
 ]
 
 [[package]]
 name = "violet-app"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "hotpath",
@@ -5307,7 +5325,7 @@ dependencies = [
 
 [[package]]
 name = "violet-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "serde",
@@ -5318,7 +5336,7 @@ dependencies = [
 
 [[package]]
 name = "violet-provider-cli"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "serde_json",
  "tokio",
@@ -5330,7 +5348,7 @@ dependencies = [
 
 [[package]]
 name = "violet-providers"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "flate2",
@@ -5350,7 +5368,7 @@ dependencies = [
 
 [[package]]
 name = "violet-sdk"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "log",
  "wit-bindgen 0.62.0",
@@ -5358,7 +5376,7 @@ dependencies = [
 
 [[package]]
 name = "violet-storage"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "directories",
  "hotpath",
@@ -5373,7 +5391,7 @@ dependencies = [
 
 [[package]]
 name = "violet-wasm"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "hotpath",
@@ -6542,6 +6560,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "winresource"
+version = "0.1.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2bc6d36480b829272a5bdabf08e6dca8004761c1da7e35efef800540c66221b"
+dependencies = [
+ "toml",
+ "version_check",
 ]
 
 [[package]]

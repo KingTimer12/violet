@@ -5,7 +5,7 @@ members = [".", "crates/*"]
 exclude = ["providers"]
 
 [workspace.package]
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
@@ -74,6 +74,14 @@ fastframe-fonts = { git = "https://github.com/crmne/fastframe", tag = "v0.2.3" }
 fastframe-icons = { git = "https://github.com/crmne/fastframe", tag = "v0.2.3" }
 fastframe-log = { git = "https://github.com/crmne/fastframe", tag = "v0.2.3" }
 fastframe-macos = { git = "https://github.com/crmne/fastframe", tag = "v0.2.3" }
+# Self-update from the GitHub releases (src/update.rs).
+fastframe-update = { git = "https://github.com/crmne/fastframe", tag = "v0.6.0" }
+anyhow = "1"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[build-dependencies]
+# The Windows executable's icon (build.rs).
+winresource = "0.1"
 
 [features]
 # `cargo run --features hotpath`: times the hot paths (frames, queries,
