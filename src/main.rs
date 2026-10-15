@@ -11,6 +11,7 @@ mod completion;
 mod settings;
 mod sql;
 mod ui;
+mod update;
 
 use std::sync::Arc;
 
@@ -29,6 +30,23 @@ use ui::{Services, VioletApp};
 
 #[hotpath::main]
 fn main() -> eframe::Result {
+    // First: run as the update helper when asked to, and take the update
+    // flags off the command line.
+    let launch = fastframe_update::intercept(&update::UPDATES);
+    // The helper of the previous version checks a download this way
+    // before installing it.
+    if launch
+        .arguments
+        .get(1)
+        .is_some_and(|arg| arg == "--version")
+    {
+        #[allow(clippy::print_stdout)]
+        {
+            println!("violet {}", env!("CARGO_PKG_VERSION"));
+        }
+        return Ok(());
+    }
+
     // `VIOLET_HOME` keeps everything under one directory: portable installs,
     // and runs that must not touch the user's own connections.
     let dirs = std::env::var_os("VIOLET_HOME")
@@ -84,6 +102,12 @@ fn main() -> eframe::Result {
             let repository: Arc<dyn ProfileRepository> =
                 Arc::new(JsonProfileRepository::new(dirs.profiles_file()));
             let (profiles, error) = ProfileService::load(repository, Arc::clone(&secrets));
+            if let Some(error) = launch.error {
+                startup_errors.push(ui::toast_error(
+                    "The update was undone",
+                    format!("Violet went back to the version it was. {error}"),
+                ));
+            }
             if let Some(error) = error {
                 log::error!("profiles: {error}");
                 startup_errors.push(ui::toast_error(
@@ -128,6 +152,14 @@ fn main() -> eframe::Result {
                 history,
                 session: JsonFile::new(dirs.session_file()),
                 scripts: ScriptStore::new(dirs.scripts_dir()),
+                updates: settings
+                    .updates
+                    .then(|| {
+                        let repaint = ctx.clone();
+                        update::Updates::start(move || repaint.request_repaint())
+                    })
+                    .flatten(),
+                update_receipt: launch.receipt,
             };
             Ok(Box::new(VioletApp::new(
                 &ctx,

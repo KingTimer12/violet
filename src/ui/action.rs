@@ -137,4 +137,8 @@ pub enum Action {
     RetryTools(DriverId),
     /// Shows a file in the system's file manager.
     Reveal(PathBuf),
+    /// Quits so the downloaded update installs, then starts it.
+    RestartToUpdate,
+    /// Opens a web page, such as a release's.
+    OpenUrl(String),
 }

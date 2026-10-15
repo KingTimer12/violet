@@ -20,6 +20,7 @@ pub fn title_bar(
     ui: &mut Ui,
     title: &str,
     theme_preference: egui::ThemePreference,
+    update: &crate::update::Status,
     actions: &mut Vec<Action>,
 ) {
     let palette = Palette::current(ui.ctx());
@@ -97,8 +98,69 @@ pub fn title_bar(
             if widgets::icon_button(ui, icon, tip).clicked() {
                 actions.push(Action::SetTheme(next));
             }
+            update_badge(ui, update, actions);
         });
     });
+}
+
+/// A new version: downloading, ready to install on restart, or to be
+/// downloaded by hand.
+fn update_badge(ui: &mut Ui, update: &crate::update::Status, actions: &mut Vec<Action>) {
+    use crate::update::Status;
+    let palette = Palette::current(ui.ctx());
+    match update {
+        Status::Idle => {}
+        Status::Downloading { version, percent } => {
+            ui.label(
+                RichText::new(format!("Downloading Violet {version}… {percent}%"))
+                    .font(theme::medium(12.0))
+                    .color(palette.secondary),
+            );
+        }
+        Status::Ready { version } => {
+            if widgets::button(
+                ui,
+                Tone::Secondary,
+                Some(Icon::Download),
+                "Restart to update",
+            )
+            .on_hover_text(format!("Violet {version} is downloaded and verified"))
+            .clicked()
+            {
+                actions.push(Action::RestartToUpdate);
+            }
+        }
+        Status::Manual {
+            version,
+            url,
+            reason,
+        } => {
+            if widgets::icon_button(
+                ui,
+                Icon::Download,
+                &format!("Violet {version} is out. {reason}"),
+            )
+            .clicked()
+            {
+                actions.push(Action::OpenUrl(url.clone()));
+            }
+        }
+        Status::Failed {
+            version,
+            url,
+            error,
+        } => {
+            if widgets::icon_button(
+                ui,
+                Icon::CircleAlert,
+                &format!("Violet {version} could not be downloaded: {error}"),
+            )
+            .clicked()
+            {
+                actions.push(Action::OpenUrl(url.clone()));
+            }
+        }
+    }
 }
 
 /// Tabs along the top of the workspace.

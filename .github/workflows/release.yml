@@ -91,9 +91,12 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          $name = "violet-$($env:VERSION)-windows-x64"
+          # Named as the updater (fastframe-update) looks for it; the
+          # marker lets a copy from this archive replace itself.
+          $name = "violet-$($env:VERSION)-x86_64-pc-windows-msvc"
           New-Item -ItemType Directory -Path "package/$name" | Out-Null
           Copy-Item target/release/violet.exe "package/$name/"
+          Set-Content -NoNewline -Encoding ascii -Path "package/$name/violet-portable.txt" -Value "violet-portable-v1`n"
           Copy-Item README.md "package/$name/"
           Compress-Archive -Path "package/$name" -DestinationPath "package/$name.zip"
           $hash = (Get-FileHash "package/$name.zip" -Algorithm SHA256).Hash.ToLower()
@@ -171,17 +174,56 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The updater compares the tag with the version the app reports.
+      - name: The tag matches the version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          test "$GITHUB_REF_NAME" = "v$version" || {
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml's $version" >&2
+            exit 1
+          }
+
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          path: assets
+          # Not `assets`: that is the repository's own folder.
+          path: release
           merge-multiple: true
+
+      # checksums.txt lists every asset; checksums.txt.sig is its raw
+      # Ed25519 signature, which installed copies check against
+      # assets/update-public-key.hex before taking an update.
+      - name: Sign the checksums
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          test -n "$UPDATE_SIGNING_KEY" || {
+            echo "The UPDATE_SIGNING_KEY secret is missing" >&2
+            exit 1
+          }
+          cd release
+          sha256sum -- * | grep -v -e ' checksums.txt' > ../checksums.txt
+          mv ../checksums.txt .
+          key=$(mktemp)
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$UPDATE_SIGNING_KEY" > "$key"
+          openssl pkeyutl -sign -rawin -inkey "$key" -in checksums.txt -out checksums.txt.sig
+          test "$(wc -c < checksums.txt.sig)" -eq 64
+          # The signature verifies against the key the app embeds.
+          pub=$(openssl pkey -in "$key" -pubout -outform DER | tail -c 32 | xxd -p -c 64)
+          test "$pub" = "$(tr -d '[:space:]' < ../assets/update-public-key.hex)" || {
+            echo "UPDATE_SIGNING_KEY is not the key assets/update-public-key.hex names" >&2
+            exit 1
+          }
+          cat checksums.txt
 
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ls -l assets
-          gh release create "$GITHUB_REF_NAME" assets/* \
+          ls -l release
+          gh release create "$GITHUB_REF_NAME" release/* \
             --repo "$GITHUB_REPOSITORY" \
             --title "Violet $GITHUB_REF_NAME" \
             --generate-notes

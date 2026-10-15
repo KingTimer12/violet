@@ -54,6 +54,8 @@ pub struct Settings {
     pub backup_name: String,
     /// Where a script was last saved, for the file dialogs.
     pub script_folder: String,
+    /// Check for new versions and download them in the background.
+    pub updates: bool,
 }
 
 impl Default for Settings {
@@ -69,6 +71,7 @@ impl Default for Settings {
             backup_folder: String::new(),
             backup_name: String::new(),
             script_folder: String::new(),
+            updates: true,
         }
     }
 }

@@ -1754,6 +1754,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastframe-update"
+version = "0.6.0"
+source = "git+https://github.com/crmne/fastframe?tag=v0.6.0#0d65ca99eb6d00f10ff556bf985249658feed469"
+dependencies = [
+ "anyhow",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "url",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5271,6 +5285,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "violet"
 version = "0.1.5"
 dependencies = [
+ "anyhow",
  "eframe",
  "egui",
  "egui_extras",
@@ -5279,12 +5294,14 @@ dependencies = [
  "fastframe-log",
  "fastframe-macos",
  "fastframe-text",
+ "fastframe-update",
  "hotpath",
  "image",
  "jiff",
  "log",
  "rfd",
  "serde",
+ "ureq",
  "violet-app",
  "violet-core",
  "violet-providers",

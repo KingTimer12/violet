@@ -74,6 +74,11 @@ pub struct Services {
     /// The editors open last time.
     pub session: JsonFile<SavedSession>,
     pub scripts: ScriptStore,
+    /// The update worker; `None` when updates are off.
+    pub updates: Option<crate::update::Updates>,
+    /// Set when this launch is a just-installed update, to confirm once
+    /// the window is up.
+    pub update_receipt: Option<fastframe_update::Receipt>,
 }
 
 pub struct VioletApp {
@@ -122,6 +127,8 @@ pub struct VioletApp {
     task_dialog: Option<tasks::TaskDialog>,
     /// Backups and restores still running.
     started: HashMap<TaskId, task_flow::Started>,
+    updates: Option<crate::update::Updates>,
+    update_receipt: Option<fastframe_update::Receipt>,
     #[cfg(debug_assertions)]
     snapshot: Option<devtools::Snapshot>,
 }
@@ -220,6 +227,8 @@ impl VioletApp {
             tools: HashMap::new(),
             task_dialog: None,
             started: HashMap::new(),
+            updates: services.updates,
+            update_receipt: services.update_receipt,
             #[cfg(debug_assertions)]
             snapshot: devtools::Snapshot::from_env(),
         };
@@ -1283,6 +1292,20 @@ impl VioletApp {
                     }
                 }
             }
+            Action::RestartToUpdate => {
+                let Some(updates) = &self.updates else {
+                    return;
+                };
+                match updates.restart() {
+                    // The helper installs once Violet has quit.
+                    Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                    Err(error) => self.toasts.push(
+                        ctx,
+                        Toast::error("The update could not start", format!("{error:#}")),
+                    ),
+                }
+            }
+            Action::OpenUrl(url) => ctx.open_url(egui::OpenUrl::new_tab(url)),
             Action::OpenProviders => {
                 self.providers.open = true;
                 self.load_providers();
@@ -1832,7 +1855,18 @@ impl eframe::App for VioletApp {
                     .stroke(Stroke::new(1.0, palette.outline)),
             )
             .show(ui, |ui| {
-                chrome::title_bar(ui, &title, self.settings.theme.into(), &mut self.actions)
+                let update = self
+                    .updates
+                    .as_ref()
+                    .map(crate::update::Updates::status)
+                    .unwrap_or_default();
+                chrome::title_bar(
+                    ui,
+                    &title,
+                    self.settings.theme.into(),
+                    &update,
+                    &mut self.actions,
+                );
             });
 
         Panel::bottom("status-bar")
@@ -1888,6 +1922,10 @@ impl eframe::App for VioletApp {
         #[cfg(debug_assertions)]
         self.drive_snapshot(&ctx);
         self.apply_actions(&ctx);
+        // The window is up: the helper may keep the update.
+        if let Some(receipt) = self.update_receipt.take() {
+            crate::update::acknowledge(receipt);
+        }
     }
 }
 
