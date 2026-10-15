@@ -192,7 +192,7 @@ impl Provider for Lite {
     }
 
     /// Programs Violet downloads with the provider, so nothing has to be
-    /// installed: a `.tar.gz` per platform, with its SHA-256.
+    /// installed: a `.tar.gz` (or `.tar.xz`) per platform, with its SHA-256.
     fn downloads() -> Vec<Download> {
         vec![Download {
             platform: "linux-x86_64".into(),

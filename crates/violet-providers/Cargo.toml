@@ -18,10 +18,13 @@ tokio.workspace = true
 uuid.workspace = true
 sha2 = "0.10"
 flate2 = "1"
+# `.tar.xz` downloads, such as MySQL's Linux client. Pure Rust.
+lzma-rust2 = { version = "0.22", default-features = false, features = ["std", "xz", "optimization"] }
 tar = { version = "0.4", default-features = false }
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
+lzma-rust2 = { version = "0.22", default-features = false, features = ["std", "xz", "encoder"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 

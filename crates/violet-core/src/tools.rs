@@ -594,7 +594,11 @@ impl Task {
             // password into one a program logs or sends along, such as an
             // application name.
             let upper = name.to_ascii_uppercase();
-            if !env_name_ok(name) || !(upper.contains("PASSWORD") || upper.contains("PASSWD")) {
+            let password = upper.contains("PASSWORD")
+                || upper.contains("PASSWD")
+                // MySQL's and MariaDB's clients only read `MYSQL_PWD`.
+                || upper.split('_').next_back() == Some("PWD");
+            if !env_name_ok(name) || !password {
                 return bad(format!("{name:?} is not a usable password variable"));
             }
             connection_env.push(name.to_ascii_uppercase());
@@ -1597,6 +1601,12 @@ mod tests {
             bad.check().is_err(),
             "the password into an application name"
         );
+        let mut mysql = task();
+        mysql.connection.password_env = Some("MYSQL_PWD".into());
+        assert!(mysql.check().is_ok(), "MySQL's password variable");
+        let mut bad = task();
+        bad.connection.password_env = Some("PWDX_NAME".into());
+        assert!(bad.check().is_err(), "a name merely starting like one");
         let mut bad = task();
         bad.commands[0].variables.push(Variable {
             when: Vec::new(),

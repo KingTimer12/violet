@@ -152,7 +152,12 @@ fn wanted(relative: &str, extract: &[String]) -> bool {
 }
 
 fn unpack(archive: &[u8], download: &Download, dest: &Path) -> Result<()> {
-    let decoder = flate2::read::GzDecoder::new(archive);
+    // The address says how the tar is compressed: xz, or gzip otherwise.
+    let decoder: Box<dyn std::io::Read + '_> = if download.url.ends_with(".tar.xz") {
+        Box::new(lzma_rust2::XzReader::new(archive, true))
+    } else {
+        Box::new(flate2::read::GzDecoder::new(archive))
+    };
     let mut tar = tar::Archive::new(decoder);
     std::fs::create_dir_all(dest).map_err(|e| io(dest, &e))?;
     let mut total = 0u64;
@@ -242,6 +247,13 @@ mod tests {
     use super::*;
 
     fn archive(entries: &[(&str, &[u8], Option<&str>)]) -> Vec<u8> {
+        let tar = tarball(entries);
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut gz, &tar).expect("gz");
+        gz.finish().expect("gz")
+    }
+
+    fn tarball(entries: &[(&str, &[u8], Option<&str>)]) -> Vec<u8> {
         let mut builder = tar::Builder::new(Vec::new());
         for (path, body, link) in entries {
             let mut header = tar::Header::new_gnu();
@@ -262,10 +274,7 @@ mod tests {
                 }
             }
         }
-        let tar = builder.into_inner().expect("tar");
-        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        std::io::Write::write_all(&mut gz, &tar).expect("gz");
-        gz.finish().expect("gz")
+        builder.into_inner().expect("tar")
     }
 
     fn download() -> Download {
@@ -312,6 +321,26 @@ mod tests {
             assert_eq!(mode & 0o7777, 0o755, "no setuid");
         }
         assert_eq!(folder.installed().map(|i| folder.bin(&i)), Some(bin));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn xz_archives_unpack_too() {
+        let dir = std::env::temp_dir().join(format!("violet-tools-{}", uuid::Uuid::new_v4()));
+        let folder = ToolsFolder::new(&dir, "mysql");
+        let tar = tarball(&[("pg/bin/pg_dump", b"#!dump", None)]);
+        let options = lzma_rust2::XzOptions::with_preset(1);
+        let mut xz = lzma_rust2::XzWriter::new(Vec::new(), options).expect("xz");
+        std::io::Write::write_all(&mut xz, &tar).expect("xz");
+        let bytes = xz.finish().expect("xz");
+        let download = Download {
+            url: "https://example.com/pg.tar.xz".into(),
+            ..download()
+        };
+        let bin = folder.install(&download, &bytes).expect("installed");
+        assert!(bin.join("pg_dump").is_file());
+        // The same bytes are not gzip.
+        assert!(folder.install(&self::download(), &bytes).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
