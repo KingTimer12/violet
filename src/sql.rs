@@ -714,9 +714,338 @@ pub fn line_column(source: &str, char_offset: usize) -> (usize, usize) {
     (line, column)
 }
 
+/// A statement's tokens outside comments and whitespace: depth in
+/// brackets, upper-cased text for words, and the token.
+fn significant(source: &str) -> Vec<(usize, String, Token)> {
+    let mut depth = 0usize;
+    let mut out = Vec::new();
+    for token in tokens(source) {
+        if matches!(token.kind, TokenKind::Whitespace | TokenKind::Comment) {
+            continue;
+        }
+        let text = &source[token.range.clone()];
+        if token.kind == TokenKind::Punctuation && text == ")" {
+            depth = depth.saturating_sub(1);
+        }
+        let upper = if is_word(token.kind) {
+            text.to_uppercase()
+        } else {
+            text.to_owned()
+        };
+        out.push((depth, upper, token.clone()));
+        if token.kind == TokenKind::Punctuation && text == "(" {
+            depth += 1;
+        }
+    }
+    out
+}
+
+/// A token that can name something: a word, keyword-coloured or not, or a
+/// quoted identifier.
+fn is_word(kind: TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::Keyword | TokenKind::Type | TokenKind::Identifier
+    )
+}
+
+/// A name in a statement, as written.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Name {
+    /// Without its quotes.
+    pub text: String,
+    /// Quoted names keep their case; others fold as the database folds.
+    pub quoted: bool,
+}
+
+impl Name {
+    fn read(source: &str, token: &Token) -> Option<Self> {
+        let text = &source[token.range.clone()];
+        match token.kind {
+            TokenKind::QuotedIdentifier => {
+                let inner = text.strip_prefix('"')?.strip_suffix('"')?;
+                Some(Self {
+                    text: inner.replace("\"\"", "\""),
+                    quoted: true,
+                })
+            }
+            kind if is_word(kind) => Some(Self {
+                text: text.to_owned(),
+                quoted: false,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Whether `actual`, a name as the catalog has it, is this one.
+    pub fn matches(&self, actual: &str) -> bool {
+        if self.quoted {
+            self.text == actual
+        } else {
+            self.text.eq_ignore_ascii_case(actual)
+        }
+    }
+}
+
+/// A table a statement names: `schema.table` or `table`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableRef {
+    pub schema: Option<Name>,
+    pub name: Name,
+}
+
+/// Reads `name` or `schema.name` from `tokens`, returning it and how many
+/// tokens it took.
+fn table_ref(source: &str, tokens: &[(usize, String, Token)]) -> Option<(TableRef, usize)> {
+    let first = Name::read(source, &tokens.first()?.2)?;
+    let dotted = tokens
+        .get(1)
+        .is_some_and(|(_, text, token)| token.kind == TokenKind::Punctuation && text == ".");
+    if dotted {
+        let second = Name::read(source, &tokens.get(2)?.2)?;
+        return Some((
+            TableRef {
+                schema: Some(first),
+                name: second,
+            },
+            3,
+        ));
+    }
+    Some((
+        TableRef {
+            schema: None,
+            name: first,
+        },
+        1,
+    ))
+}
+
+/// Statements in `source` that change every row of their table: `UPDATE`
+/// or `DELETE` with no `WHERE`, `WITH` queries included. Each is described
+/// as its command and table, `UPDATE public.orders`.
+#[must_use]
+pub fn unbounded_writes(source: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for range in statements(source) {
+        let text = &source[range];
+        let all = significant(text);
+        let top: Vec<&(usize, String, Token)> =
+            all.iter().filter(|(depth, _, _)| *depth == 0).collect();
+        // The command: the first word, or after `WITH` the first command
+        // outside the queries' brackets.
+        let verb = match top.first() {
+            Some((_, word, _)) if word == "WITH" => top.iter().position(|(_, word, token)| {
+                is_word(token.kind)
+                    && matches!(
+                        word.as_str(),
+                        "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "VALUES" | "TABLE"
+                    )
+            }),
+            Some(_) => Some(0),
+            None => None,
+        };
+        let Some(verb) = verb else { continue };
+        let command = top[verb].1.as_str();
+        if !matches!(command, "UPDATE" | "DELETE") {
+            continue;
+        }
+        let filtered = top[verb + 1..]
+            .iter()
+            .any(|(_, word, token)| is_word(token.kind) && word == "WHERE");
+        if filtered {
+            continue;
+        }
+        // The table: after `UPDATE` or `DELETE FROM`, past `ONLY`.
+        let rest: Vec<(usize, String, Token)> = top[verb + 1..]
+            .iter()
+            .map(|entry| (*entry).clone())
+            .skip_while(|(_, word, _)| word == "FROM" || word == "ONLY")
+            .collect();
+        let table =
+            table_ref(text, &rest).map_or_else(String::new, |(table, _)| match table.schema {
+                Some(schema) => format!("{}.{}", schema.text, table.name.text),
+                None => table.name.text,
+            });
+        found.push(format!("{command} {table}").trim_end().to_owned());
+    }
+    found
+}
+
+/// The table a query reads, when it is one `SELECT` of plain columns from
+/// a single table, so its rows map back to the table's: no joins,
+/// grouping, `DISTINCT`, set operations or computed columns. Filtering,
+/// ordering and limits are fine.
+#[must_use]
+pub fn single_table_select(source: &str) -> Option<TableRef> {
+    let all = statements(source);
+    let [range] = all.as_slice() else {
+        return None;
+    };
+    let text = &source[range.clone()];
+    let tokens = significant(text);
+    if tokens.first()?.1 != "SELECT" {
+        return None;
+    }
+    let refused = [
+        "DISTINCT",
+        "GROUP",
+        "HAVING",
+        "UNION",
+        "INTERSECT",
+        "EXCEPT",
+        "WINDOW",
+        "JOIN",
+        "INTO",
+        "LATERAL",
+        "FOR",
+        "USING",
+    ];
+    if tokens.iter().any(|(depth, word, token)| {
+        *depth == 0 && is_word(token.kind) && refused.contains(&word.as_str())
+    }) {
+        return None;
+    }
+    let from = tokens
+        .iter()
+        .position(|(depth, word, token)| *depth == 0 && is_word(token.kind) && word == "FROM")?;
+
+    // Each column: `*`, `t.*`, `column` or `t.column`.
+    let list = &tokens[1..from];
+    if list.is_empty() {
+        return None;
+    }
+    for item in list.split(|(_, text, token)| token.kind == TokenKind::Punctuation && text == ",") {
+        let plain = match item {
+            [(_, star, token)] if token.kind == TokenKind::Operator => star == "*",
+            [(_, _, name)] => Name::read(text, name).is_some(),
+            [(_, _, qualifier), (_, dot, _), (_, last, token)] => {
+                Name::read(text, qualifier).is_some()
+                    && dot == "."
+                    && (Name::read(text, token).is_some()
+                        || (token.kind == TokenKind::Operator && last == "*"))
+            }
+            _ => false,
+        };
+        if !plain {
+            return None;
+        }
+    }
+
+    // `FROM table [AS] [alias]`, then the end or a clause that keeps rows
+    // as they are.
+    let after = &tokens[from + 1..];
+    let (table, used) = table_ref(text, after)?;
+    let mut rest = after[used..].iter().peekable();
+    if rest.peek().is_some_and(|(_, word, _)| word == "AS") {
+        rest.next();
+    }
+    if let Some((_, word, token)) = rest.peek()
+        && Name::read(text, token).is_some()
+        && !matches!(
+            word.as_str(),
+            "WHERE" | "ORDER" | "LIMIT" | "OFFSET" | "FETCH"
+        )
+    {
+        rest.next();
+    }
+    match rest.next() {
+        None => Some(table),
+        Some((0, word, token))
+            if is_word(token.kind)
+                && matches!(
+                    word.as_str(),
+                    "WHERE" | "ORDER" | "LIMIT" | "OFFSET" | "FETCH"
+                ) =>
+        {
+            Some(table)
+        }
+        Some(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writes_without_where_are_found() {
+        assert_eq!(unbounded_writes("UPDATE t SET a = 1"), ["UPDATE t"]);
+        assert_eq!(
+            unbounded_writes("delete from only public.\"Orders\";"),
+            ["DELETE public.Orders"]
+        );
+        assert_eq!(
+            unbounded_writes("UPDATE t SET a = (SELECT b FROM u WHERE u.id = 1)"),
+            ["UPDATE t"]
+        );
+        assert_eq!(
+            unbounded_writes("WITH x AS (SELECT 1 WHERE true) DELETE FROM t"),
+            ["DELETE t"]
+        );
+        // One statement among several.
+        assert_eq!(
+            unbounded_writes("UPDATE t SET a = 1 WHERE id = 2; DELETE FROM u;"),
+            ["DELETE u"]
+        );
+        for safe in [
+            "UPDATE t SET a = 1 WHERE id = 2",
+            "DELETE FROM t WHERE true",
+            "SELECT * FROM t",
+            "INSERT INTO t VALUES (1)",
+            "-- UPDATE t SET a = 1\nSELECT 1",
+            "SELECT 'UPDATE t SET a = 1'",
+            "WITH x AS (UPDATE t SET a = 1 WHERE id = 1 RETURNING *) SELECT * FROM x",
+        ] {
+            assert!(unbounded_writes(safe).is_empty(), "{safe}");
+        }
+    }
+
+    #[test]
+    fn single_table_selects_are_recognised() {
+        let table = |schema: Option<&str>, name: &str| TableRef {
+            schema: schema.map(|text| Name {
+                text: text.to_owned(),
+                quoted: false,
+            }),
+            name: Name {
+                text: name.to_owned(),
+                quoted: false,
+            },
+        };
+        assert_eq!(
+            single_table_select("SELECT * FROM clientes"),
+            Some(table(None, "clientes"))
+        );
+        assert_eq!(
+            single_table_select(
+                "select c.id, c.nome from public.clientes c where c.id > (select 1) order by 1 limit 10;"
+            ),
+            Some(table(Some("public"), "clientes"))
+        );
+        assert_eq!(
+            single_table_select("SELECT * FROM \"Clientes\" AS x").map(|t| t.name),
+            Some(Name {
+                text: "Clientes".to_owned(),
+                quoted: true
+            })
+        );
+        for refused in [
+            "SELECT count(*) FROM t",
+            "SELECT a + 1 FROM t",
+            "SELECT a AS b FROM t",
+            "SELECT * FROM t JOIN u ON true",
+            "SELECT * FROM t, u",
+            "SELECT DISTINCT a FROM t",
+            "SELECT a FROM t GROUP BY a",
+            "SELECT * FROM t UNION SELECT * FROM u",
+            "SELECT * FROM (SELECT 1) x",
+            "SELECT 1",
+            "SELECT * FROM t; SELECT * FROM u",
+            "UPDATE t SET a = 1",
+        ] {
+            assert_eq!(single_table_select(refused), None, "{refused}");
+        }
+    }
 
     #[test]
     fn passwords_never_reach_the_history() {

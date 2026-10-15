@@ -65,6 +65,18 @@ pub enum Action {
         relation: String,
     },
     Run(TabId, RunScope),
+    /// Runs again, the user having accepted statements without `WHERE`.
+    RunConfirmed(TabId, RunScope),
+    /// Opens the editor for a cell of a tab's rows.
+    EditCell(TabId, usize, usize),
+    /// Changes a cell in the grid, not on the server yet; `None` is NULL.
+    SetCell(TabId, usize, usize, Option<String>),
+    RevertCell(TabId, usize, usize),
+    DiscardEdits(TabId),
+    /// Shows the statements that save a tab's changed cells.
+    ReviewEdits(TabId),
+    /// Writes them, the user having reviewed them.
+    ApplyEdits(TabId),
     /// Saves an editor: to its file, else as a script of its connection's
     /// database, else wherever the user picks.
     SaveScript(TabId),
@@ -82,7 +94,9 @@ pub enum Action {
     ApplyFilter(TabId),
     ClearFilter(TabId),
     /// Sorts a data tab by a column, cycling the direction.
-    Sort(TabId, String),
+    /// Reads a tab's rows again sorted on the server by the column at this
+    /// index, descending or not; `None` takes the sort off.
+    SortBy(TabId, usize, Option<bool>),
     FetchMore(TabId),
     FetchAll(TabId),
     CountRows(TabId),
