@@ -57,6 +57,7 @@ jobs:
           workspaces: |
             . -> target
             providers/postgres -> target
+            providers/mysql -> target
 
       - name: Build and package
         run: scripts/package-providers.sh dist

@@ -3,8 +3,9 @@
 A modern, fast database client in the spirit of DBeaver, built with
 [egui](https://github.com/emilk/egui) and [fastframe](https://fastframe.dev).
 Databases come as **providers**: WebAssembly components Violet downloads
-the first time a connection needs one, and runs in a sandbox. PostgreSQL is
-the first; anyone can write another with the [SDK](crates/violet-sdk).
+the first time a connection needs one, and runs in a sandbox. PostgreSQL and
+MySQL (with MariaDB) come first; anyone can write another with the
+[SDK](crates/violet-sdk).
 
 ## Compared with DBeaver
 
@@ -49,6 +50,7 @@ violet-sdk              what providers are built with: wit/provider.wit,
                         Provider / Session traits, sockets, rows
 violet-provider-cli     `violet-provider`: inspect, install, package
 providers/postgres      the PostgreSQL provider (wasm32-wasip2)
+providers/mysql         the MySQL and MariaDB provider (wasm32-wasip2)
 ```
 
 Dependencies point inward: adapters depend on `violet-core`; `violet-app`

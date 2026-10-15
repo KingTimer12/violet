@@ -468,7 +468,8 @@ interface tools {
         /// `macos-aarch64`, `macos-x86_64`, `linux-x86_64`,
         /// `linux-aarch64` or `windows-x86_64`.
         platform: string,
-        /// An `https://` URL of a `.tar.gz` archive.
+        /// An `https://` URL of a `.tar.gz` or `.tar.xz` archive, told
+        /// apart by that ending.
         url: string,
         sha256: string,
         size: u64,
