@@ -60,6 +60,12 @@ fn main() -> eframe::Result {
         .with_app_id("dev.violet.Violet")
         .with_inner_size([1360.0, 860.0])
         .with_min_inner_size([880.0, 560.0])
+        // The title bar, taskbar and Alt+Tab icon on Windows and Linux;
+        // macOS takes the bundle's.
+        .with_icon(
+            eframe::icon_data::from_png_bytes(include_bytes!("../assets/app/violet.png"))
+                .unwrap_or_default(),
+        )
         // Draw under the title bar on macOS; the header leaves room for the
         // traffic lights (fastframe-macos).
         .with_fullsize_content_view(true)
