@@ -365,6 +365,9 @@ fn restore_command() -> Command {
     let command = Command::new("mysql")
         .stdin_from_path()
         .arg([text("--batch")])
+        // Client commands (`system`, `tee`, `pager`, `source`...) stay off
+        // in a script, all but `delimiter` and `charset`, which dumps use.
+        .arg([text("--binary-mode")])
         .flag("force", true, "--force")
         .arg_when(
             &[is("client", &["mysql"]), on("sandbox")],

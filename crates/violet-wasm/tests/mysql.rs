@@ -172,6 +172,7 @@ async fn backups_and_restores_are_declared_and_filled_by_violet() {
     assert!(mysql.stdin_from_path);
     assert!(mysql.args.contains(&"--database=copy".to_owned()));
     assert!(mysql.args.contains(&"--system-command=OFF".to_owned()));
+    assert!(mysql.args.contains(&"--binary-mode".to_owned()));
     // MariaDB's clients spell TLS and the sandbox their own way.
     request.settings.insert("client".into(), "mariadb".into());
     let mariadb = restore.build(&profile, &request).expect("mariadb");
