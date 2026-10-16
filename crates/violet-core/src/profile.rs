@@ -139,13 +139,18 @@ pub struct ConnectionProfile {
 }
 
 impl ConnectionProfile {
-    /// A blank profile for `driver`, listening on `port`.
+    /// A blank profile for `driver`, listening on `port`. Port 0 is a
+    /// file-based driver's: the host is then the database file's path.
     pub fn new(driver: DriverId, port: u16) -> Self {
         Self {
             id: ConnectionId::new(),
             name: String::new(),
             driver,
-            host: "localhost".to_owned(),
+            host: if port == 0 {
+                String::new()
+            } else {
+                "localhost".to_owned()
+            },
             port,
             database: String::new(),
             username: String::new(),
@@ -157,18 +162,55 @@ impl ConnectionProfile {
         }
     }
 
-    /// The name shown in lists: the profile's own, or `user@host/db`.
+    /// Whether the profile opens a database file (a file-based driver's,
+    /// port 0) rather than a server: the host is then the file's path.
+    #[must_use]
+    pub fn is_file(&self) -> bool {
+        self.port == 0
+    }
+
+    /// The database file's name, for a file profile.
+    #[must_use]
+    pub fn file_name(&self) -> &str {
+        self.host.rsplit(['/', '\\']).next().unwrap_or(&self.host)
+    }
+
+    /// Where the profile connects, as lists show it: `host:port`, or the
+    /// file's path.
+    #[must_use]
+    pub fn address(&self) -> String {
+        if self.is_file() {
+            self.host.clone()
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+
+    /// The name shown in lists: the profile's own, or `user@host/db` (the
+    /// file's name for a file).
     #[must_use]
     pub fn display_name(&self) -> String {
-        if self.name.trim().is_empty() {
-            format!("{}@{}/{}", self.username, self.host, self.database)
-        } else {
+        if !self.name.trim().is_empty() {
             self.name.clone()
+        } else if self.is_file() {
+            self.file_name().to_owned()
+        } else {
+            format!("{}@{}/{}", self.username, self.host, self.database)
         }
     }
 
     /// Checks the fields a connection cannot do without.
     pub fn validate(&self) -> Result<(), String> {
+        if self.is_file() {
+            let path = std::path::Path::new(self.host.trim());
+            if self.host.trim().is_empty() {
+                return Err("Database file is required".to_owned());
+            }
+            if !path.is_absolute() {
+                return Err("Database file must be a full path".to_owned());
+            }
+            return Ok(());
+        }
         if self.host.trim().is_empty() {
             return Err("Host is required".to_owned());
         }
@@ -191,6 +233,27 @@ pub struct Credentials {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_profiles_need_a_full_path_and_nothing_else() {
+        let mut profile = ConnectionProfile::new(DriverId::new("sqlite"), 0);
+        assert!(profile.is_file());
+        assert_eq!(
+            profile.validate(),
+            Err("Database file is required".to_owned())
+        );
+        profile.host = "shop.db".to_owned();
+        assert_eq!(
+            profile.validate(),
+            Err("Database file must be a full path".to_owned())
+        );
+        let absolute = std::env::temp_dir().join("shop.db");
+        profile.host = absolute.to_string_lossy().into_owned();
+        assert_eq!(profile.validate(), Ok(()));
+        assert_eq!(profile.file_name(), "shop.db");
+        assert_eq!(profile.display_name(), "shop.db");
+        assert_eq!(profile.address(), profile.host);
+    }
 
     #[test]
     fn validation_names_the_missing_field() {

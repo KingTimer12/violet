@@ -7,6 +7,7 @@ wasmtime::component::bindgen!({
     exports: { default: async },
     with: {
         "violet:provider/network.socket": crate::socket::Socket,
+        "violet:provider/files.file": crate::files::DbFile,
     },
 });
 

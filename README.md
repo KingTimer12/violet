@@ -3,8 +3,8 @@
 A modern, fast database client in the spirit of DBeaver, built with
 [egui](https://github.com/emilk/egui) and [fastframe](https://fastframe.dev).
 Databases come as **providers**: WebAssembly components Violet downloads
-the first time a connection needs one, and runs in a sandbox. PostgreSQL and
-MySQL (with MariaDB) come first; anyone can write another with the
+the first time a connection needs one, and runs in a sandbox. PostgreSQL,
+MySQL (with MariaDB) and SQLite come first; anyone can write another with the
 [SDK](crates/violet-sdk).
 
 ## Compared with DBeaver
@@ -51,6 +51,7 @@ violet-sdk              what providers are built with: wit/provider.wit,
 violet-provider-cli     `violet-provider`: inspect, install, package
 providers/postgres      the PostgreSQL provider (wasm32-wasip2)
 providers/mysql         the MySQL and MariaDB provider (wasm32-wasip2)
+providers/sqlite        the SQLite provider, SQLite compiled in (wasm32-wasip2)
 ```
 
 Dependencies point inward: adapters depend on `violet-core`; `violet-app`
@@ -84,6 +85,15 @@ Each provider runs in its own sandbox, per connection: no files, no
 environment, no network except a socket to the host and port of the
 profile it serves, with TLS done by Violet. Even a hostile provider cannot
 send a password or rows anywhere else.
+
+SQLite connections open a database file instead: pick one (or create one)
+in the connection form, optionally read-only. The provider reaches that
+file and its `-journal`/`-wal` beside it, nothing else, through Violet;
+`ATTACH` of other files is refused (`:memory:` works). Locks are SQLite's
+own, on the same bytes native SQLite locks, so a database can stay open in
+other programs while Violet uses it. A database in WAL mode is opened
+exclusively (the sandbox has no shared memory for the WAL index): close
+other programs using it first.
 
 ### Adding a database
 
@@ -372,7 +382,8 @@ any other, as installed copies compare the two.
 
 | Platform | File | Install |
 | --- | --- | --- |
-| Windows x64 | `violet-<tag>-x86_64-pc-windows-msvc.zip` | Unzip and run `violet.exe` |
+| Windows x64 | `violet-<tag>-x86_64-pc-windows-msvc.msi` | Run it: installs for this user (no administrator) into `%LOCALAPPDATA%\Programs\Violet`, with a Start menu shortcut |
+| Windows x64, portable | `violet-<tag>-x86_64-pc-windows-msvc.zip` | Unzip and run `violet.exe`; keep `violet-portable.txt` beside it, or it cannot update itself |
 | macOS 11+ (Apple silicon and Intel) | `violet-<tag>-macos-universal.dmg` | Drag Violet to Applications; the first time, right click it > Open (the app is not notarized) |
 | Linux x86_64 / aarch64 | `violet-<tag>-<arch>-unknown-linux-gnu.tar.gz` | Unpack and run `./install.sh` (to `~/.local`), or `./violet` in place |
 
@@ -380,7 +391,9 @@ Each comes with its SHA-256 (`.sha256`). At the release's top level sit
 `providers.json` and each provider's `.wasm`, where Violet's default
 catalogue URL finds them. Running the workflow by hand builds the same
 files as artifacts without publishing. The packages are made by
-`scripts/package-{macos,linux}.sh`, which work the same locally; the app
+`scripts/package-{macos,linux}.sh` and `scripts/package-windows.ps1`
+(the `.msi` from `packaging/windows/violet.wxs`, with the WiX Toolset 5),
+which work the same locally; the app
 icons come from `assets/app/violet.svg` (`scripts/app-icons.sh`).
 
 #### Updates
@@ -430,8 +443,9 @@ before signing with it.
 
 ```sh
 rustup target add wasm32-wasip2
-# Build the providers and a local catalogue, and run against it:
-scripts/package-providers.sh dist
+# Build the providers and a local catalogue, and run against it. SQLite's C
+# needs the WASI SDK (https://github.com/WebAssembly/wasi-sdk/releases):
+WASI_SDK_PATH=/opt/wasi-sdk scripts/package-providers.sh dist
 VIOLET_PROVIDER_INDEX=$PWD/dist/providers.json cargo run
 
 cargo test --workspace

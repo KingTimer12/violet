@@ -433,8 +433,9 @@ fn header(
             };
             ui.label(
                 RichText::new(format!(
-                    "{} · {database}{}:{}",
-                    env.driver_name, env.profile.host, env.profile.port
+                    "{} · {database}{}",
+                    env.driver_name,
+                    env.profile.address()
                 ))
                 .color(palette.secondary),
             );

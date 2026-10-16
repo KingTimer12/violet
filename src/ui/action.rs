@@ -171,6 +171,8 @@ pub enum Action {
     Reveal(PathBuf),
     /// Quits so the downloaded update installs, then starts it.
     RestartToUpdate,
+    /// Checks for, and downloads, the update again after a failure.
+    RetryUpdate,
     /// Opens a web page, such as a release's.
     OpenUrl(String),
 }

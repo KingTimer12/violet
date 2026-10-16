@@ -1795,6 +1795,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b97b65636e5b9ef369943878ac74335ba1c55c1cb6adbf1e2c293c624248d693"
 
 [[package]]
+name = "file-guard"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "21ef72acf95ec3d7dbf61275be556299490a245f017cf084bd23b4f68cf9407c"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "filetime"
 version = "0.2.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5301,7 +5311,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "violet"
-version = "0.1.6"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "eframe",
@@ -5333,7 +5343,7 @@ dependencies = [
 
 [[package]]
 name = "violet-app"
-version = "0.1.6"
+version = "0.1.8"
 dependencies = [
  "async-trait",
  "hotpath",
@@ -5345,7 +5355,7 @@ dependencies = [
 
 [[package]]
 name = "violet-core"
-version = "0.1.6"
+version = "0.1.8"
 dependencies = [
  "async-trait",
  "serde",
@@ -5356,7 +5366,7 @@ dependencies = [
 
 [[package]]
 name = "violet-provider-cli"
-version = "0.1.6"
+version = "0.1.8"
 dependencies = [
  "serde_json",
  "tokio",
@@ -5368,7 +5378,7 @@ dependencies = [
 
 [[package]]
 name = "violet-providers"
-version = "0.1.6"
+version = "0.1.8"
 dependencies = [
  "async-trait",
  "flate2",
@@ -5388,7 +5398,7 @@ dependencies = [
 
 [[package]]
 name = "violet-sdk"
-version = "0.1.6"
+version = "0.1.8"
 dependencies = [
  "log",
  "wit-bindgen 0.62.0",
@@ -5396,7 +5406,7 @@ dependencies = [
 
 [[package]]
 name = "violet-storage"
-version = "0.1.6"
+version = "0.1.8"
 dependencies = [
  "directories",
  "hotpath",
@@ -5411,9 +5421,10 @@ dependencies = [
 
 [[package]]
 name = "violet-wasm"
-version = "0.1.6"
+version = "0.1.8"
 dependencies = [
  "async-trait",
+ "file-guard",
  "hotpath",
  "log",
  "rustls",

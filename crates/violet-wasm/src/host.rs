@@ -1,5 +1,5 @@
-//! What an instance can call: its socket and the log, plus a WASI with
-//! nothing in it.
+//! What an instance can call: its socket, its database file and the log,
+//! plus a WASI with nothing in it.
 
 use std::sync::Arc;
 
@@ -8,7 +8,8 @@ use wasmtime::{StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
 use crate::bindings::types::{DbError, ErrorKind};
-use crate::bindings::violet::provider::{logging, network};
+use crate::bindings::violet::provider::{files, logging, network};
+use crate::files::{DbFile, MAX_FILES};
 use crate::socket::{Kill, MAX_OPENS, MAX_SOCKETS, PlainBudget, Socket, Target, error};
 
 /// Memory one instance may use.
@@ -28,6 +29,8 @@ pub struct HostState {
     /// Sockets open now, and opened in all.
     sockets: usize,
     opened: usize,
+    /// Files open now.
+    files: usize,
     plain_budget: Arc<PlainBudget>,
     /// For log lines.
     provider: String,
@@ -58,6 +61,7 @@ impl HostState {
             kill,
             sockets: 0,
             opened: 0,
+            files: 0,
             plain_budget: Arc::new(PlainBudget::new()),
             provider: "provider".into(),
         }
@@ -138,6 +142,107 @@ impl network::HostSocket for HostState {
     async fn drop(&mut self, socket: Resource<Socket>) -> wasmtime::Result<()> {
         self.table.delete(socket)?;
         self.sockets = self.sockets.saturating_sub(1);
+        Ok(())
+    }
+}
+
+impl HostState {
+    /// The profile whose database file may be opened.
+    fn file_target(&self) -> Result<&Target, DbError> {
+        self.target
+            .as_ref()
+            .ok_or_else(|| error(ErrorKind::Unsupported, "No connection is being opened"))
+    }
+
+    fn file(&mut self, resource: &Resource<DbFile>) -> Result<&mut DbFile, DbError> {
+        self.table
+            .get_mut(resource)
+            .map_err(|e| error(ErrorKind::Other, e.to_string()))
+    }
+}
+
+impl files::Host for HostState {
+    async fn open(
+        &mut self,
+        suffix: String,
+        create: bool,
+        read_only: bool,
+    ) -> Result<Resource<DbFile>, DbError> {
+        if self.files >= MAX_FILES {
+            return Err(error(ErrorKind::Other, "Too many open files"));
+        }
+        let file = DbFile::open(self.file_target()?, &suffix, create, read_only)?;
+        let resource = self
+            .table
+            .push(file)
+            .map_err(|e| error(ErrorKind::Other, e.to_string()))?;
+        self.files += 1;
+        Ok(resource)
+    }
+
+    async fn exists(&mut self, suffix: String) -> Result<bool, DbError> {
+        crate::files::exists(self.file_target()?, &suffix)
+    }
+
+    async fn delete(&mut self, suffix: String) -> Result<(), DbError> {
+        crate::files::delete(self.file_target()?, &suffix)
+    }
+}
+
+impl files::HostFile for HostState {
+    async fn read(
+        &mut self,
+        file: Resource<DbFile>,
+        offset: u64,
+        len: u32,
+    ) -> Result<Vec<u8>, DbError> {
+        self.file(&file)?.read(offset, len)
+    }
+
+    async fn write(
+        &mut self,
+        file: Resource<DbFile>,
+        offset: u64,
+        bytes: Vec<u8>,
+    ) -> Result<(), DbError> {
+        self.file(&file)?.write(offset, &bytes)
+    }
+
+    async fn size(&mut self, file: Resource<DbFile>) -> Result<u64, DbError> {
+        self.file(&file)?.size()
+    }
+
+    async fn truncate(&mut self, file: Resource<DbFile>, size: u64) -> Result<(), DbError> {
+        self.file(&file)?.truncate(size)
+    }
+
+    async fn sync(&mut self, file: Resource<DbFile>) -> Result<(), DbError> {
+        self.file(&file)?.sync()
+    }
+
+    async fn lock(
+        &mut self,
+        file: Resource<DbFile>,
+        level: files::LockLevel,
+    ) -> Result<bool, DbError> {
+        self.file(&file)?.lock(level)
+    }
+
+    async fn unlock(
+        &mut self,
+        file: Resource<DbFile>,
+        level: files::LockLevel,
+    ) -> Result<(), DbError> {
+        self.file(&file)?.unlock(level)
+    }
+
+    async fn reserved(&mut self, file: Resource<DbFile>) -> Result<bool, DbError> {
+        self.file(&file)?.reserved()
+    }
+
+    async fn drop(&mut self, file: Resource<DbFile>) -> wasmtime::Result<()> {
+        self.table.delete(file)?;
+        self.files = self.files.saturating_sub(1);
         Ok(())
     }
 }

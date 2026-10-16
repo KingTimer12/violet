@@ -4,7 +4,8 @@
 /// import only what is listed in the `provider` world below. It has no
 /// file system, no environment and no sockets of its own: the one network
 /// connection it can open goes to the host and port of the profile it was
-/// asked to connect to, through `network`.
+/// asked to connect to, through `network`, and a file-based provider's one
+/// file is the profile's, through `files`.
 package violet:provider@0.1.0;
 
 /// Shapes shared by Violet and providers.
@@ -202,6 +203,56 @@ interface network {
     /// When the profile's host is a socket directory (an absolute path),
     /// opens the socket file `name` inside it, such as `.s.PGSQL.5432`.
     connect-local: func(name: string) -> result<socket, db-error>;
+}
+
+/// The database file of a file-based provider, such as SQLite's.
+///
+/// A provider whose `default-port` is 0 opens a file instead of reaching a
+/// server: the profile's host is the file's absolute path, and its port is
+/// 0. Through this interface the provider reaches that file and the files
+/// its database keeps beside it (`-journal`, `-wal`), and nothing else.
+/// Locks follow SQLite's scheme, on the same bytes of the file native
+/// SQLite locks, so Violet and other programs using the database take
+/// turns.
+interface files {
+    use types.{db-error};
+
+    /// SQLite's lock levels; each allows what the ones before it do.
+    enum lock-level {
+        none,
+        shared,
+        reserved,
+        pending,
+        exclusive,
+    }
+
+    resource file {
+        /// Up to `len` bytes from `offset`; fewer only past the end.
+        read: func(offset: u64, len: u32) -> result<list<u8>, db-error>;
+        /// Writes all of `bytes` at `offset`, growing the file as needed.
+        write: func(offset: u64, bytes: list<u8>) -> result<_, db-error>;
+        size: func() -> result<u64, db-error>;
+        truncate: func(size: u64) -> result<_, db-error>;
+        /// Flushes what was written to the disk.
+        sync: func() -> result<_, db-error>;
+        /// Raises this file's lock to `level`. False when another
+        /// connection, here or in another program, holds a lock that
+        /// conflicts: the database is busy.
+        lock: func(level: lock-level) -> result<bool, db-error>;
+        /// Lowers this file's lock to `level`, `shared` or `none`.
+        unlock: func(level: lock-level) -> result<_, db-error>;
+        /// Whether any connection holds a `reserved` lock or higher.
+        reserved: func() -> result<bool, db-error>;
+    }
+
+    /// Opens the database file, with an empty `suffix`, or the file named
+    /// like it plus `suffix`: `-journal` or `-wal`. `create` makes it when
+    /// missing; `read-only` refuses writes.
+    open: func(suffix: string, create: bool, read-only: bool) -> result<file, db-error>;
+    /// Whether the file with `suffix` exists.
+    exists: func(suffix: string) -> result<bool, db-error>;
+    /// Deletes the `-journal` or `-wal` file; never the database itself.
+    delete: func(suffix: string) -> result<_, db-error>;
 }
 
 /// Messages for Violet's log.
@@ -497,6 +548,7 @@ interface tools {
 
 world provider-world {
     import network;
+    import files;
     import logging;
     export provider;
     export tools;

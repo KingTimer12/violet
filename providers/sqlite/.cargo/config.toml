@@ -1,0 +1,8 @@
+# SQLite's compile-time options (libsqlite3-sys passes them as -D flags).
+# - SQLITE_OS_OTHER: no operating-system layer; src/vfs.rs is the only one.
+# - SQLITE_TEMP_STORE=3: temporary tables and indexes stay in memory.
+# - SQLITE_DEFAULT_FOREIGN_KEYS=0: as the sqlite3 shell and most programs,
+#   rather than libsqlite3-sys's default of enforcing them.
+# - SQLITE_OMIT_LOAD_EXTENSION: a sandbox loads no libraries.
+[env]
+LIBSQLITE3_FLAGS = "SQLITE_OS_OTHER=1 SQLITE_TEMP_STORE=3 SQLITE_DEFAULT_FOREIGN_KEYS=0 SQLITE_OMIT_LOAD_EXTENSION=1"
