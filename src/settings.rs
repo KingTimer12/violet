@@ -54,6 +54,8 @@ pub struct Settings {
     pub backup_name: String,
     /// Where a script was last saved, for the file dialogs.
     pub script_folder: String,
+    /// Where rows were last exported, for the file dialog.
+    pub export_folder: String,
     /// Check for new versions and download them in the background.
     pub updates: bool,
 }
@@ -71,6 +73,7 @@ impl Default for Settings {
             backup_folder: String::new(),
             backup_name: String::new(),
             script_folder: String::new(),
+            export_folder: String::new(),
             updates: true,
         }
     }

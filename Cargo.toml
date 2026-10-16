@@ -78,6 +78,8 @@ fastframe-macos = { git = "https://github.com/crmne/fastframe", tag = "v0.2.3" }
 fastframe-update = { git = "https://github.com/crmne/fastframe", tag = "v0.6.0" }
 anyhow = "1"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+serde_json.workspace = true
 
 [build-dependencies]
 # The Windows executable's icon (build.rs).

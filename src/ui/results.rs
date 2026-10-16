@@ -19,6 +19,7 @@ use super::widgets::{self, Tone};
 use super::workspace::{
     Count, Executed, Outcome, Paging, QueryTab, TabKind, format_duration, thousands,
 };
+use crate::export::{to_delimited, write_row};
 use crate::sql;
 
 const ROW_HEIGHT: f32 = 26.0;
@@ -165,11 +166,25 @@ pub fn show(
                             edit_bar(ui, tab.id, tab.edits.len(), editing, actions);
                         }
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if set.has_rows()
-                                && widgets::icon_button(ui, Icon::Copy, "Copy all rows as CSV")
+                            if set.has_rows() {
+                                let export =
+                                    widgets::icon_button(ui, Icon::Download, "Export rows…");
+                                egui::Popup::menu(&export).show(|ui| {
+                                    for format in crate::export::Format::ALL {
+                                        if super::sidebar::menu_item(
+                                            ui,
+                                            Icon::Download,
+                                            format.label(),
+                                        ) {
+                                            actions.push(Action::Export(tab.id, format));
+                                        }
+                                    }
+                                });
+                                if widgets::icon_button(ui, Icon::Copy, "Copy all rows as CSV")
                                     .clicked()
-                            {
-                                actions.push(Action::Copy(to_delimited(set, ',')));
+                                {
+                                    actions.push(Action::Copy(to_delimited(set, ',')));
+                                }
                             }
                             if tab.last_run.is_some()
                                 && widgets::icon_button(
@@ -767,85 +782,9 @@ fn error_card(ui: &mut Ui, error: &DbError, executed: &Executed, editor: &str) {
         });
 }
 
-/// Appends one delimited line of `cells` to `out`; `NULL` is empty.
-fn write_row<'a>(out: &mut String, cells: impl Iterator<Item = Option<&'a str>>, separator: char) {
-    for (index, value) in cells.enumerate() {
-        if index > 0 {
-            out.push(separator);
-        }
-        write_field(out, value.unwrap_or_default(), separator);
-    }
-}
-
-/// Appends a field, quoted when it holds the separator, a quote or a line
-/// break.
-fn write_field(out: &mut String, value: &str, separator: char) {
-    let quote = value
-        .chars()
-        .any(|c| c == separator || matches!(c, '"' | '\n' | '\r'));
-    if quote {
-        out.push('"');
-        for (index, part) in value.split('"').enumerate() {
-            if index > 0 {
-                out.push_str("\"\"");
-            }
-            out.push_str(part);
-        }
-        out.push('"');
-    } else {
-        out.push_str(value);
-    }
-}
-
-/// The set as CSV (or TSV), header first, built in one buffer sized up
-/// front.
-#[hotpath::measure]
-pub fn to_delimited(set: &ResultSet, separator: char) -> String {
-    let cells = set.rows.len() * set.columns.len();
-    let mut out = String::with_capacity(set.rows.text_len() + cells + 64);
-    write_row(
-        &mut out,
-        set.columns.iter().map(|c| Some(c.name.as_str())),
-        separator,
-    );
-    for row in set.rows.iter() {
-        out.push('\n');
-        write_row(&mut out, row.iter(), separator);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
-    use violet_core::ColumnMeta;
-
     use super::*;
-
-    #[test]
-    fn csv_quotes_only_what_needs_it() {
-        let mut set = ResultSet {
-            columns: vec![
-                ColumnMeta {
-                    name: "id".into(),
-                    type_name: None,
-                    numeric: true,
-                },
-                ColumnMeta {
-                    name: "note".into(),
-                    type_name: None,
-                    numeric: false,
-                },
-            ],
-            ..ResultSet::default()
-        };
-        set.rows.push([Some("1"), Some("plain")]);
-        set.rows.push([Some("2"), Some("a, \"b\"\nc")]);
-        set.rows.push([Some("3"), None]);
-        assert_eq!(
-            to_delimited(&set, ','),
-            "id,note\n1,plain\n2,\"a, \"\"b\"\"\nc\"\n3,"
-        );
-    }
 
     #[test]
     fn previews_show_the_first_line() {

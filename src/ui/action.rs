@@ -113,6 +113,8 @@ pub enum Action {
     RemoveProvider(DriverId),
     ToggleSidebar,
     Copy(String),
+    /// Writes the shown rows of a tab to a file in a format.
+    Export(TabId, crate::export::Format),
     /// Closes the referenced row beside a tab's grid.
     CloseReference(TabId),
     OpenHistory,

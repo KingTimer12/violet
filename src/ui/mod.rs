@@ -9,6 +9,7 @@ mod connection_form;
 mod devtools;
 mod edit_flow;
 mod editor;
+mod export_flow;
 mod fonts;
 mod history;
 pub mod icons;
@@ -105,6 +106,8 @@ pub struct VioletApp {
     applying: HashMap<violet_app::RequestId, edit_flow::Applying>,
     /// The row the selected foreign key cell points at.
     reference: Option<reference::Reference>,
+    /// Exports waiting for every row to be read.
+    exports: HashMap<violet_app::RequestId, export_flow::PendingExport>,
     confirm_delete: Option<ConnectionId>,
     /// Runs waiting for their tab's connection to open.
     queued: Vec<(TabId, RunScope)>,
@@ -215,6 +218,7 @@ impl VioletApp {
             run_review: None,
             applying: HashMap::new(),
             reference: None,
+            exports: HashMap::new(),
             confirm_delete: None,
             queued: Vec::new(),
             actions: Vec::new(),
@@ -556,6 +560,10 @@ impl VioletApp {
             Event::QueryFinished { request, result } => {
                 if let Some(applying) = self.applying.remove(&request) {
                     self.edits_applied(ctx, applying, &result);
+                    return;
+                }
+                if let Some(pending) = self.exports.remove(&request) {
+                    self.export_read(ctx, pending, result);
                     return;
                 }
                 if self.awaits_reference(request) {
@@ -1529,6 +1537,7 @@ impl VioletApp {
                 self.settings.sidebar = !self.settings.sidebar;
                 self.save_settings(ctx);
             }
+            Action::Export(tab_id, format) => self.export(ctx, tab_id, format),
             Action::CloseReference(tab_id) => {
                 if let Some(tab) = self.workspace.get_mut(tab_id) {
                     tab.selected_cell = None;
