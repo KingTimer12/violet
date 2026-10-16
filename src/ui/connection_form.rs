@@ -70,6 +70,16 @@ impl ConnectionForm {
         ) {
             self.profile.username.clone_from(&to.default_user);
         }
+        // Between a server and a database file, the host means something
+        // else: a host name, or the file's path.
+        let was_file = from.is_some_and(|f| f.default_port == 0);
+        let is_file = to.default_port == 0;
+        if is_file && !was_file {
+            self.port = "0".to_owned();
+            self.profile.host.clear();
+        } else if was_file && !is_file {
+            self.profile.host = "localhost".to_owned();
+        }
     }
 
     pub fn edit(profile: ConnectionProfile, has_saved_password: bool) -> Self {
@@ -106,6 +116,10 @@ impl ConnectionForm {
         profile.host = profile.host.trim().to_owned();
         profile.username = profile.username.trim().to_owned();
         profile.database = profile.database.trim().to_owned();
+        if profile.is_file() {
+            // Nothing to keep in the keychain for a file.
+            profile.save_password = false;
+        }
         if let Err(message) = profile.validate() {
             self.error = Some(message);
             return None;
@@ -125,6 +139,11 @@ pub fn show(
     let chosen = drivers
         .iter()
         .find(|driver| driver.info.id == form.profile.driver);
+    // A database file rather than a server (SQLite): no host, port, user or
+    // password, but a path.
+    let file_based = chosen.map_or(form.profile.is_file(), |driver| {
+        driver.info.default_port == 0
+    });
     let palette = Palette::current(ctx);
     let mut open = true;
     let modal = egui::Modal::new(egui::Id::new("connection-form"))
@@ -204,52 +223,57 @@ pub fn show(
                 ))
             });
 
-            ui.columns(2, |columns| {
-                widgets::field(&mut columns[0], "Host", |ui| {
-                    ui.add(widgets::text_input(&mut form.profile.host, "localhost"))
+            if file_based {
+                database_file(ui, form);
+            } else {
+                ui.columns(2, |columns| {
+                    widgets::field(&mut columns[0], "Host", |ui| {
+                        ui.add(widgets::text_input(&mut form.profile.host, "localhost"))
+                    });
+                    widgets::field(&mut columns[1], "Port", |ui| {
+                        ui.add(widgets::text_input(&mut form.port, "5432"))
+                    });
                 });
-                widgets::field(&mut columns[1], "Port", |ui| {
-                    ui.add(widgets::text_input(&mut form.port, "5432"))
+                ui.columns(2, |columns| {
+                    widgets::field(&mut columns[0], "Database", |ui| {
+                        ui.add(widgets::text_input(&mut form.profile.database, "postgres"))
+                    });
+                    widgets::field(&mut columns[1], "User", |ui| {
+                        ui.add(widgets::text_input(&mut form.profile.username, "postgres"))
+                    });
                 });
-            });
-            ui.columns(2, |columns| {
-                widgets::field(&mut columns[0], "Database", |ui| {
-                    ui.add(widgets::text_input(&mut form.profile.database, "postgres"))
-                });
-                widgets::field(&mut columns[1], "User", |ui| {
-                    ui.add(widgets::text_input(&mut form.profile.username, "postgres"))
-                });
-            });
 
-            widgets::field(ui, "Password", |ui| {
+                widgets::field(ui, "Password", |ui| {
+                    ui.horizontal(|ui| {
+                        let hint = if form.has_saved_password {
+                            "Saved in keychain — type to replace"
+                        } else {
+                            "Password"
+                        };
+                        let width = ui.available_width() - 36.0;
+                        ui.add_sized(
+                            [width, 30.0],
+                            widgets::text_input(&mut form.password, hint)
+                                .password(!form.show_password),
+                        );
+                        let (icon, tip) = if form.show_password {
+                            (Icon::EyeOff, "Hide")
+                        } else {
+                            (Icon::Eye, "Show")
+                        };
+                        if widgets::icon_button(ui, icon, tip).clicked() {
+                            form.show_password = !form.show_password;
+                        }
+                    })
+                    .response
+                });
                 ui.horizontal(|ui| {
-                    let hint = if form.has_saved_password {
-                        "Saved in keychain — type to replace"
-                    } else {
-                        "Password"
-                    };
-                    let width = ui.available_width() - 36.0;
-                    ui.add_sized(
-                        [width, 30.0],
-                        widgets::text_input(&mut form.password, hint).password(!form.show_password),
+                    ui.checkbox(
+                        &mut form.profile.save_password,
+                        "Save password in the system keychain",
                     );
-                    let (icon, tip) = if form.show_password {
-                        (Icon::EyeOff, "Hide")
-                    } else {
-                        (Icon::Eye, "Show")
-                    };
-                    if widgets::icon_button(ui, icon, tip).clicked() {
-                        form.show_password = !form.show_password;
-                    }
-                })
-                .response
-            });
-            ui.horizontal(|ui| {
-                ui.checkbox(
-                    &mut form.profile.save_password,
-                    "Save password in the system keychain",
-                );
-            });
+                });
+            }
             if chosen.is_some_and(|driver| driver.info.capabilities.databases) {
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut form.profile.show_all_databases, "Show all databases")
@@ -259,7 +283,7 @@ pub fn show(
                 });
             }
 
-            let tls = chosen.is_some_and(|driver| driver.info.capabilities.tls);
+            let tls = !file_based && chosen.is_some_and(|driver| driver.info.capabilities.tls);
             ui.horizontal(|ui| {
                 if tls {
                     ui.vertical(|ui| {
@@ -397,6 +421,68 @@ pub fn show(
         open = false;
     }
     open
+}
+
+/// File extensions SQLite databases go by.
+const DATABASE_FILES: [&str; 5] = ["db", "sqlite", "sqlite3", "db3", "s3db"];
+
+/// The database file field: its path, picked or typed, and whether it
+/// opens read-only.
+fn database_file(ui: &mut egui::Ui, form: &mut ConnectionForm) {
+    widgets::field(ui, "Database file", |ui| {
+        ui.horizontal(|ui| {
+            let width = ui.available_width() - 190.0;
+            ui.add_sized(
+                [width.max(120.0), 30.0],
+                widgets::text_input(&mut form.profile.host, "Path to a .db or .sqlite file"),
+            );
+            let start = std::path::Path::new(form.profile.host.trim())
+                .parent()
+                .filter(|folder| folder.is_dir())
+                .map(std::path::Path::to_path_buf);
+            let picker = || {
+                let picker = rfd::FileDialog::new()
+                    .add_filter("SQLite database", &DATABASE_FILES)
+                    .add_filter("All files", &["*"]);
+                match &start {
+                    Some(folder) => picker.set_directory(folder),
+                    None => picker,
+                }
+            };
+            if widgets::button(ui, Tone::Secondary, Some(Icon::FolderOpen), "Open…")
+                .on_hover_text("Pick an existing database file")
+                .clicked()
+                && let Some(path) = picker().set_title("Open a SQLite database").pick_file()
+            {
+                form.profile.host = path.to_string_lossy().into_owned();
+            }
+            if widgets::button(ui, Tone::Secondary, Some(Icon::Plus), "New…")
+                .on_hover_text("Create a new, empty database file")
+                .clicked()
+                && let Some(path) = picker()
+                    .set_title("Create a SQLite database")
+                    .set_file_name("database.db")
+                    .save_file()
+            {
+                form.profile.host = path.to_string_lossy().into_owned();
+            }
+        })
+        .response
+    });
+    let mut read_only = form.profile.options.get("read_only").map(String::as_str) == Some("true");
+    if ui
+        .checkbox(&mut read_only, "Read only")
+        .on_hover_text("Open the database without changing it")
+        .changed()
+    {
+        if read_only {
+            form.profile
+                .options
+                .insert("read_only".to_owned(), "true".to_owned());
+        } else {
+            form.profile.options.remove("read_only");
+        }
+    }
 }
 
 fn swatch(ui: &mut egui::Ui, value: &mut Option<[u8; 3]>, tag: Option<[u8; 3]>, palette: &Palette) {

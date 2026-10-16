@@ -130,16 +130,27 @@ fn update_badge(ui: &mut Ui, update: &crate::update::Status, actions: &mut Vec<A
                 actions.push(Action::RestartToUpdate);
             }
         }
+        Status::Installing { version } => {
+            ui.label(
+                RichText::new(format!("Installing Violet {version}…"))
+                    .font(theme::medium(12.0))
+                    .color(palette.secondary),
+            );
+        }
         Status::Manual {
             version,
             url,
             reason,
         } => {
-            if widgets::icon_button(
+            // Labelled, not a bare icon: this copy cannot update itself and
+            // the reason has to be seen.
+            if widgets::button(
                 ui,
-                Icon::Download,
-                &format!("Violet {version} is out. {reason}"),
+                Tone::Secondary,
+                Some(Icon::Download),
+                &format!("Violet {version} available"),
             )
+            .on_hover_text(format!("{reason}\n\nClick to open the release page."))
             .clicked()
             {
                 actions.push(Action::OpenUrl(url.clone()));
@@ -150,13 +161,20 @@ fn update_badge(ui: &mut Ui, update: &crate::update::Status, actions: &mut Vec<A
             url,
             error,
         } => {
-            if widgets::icon_button(
+            let response = widgets::button(
                 ui,
-                Icon::CircleAlert,
-                &format!("Violet {version} could not be downloaded: {error}"),
+                Tone::Secondary,
+                Some(Icon::CircleAlert),
+                "Update failed",
             )
-            .clicked()
-            {
+            .on_hover_text(format!(
+                "Violet {version} could not be installed: {error}\n\n\
+                 Click to try again, or right-click to open the release page."
+            ));
+            if response.clicked() {
+                actions.push(Action::RetryUpdate);
+            }
+            if response.secondary_clicked() {
                 actions.push(Action::OpenUrl(url.clone()));
             }
         }
@@ -795,10 +813,14 @@ fn connection_card(
         theme::semibold(13.5),
         palette.text,
     );
-    let detail = format!(
-        "{}@{}:{}/{}",
-        profile.username, profile.host, profile.port, profile.database
-    );
+    let detail = if profile.is_file() {
+        profile.host.clone()
+    } else {
+        format!(
+            "{}@{}:{}/{}",
+            profile.username, profile.host, profile.port, profile.database
+        )
+    };
     let detail_rect = egui::Rect::from_min_max(
         egui::pos2(text_left, rect.center().y),
         egui::pos2(rect.right() - 120.0, rect.bottom() - 8.0),

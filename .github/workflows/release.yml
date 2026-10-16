@@ -68,6 +68,20 @@ jobs:
             . -> target
             providers/postgres -> target
             providers/mysql -> target
+            providers/sqlite -> target
+
+      # SQLite is C: the WASI SDK's clang builds it for wasm32-wasip2.
+      # Pinned by digest, like the actions.
+      - name: WASI SDK
+        env:
+          WASI_SDK: wasi-sdk-34.0-x86_64-linux
+          WASI_SDK_SHA256: b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/wasi-sdk.tar.gz" \
+            "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/$WASI_SDK.tar.gz"
+          echo "$WASI_SDK_SHA256  $RUNNER_TEMP/wasi-sdk.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/wasi-sdk.tar.gz" -C "$RUNNER_TEMP"
+          echo "WASI_SDK_PATH=$RUNNER_TEMP/$WASI_SDK" >> "$GITHUB_ENV"
 
       - name: Build and package
         run: scripts/package-providers.sh dist
@@ -96,24 +110,22 @@ jobs:
         with:
           save-if: ${{ github.ref_type != 'tag' }}
 
-      - name: Build
-        run: cargo build --release --locked --bin violet
-
-      - name: Package
+      # The Windows Installer package is built with the WiX Toolset,
+      # pinned like the actions.
+      - name: WiX Toolset
         shell: pwsh
         run: |
-          # Named as the updater (fastframe-update) looks for it; the
-          # marker lets a copy from this archive replace itself.
-          $name = "violet-$($env:VERSION)-x86_64-pc-windows-msvc"
-          New-Item -ItemType Directory -Path "package/$name" | Out-Null
-          Copy-Item target/release/violet.exe "package/$name/"
-          Set-Content -NoNewline -Encoding ascii -Path "package/$name/violet-portable.txt" -Value "violet-portable-v1`n"
-          Copy-Item README.md "package/$name/"
-          Compress-Archive -Path "package/$name" -DestinationPath "package/$name.zip"
-          $hash = (Get-FileHash "package/$name.zip" -Algorithm SHA256).Hash.ToLower()
-          "$hash  $name.zip" | Out-File -Encoding ascii "package/$name.zip.sha256"
-          Remove-Item -Recurse "package/$name"
-          Get-ChildItem package
+          dotnet tool install --global wix --version 5.0.2
+          $tools = Join-Path $env:USERPROFILE .dotnet/tools
+          $env:PATH = "$tools;$env:PATH"
+          $tools | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          wix extension add --global WixToolset.Util.wixext/5.0.2
+
+      # The portable zip and the .msi, named as the updater
+      # (fastframe-update) looks for them.
+      - name: Build and package
+        shell: pwsh
+        run: scripts/package-windows.ps1 -Version $env:VERSION -OutDir package
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

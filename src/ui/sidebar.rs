@@ -243,7 +243,7 @@ fn connection(
     let link = explorer.link(id).clone();
     let expanded = explorer.is_expanded(&key) && link.is_online();
     let name = profile.display_name();
-    let detail = format!("{}:{}", profile.host, profile.port);
+    let detail = profile.address();
     let status = match &link {
         Link::Online(_) => palette.success,
         Link::Connecting => palette.warning,

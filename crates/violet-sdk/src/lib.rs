@@ -4,7 +4,8 @@
 //! WebAssembly component Violet downloads into its `providers` folder the
 //! first time a connection needs it, and runs in a sandbox. A provider sees
 //! no files, no environment and no network except one stream to the server
-//! the user asked to connect to (see [`net`]), so a faulty or hostile one
+//! the user asked to connect to (see [`net`]), or for a file-based database
+//! the one file the user picked (see [`files`]), so a faulty or hostile one
 //! cannot reach anything else.
 //!
 //! A provider implements [`Provider`] and [`Session`] and registers them
@@ -40,6 +41,7 @@
 //! providers written in other languages.
 
 mod error;
+pub mod files;
 pub mod net;
 mod rows;
 pub mod tools;

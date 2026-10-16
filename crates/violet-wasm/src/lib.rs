@@ -6,6 +6,8 @@
 //!
 //! - one kind of socket, to the host and port of the profile it serves
 //!   ([`socket`]), with TLS done here, against the web PKI roots;
+//! - for a file-based provider, the profile's database file and its
+//!   journals, with SQLite's locks ([`files`]);
 //! - a log;
 //! - the bare WASI a Rust program needs to start (clocks, randomness), with
 //!   no files, environment, arguments or sockets of its own.
@@ -18,6 +20,7 @@
 mod bindings;
 mod convert;
 mod driver;
+mod files;
 mod host;
 mod session;
 mod socket;

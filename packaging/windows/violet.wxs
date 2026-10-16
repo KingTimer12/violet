@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Violet's Windows Installer package (WiX Toolset 5), built by
+  scripts/package-windows.ps1:
+
+    wix build -arch x64 -ext WixToolset.Util.wixext -d Version=0.1.7
+        -d Executable=target\release\violet.exe -d Marker=violet-installer.txt
+        -d Icon=assets\app\violet.ico
+        -o violet-v0.1.7-x86_64-pc-windows-msvc.msi packaging\windows\violet.wxs
+
+  It installs per user, without elevation, into
+  %LOCALAPPDATA%\Programs\Violet. That folder is the public INSTALLFOLDER
+  property: the updater (fastframe-update) installs a new release with
+
+    msiexec /i <package> /qn /norestart INSTALLFOLDER="<folder Violet runs from>"
+
+  Beside violet.exe goes violet-installer.txt, the marker that tells the
+  updater this copy updates through the package. Every release upgrades
+  the one before it (same UpgradeCode, never change it).
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Name="Violet"
+           Manufacturer="Violet"
+           Version="$(var.Version)"
+           UpgradeCode="1d25b597-58fa-4cb3-a48e-9b1a3ce4d3cf"
+           Scope="perUser"
+           Compressed="yes"
+           Language="1033">
+    <SummaryInformation Description="Violet, a modern multi-database client" />
+
+    <!-- Reinstalling the same version replaces it too. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of Violet is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="violet.ico" SourceFile="$(var.Icon)" />
+    <Property Id="ARPPRODUCTICON" Value="violet.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/KingTimer12/violet" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="Violet" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <!--
+      Per-user components key on HKCU values (ICE38). The install folder is
+      kept there too, for the clean-up below.
+    -->
+    <ComponentGroup Id="Application" Directory="INSTALLFOLDER">
+      <Component Id="Executable" Guid="6f1d3c0a-6a33-4f0e-9a51-2b7d1c0e8a01">
+        <RegistryValue Root="HKCU" Key="Software\Violet" Name="InstallFolder"
+                       Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+        <File Id="violet.exe" Source="$(var.Executable)" Name="violet.exe" />
+        <!-- Tells the updater this copy updates through the package. -->
+        <File Id="InstallerMarker" Source="$(var.Marker)" Name="violet-installer.txt" />
+        <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+        <RemoveFolder Id="RemoveProgramsFolder" Directory="ProgramsFolder" On="uninstall" />
+        <util:RemoveFolderEx On="uninstall" Property="VIOLETCLEANUP" />
+      </Component>
+      <Component Id="StartMenuShortcut" Directory="ProgramMenuFolder"
+                 Guid="0b7c5d8e-3f42-4c1a-8d6e-5a9b2e4f7c02">
+        <RegistryValue Root="HKCU" Key="Software\Violet" Name="StartMenuShortcut"
+                       Type="integer" Value="1" KeyPath="yes" />
+        <Shortcut Id="VioletShortcut" Name="Violet"
+                  Description="A modern, multi-database client"
+                  Target="[INSTALLFOLDER]violet.exe"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="violet.ico" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main" Title="Violet">
+      <ComponentGroupRef Id="Application" />
+    </Feature>
+
+    <!--
+      A real uninstall also removes what updates left in the install folder
+      (the updater's .violet-update-* staging folders). Not during an
+      upgrade, which runs while the updater's helper works from one of
+      them, and only for a folder named Violet, in case it was installed
+      into a shared one. The folder comes from the registry: RemoveFolderEx
+      resolves its path before directories are.
+    -->
+    <Property Id="VIOLETINSTALLED">
+      <RegistrySearch Id="InstalledFolder" Root="HKCU" Key="Software\Violet"
+                      Name="InstallFolder" Type="raw" />
+    </Property>
+    <SetProperty Id="VIOLETCLEANUP" Value="[VIOLETINSTALLED]" Before="Wix4RemoveFoldersEx_$(sys.BUILDARCHSHORT)"
+                 Sequence="execute"
+                 Condition='REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE AND VIOLETINSTALLED &gt;&gt; "\Violet\"' />
+  </Package>
+</Wix>

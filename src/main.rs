@@ -193,6 +193,13 @@ fn main() -> eframe::Result {
             _ => break,
         }
     }
+    // The update helper waits for this process to exit before installing,
+    // and gives up after a minute: exit now rather than wait on database
+    // sessions and worker threads winding down.
+    if update::handed_off() {
+        log::logger().flush();
+        std::process::exit(0);
+    }
     result
 }
 
