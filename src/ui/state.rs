@@ -1,6 +1,6 @@
 //! What the interface remembers about connections and their catalogs.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use violet_core::{ColumnInfo, ConnectionId, DbObject, ForeignKey, ObjectKind, ServerInfo};
@@ -55,6 +55,40 @@ pub enum NodeKey {
     Schema(ConnectionId, String),
     Group(ConnectionId, String, ObjectKind),
     Object(ConnectionId, String, String),
+    /// A folder of a session's database: its schemas, triggers, roles or
+    /// extensions.
+    Folder(ConnectionId, Folder),
+}
+
+/// The folders a database opens into, as in DBeaver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Folder {
+    Schemas,
+    Triggers,
+    Roles,
+    Extensions,
+}
+
+impl Folder {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Schemas => "Schemas",
+            Self::Triggers => "Triggers",
+            Self::Roles => "Roles",
+            Self::Extensions => "Extensions",
+        }
+    }
+}
+
+/// An entry of the triggers, roles or extensions folder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FolderItem {
+    pub name: String,
+    /// Shown beside the name: a trigger's table, an extension's version.
+    pub detail: Option<String>,
+    /// A trigger's schema and table.
+    pub schema: Option<String>,
+    pub table: Option<String>,
 }
 
 /// A relation: connection, schema and name.
@@ -79,8 +113,13 @@ pub struct Explorer {
     pub columns: HashMap<RelationKey, Loadable<Arc<[ColumnInfo]>>>,
     /// Foreign keys from or to each schema's tables, for completion.
     pub foreign_keys: HashMap<(ConnectionId, String), Loadable<Arc<[ForeignKey]>>>,
+    /// The triggers, roles and extensions of each session's database.
+    pub folders: HashMap<(ConnectionId, Folder), Loadable<Arc<[FolderItem]>>>,
     pub expanded: HashSet<NodeKey>,
     pub selected: Option<NodeKey>,
+    /// The schemas shown per `connection/database` (see
+    /// [`Explorer::schema_scope`]), as the settings keep them.
+    pub schema_filters: BTreeMap<String, BTreeSet<String>>,
     /// A node was clicked since this was last cleared.
     pub picked: bool,
     pub filter: String,
@@ -119,6 +158,20 @@ impl Explorer {
         self.objects.retain(|(owner, _), _| *owner != id);
         self.columns.retain(|(owner, _, _), _| *owner != id);
         self.foreign_keys.retain(|(owner, _), _| *owner != id);
+        self.folders.retain(|(owner, _), _| *owner != id);
+    }
+
+    /// The saved connection and database a session is on, as
+    /// `connection/database`: the key its schema choice is kept under.
+    /// `None` until the session says which database it is on.
+    pub fn schema_scope(&self, id: ConnectionId) -> Option<String> {
+        if let Some((parent, database)) = self.opened.get(&id) {
+            return Some(format!("{}/{database}", parent.0));
+        }
+        match self.link(id) {
+            Link::Online(server) => Some(format!("{}/{}", id.0, server.database)),
+            _ => None,
+        }
     }
 
     /// Schemas whose objects completion offers unqualified: PostgreSQL's
@@ -183,7 +236,8 @@ fn owner(key: &NodeKey) -> ConnectionId {
         | NodeKey::Scripts(id)
         | NodeKey::Schema(id, _)
         | NodeKey::Group(id, _, _)
-        | NodeKey::Object(id, _, _) => *id,
+        | NodeKey::Object(id, _, _)
+        | NodeKey::Folder(id, _) => *id,
     }
 }
 

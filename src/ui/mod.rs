@@ -3,6 +3,7 @@
 //! against the application layer.
 
 mod action;
+mod catalog_flow;
 mod chrome;
 mod connection_form;
 mod copy_flow;
@@ -114,6 +115,9 @@ pub struct VioletApp {
     copy_dialog: Option<copy_flow::CopyDialog>,
     /// Definitions being read.
     definitions: HashMap<violet_app::RequestId, definition_flow::PendingDefinition>,
+    /// Folder listings being read.
+    folder_requests: HashMap<violet_app::RequestId, (ConnectionId, state::Folder)>,
+    schema_chooser: Option<catalog_flow::SchemaChooser>,
     /// Actions to run once their connection opens.
     waiting: Vec<(ConnectionId, Action)>,
     /// The format and header choice advanced copy starts with.
@@ -208,12 +212,16 @@ impl VioletApp {
         settings: Settings,
         startup_errors: Vec<Toast>,
     ) -> Self {
+        let schema_filters = settings.schema_filters.clone();
         let mut app = Self {
             backend: services.backend,
             profiles: services.profiles,
             settings_file: services.settings,
             settings,
-            explorer: Explorer::default(),
+            explorer: Explorer {
+                schema_filters,
+                ..Explorer::default()
+            },
             workspace: Workspace::default(),
             toasts: Toasts::default(),
             form: None,
@@ -232,6 +240,8 @@ impl VioletApp {
             copy_dialog: None,
             definitions: HashMap::new(),
             waiting: Vec::new(),
+            folder_requests: HashMap::new(),
+            schema_chooser: None,
             copy_choice: (crate::export::Format::Tsv, true),
             confirm_delete: None,
             queued: Vec::new(),
@@ -428,6 +438,7 @@ impl VioletApp {
                 | NodeKey::Group(id, _, _)
                 | NodeKey::Object(id, _, _),
             ) => Some(id),
+            Some(NodeKey::Folder(id, _)) => Some(id),
             Some(NodeKey::Scripts(_)) | None => None,
         };
         let Some(session) = session else {
@@ -640,6 +651,10 @@ impl VioletApp {
             Event::QueryFinished { request, result } => {
                 if let Some(applying) = self.applying.remove(&request) {
                     self.edits_applied(ctx, applying, &result);
+                    return;
+                }
+                if let Some(folder) = self.folder_requests.remove(&request) {
+                    self.folder_read(folder, result);
                     return;
                 }
                 if let Some(pending) = self.definitions.remove(&request) {
@@ -1628,6 +1643,15 @@ impl VioletApp {
                 name,
                 kind,
             } => self.open_definition(ctx, connection, schema, name, kind),
+            Action::OpenTrigger {
+                connection,
+                schema,
+                table,
+                name,
+            } => self.open_trigger(ctx, connection, schema, table, name),
+            Action::LoadFolder(connection, folder) => self.load_folder(connection, folder),
+            Action::ChooseSchemas(session) => self.choose_schemas(ctx, session),
+            Action::SetSchemaFilter(scope, picked) => self.set_schema_filter(ctx, scope, picked),
             Action::AdvancedCopy(tab_id) => self.open_copy_dialog(tab_id),
             Action::RememberCopy(format, headers) => self.copy_choice = (format, headers),
             Action::CloseReference(tab_id) => {
@@ -1918,6 +1942,11 @@ impl VioletApp {
             && !edit_flow::show_cell_editor(ctx, editor, &mut self.actions)
         {
             self.cell_editor = None;
+        }
+        if let Some(chooser) = &mut self.schema_chooser
+            && !catalog_flow::show_chooser(ctx, chooser, &mut self.actions)
+        {
+            self.schema_chooser = None;
         }
         if let Some(dialog) = &mut self.copy_dialog
             && !copy_flow::show(ctx, dialog, &mut self.actions)

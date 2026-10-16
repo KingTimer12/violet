@@ -142,6 +142,48 @@ fn definition_text(output: &QueryOutput) -> Option<String> {
     (!text.trim().is_empty()).then(|| text.to_owned())
 }
 
+/// The query that reads a trigger's definition, and what to append to it.
+fn trigger_sql(
+    family: Family,
+    dialect: SqlDialect,
+    schema: &str,
+    table: &str,
+    name: &str,
+) -> Option<(String, &'static str)> {
+    Some(match family {
+        Family::Postgres => (
+            format!(
+                "SELECT pg_catalog.pg_get_triggerdef(t.oid, true) \
+                 FROM pg_catalog.pg_trigger t \
+                 JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = {} AND c.relname = {} AND t.tgname = {}",
+                string_literal(schema)?,
+                string_literal(table)?,
+                string_literal(name)?,
+            ),
+            ";\n",
+        ),
+        Family::MySql => (
+            format!(
+                "SHOW CREATE TRIGGER {}.{}",
+                dialect.quote_ident(schema),
+                dialect.quote_ident(name)
+            ),
+            "\n",
+        ),
+        Family::Other => (
+            format!(
+                "SELECT action_statement FROM information_schema.triggers \
+                 WHERE trigger_schema = {} AND trigger_name = {}",
+                string_literal(schema)?,
+                string_literal(name)?,
+            ),
+            "\n",
+        ),
+    })
+}
+
 impl VioletApp {
     /// Reads the definition of `schema.name` and opens it in an editor.
     pub(super) fn open_definition(
@@ -168,6 +210,32 @@ impl VioletApp {
             return;
         };
         self.read_definition(connection, definition_title(&name), sql, fallback, suffix);
+    }
+
+    /// Reads a trigger's definition and opens it in an editor.
+    pub(super) fn open_trigger(
+        &mut self,
+        ctx: &egui::Context,
+        connection: ConnectionId,
+        schema: String,
+        table: String,
+        name: String,
+    ) {
+        if self.wait_for_connection(connection, || Action::OpenTrigger {
+            connection,
+            schema: schema.clone(),
+            table: table.clone(),
+            name: name.clone(),
+        }) {
+            return;
+        }
+        let family = self.family(connection);
+        let dialect = self.dialect(connection);
+        let Some((sql, suffix)) = trigger_sql(family, dialect, &schema, &table, &name) else {
+            self.toasts.push(ctx, unsafe_name());
+            return;
+        };
+        self.read_definition(connection, name, sql, None, suffix);
     }
 
     /// The database family of a connection's driver.
@@ -349,6 +417,22 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn triggers_are_read_per_database() {
+        let (sql, _) = trigger_sql(
+            Family::Postgres,
+            SqlDialect::ANSI,
+            "public",
+            "orders",
+            "audit",
+        )
+        .expect("query");
+        assert!(sql.contains("pg_get_triggerdef") && sql.contains("t.tgname = 'audit'"));
+        let (sql, _) =
+            trigger_sql(Family::MySql, SqlDialect::ANSI, "shop", "orders", "audit").expect("query");
+        assert_eq!(sql, "SHOW CREATE TRIGGER \"shop\".\"audit\"");
     }
 
     #[test]
