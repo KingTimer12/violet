@@ -270,7 +270,7 @@ fn connection(
     };
 
     if response.clicked() {
-        explorer.selected = Some(key.clone());
+        explorer.pick(key.clone());
         match link {
             Link::Online(_) => {
                 explorer.toggle(key.clone());
@@ -484,7 +484,7 @@ fn database_node(
         _ => response,
     };
     if response.clicked() {
-        explorer.selected = Some(key.clone());
+        explorer.pick(key.clone());
         if expanded && link.is_online() {
             explorer.toggle(key.clone());
         } else {
@@ -579,7 +579,7 @@ fn schema_node(
     row.loading = objects.is_loading();
     let response = row.show(ui);
     if response.clicked() {
-        explorer.selected = Some(key.clone());
+        explorer.pick(key.clone());
         if explorer.toggle(key.clone()) && matches!(objects, Loadable::Idle | Loadable::Failed(_)) {
             actions.push(Action::LoadObjects(id, schema.to_owned()));
         }
@@ -721,7 +721,7 @@ fn object_node(
     // As in DBeaver: clicking a table opens its data; the chevron shows
     // its columns.
     if response.clicked() {
-        explorer.selected = Some(key.clone());
+        explorer.pick(key.clone());
         if toggled {
             if explorer.toggle(key.clone())
                 && matches!(columns, Loadable::Idle | Loadable::Failed(_))

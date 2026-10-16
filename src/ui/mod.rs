@@ -398,6 +398,57 @@ impl VioletApp {
     }
 
     /// Whether `id` is a saved connection that lists its server's databases.
+    /// The saved connection a session belongs to: itself, or the one it
+    /// opened another database of.
+    fn root(&self, id: ConnectionId) -> ConnectionId {
+        self.explorer
+            .opened
+            .get(&id)
+            .map_or(id, |(parent, _)| *parent)
+    }
+
+    /// The tree's selection moved: when it is on a database (or something
+    /// inside one) of the server the active editor runs on, the editor
+    /// switches to that database, as DBeaver's navigator links to its
+    /// editor. An editor with no connection takes it too. Running editors
+    /// and ones with unsaved grid changes stay where they are.
+    fn follow_tree(&mut self, ctx: &egui::Context) {
+        let session = match self.explorer.selected.clone() {
+            Some(NodeKey::Database(parent, database)) => self.database_session(parent, &database),
+            Some(
+                NodeKey::Connection(id)
+                | NodeKey::Schema(id, _)
+                | NodeKey::Group(id, _, _)
+                | NodeKey::Object(id, _, _),
+            ) => Some(id),
+            Some(NodeKey::Scripts(_)) | None => None,
+        };
+        let Some(session) = session else {
+            return;
+        };
+        let root = self.root(session);
+        let Some(tab) = self.workspace.active() else {
+            return;
+        };
+        let follows = matches!(tab.kind, TabKind::Script)
+            && tab.running.is_none()
+            && tab.edits.is_empty()
+            && tab.connection != Some(session)
+            && tab
+                .connection
+                .is_none_or(|current| self.root(current) == root);
+        if !follows {
+            return;
+        }
+        let tab_id = tab.id;
+        if let Some(name) = self.connection_name(session) {
+            self.toasts
+                .push(ctx, Toast::info(format!("The editor now runs on {name}")));
+        }
+        self.actions
+            .push(Action::SetTabConnection(tab_id, Some(session)));
+    }
+
     /// The SQL dialect of a connection's driver.
     fn dialect(&self, id: ConnectionId) -> violet_core::SqlDialect {
         connections(&self.profiles, &self.explorer)
@@ -1974,6 +2025,9 @@ impl eframe::App for VioletApp {
                     &mut self.actions,
                 );
             });
+        if std::mem::take(&mut self.explorer.picked) {
+            self.follow_tree(&ctx);
+        }
         self.layout.sidebar = sidebar.map(|sidebar| sidebar.response.rect.width());
         if sidebar_open != self.settings.sidebar {
             self.actions.push(Action::ToggleSidebar);

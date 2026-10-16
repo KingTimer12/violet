@@ -81,6 +81,8 @@ pub struct Explorer {
     pub foreign_keys: HashMap<(ConnectionId, String), Loadable<Arc<[ForeignKey]>>>,
     pub expanded: HashSet<NodeKey>,
     pub selected: Option<NodeKey>,
+    /// A node was clicked since this was last cleared.
+    pub picked: bool,
     pub filter: String,
 }
 
@@ -92,6 +94,12 @@ impl Explorer {
 
     pub fn is_expanded(&self, key: &NodeKey) -> bool {
         self.expanded.contains(key)
+    }
+
+    /// Selects a node the user clicked.
+    pub fn pick(&mut self, key: NodeKey) {
+        self.selected = Some(key);
+        self.picked = true;
     }
 
     pub fn toggle(&mut self, key: NodeKey) -> bool {
