@@ -5,6 +5,7 @@
 mod action;
 mod chrome;
 mod connection_form;
+mod copy_flow;
 #[cfg(debug_assertions)]
 mod devtools;
 mod edit_flow;
@@ -109,6 +110,9 @@ pub struct VioletApp {
     reference: Option<reference::Reference>,
     /// Exports waiting for every row to be read.
     exports: HashMap<violet_app::RequestId, export_flow::PendingExport>,
+    copy_dialog: Option<copy_flow::CopyDialog>,
+    /// The format and header choice advanced copy starts with.
+    copy_choice: (crate::export::Format, bool),
     confirm_delete: Option<ConnectionId>,
     /// Runs waiting for their tab's connection to open.
     queued: Vec<(TabId, RunScope)>,
@@ -220,6 +224,8 @@ impl VioletApp {
             applying: HashMap::new(),
             reference: None,
             exports: HashMap::new(),
+            copy_dialog: None,
+            copy_choice: (crate::export::Format::Tsv, true),
             confirm_delete: None,
             queued: Vec::new(),
             actions: Vec::new(),
@@ -1539,6 +1545,8 @@ impl VioletApp {
                 self.save_settings(ctx);
             }
             Action::Export(tab_id, format) => self.export(ctx, tab_id, format),
+            Action::AdvancedCopy(tab_id) => self.open_copy_dialog(tab_id),
+            Action::RememberCopy(format, headers) => self.copy_choice = (format, headers),
             Action::CloseReference(tab_id) => {
                 if let Some(tab) = self.workspace.get_mut(tab_id) {
                     tab.grid_selection.clear();
@@ -1827,6 +1835,11 @@ impl VioletApp {
             && !edit_flow::show_cell_editor(ctx, editor, &mut self.actions)
         {
             self.cell_editor = None;
+        }
+        if let Some(dialog) = &mut self.copy_dialog
+            && !copy_flow::show(ctx, dialog, &mut self.actions)
+        {
+            self.copy_dialog = None;
         }
         if let Some(review) = &self.edit_review
             && !edit_flow::show_edit_review(ctx, review, &mut self.actions)

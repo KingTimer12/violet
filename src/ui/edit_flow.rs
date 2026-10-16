@@ -708,7 +708,7 @@ pub fn show_run_review(ctx: &egui::Context, review: &RunReview, actions: &mut Ve
     open && !modal.should_close()
 }
 
-fn frame(palette: &Palette) -> egui::Frame {
+pub(super) fn frame(palette: &Palette) -> egui::Frame {
     egui::Frame::new()
         .fill(palette.surface)
         .stroke(Stroke::new(1.0, palette.outline))

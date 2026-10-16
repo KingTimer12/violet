@@ -50,6 +50,25 @@ impl Format {
         }
     }
 
+    /// A name short enough for a tab.
+    pub const fn short(self) -> &'static str {
+        match self {
+            Self::Csv => "CSV",
+            Self::Tsv => "TSV",
+            Self::Xlsx => "Excel",
+            Self::Json => "JSON",
+            Self::Sql => "SQL",
+            Self::Markdown => "Markdown",
+            Self::Html => "HTML",
+            Self::Xml => "XML",
+        }
+    }
+
+    /// Whether it is text, which the clipboard can take.
+    pub const fn is_text(self) -> bool {
+        !matches!(self, Self::Xlsx)
+    }
+
     pub const fn extension(self) -> &'static str {
         match self {
             Self::Csv => "csv",
@@ -72,13 +91,24 @@ pub struct Options<'a> {
     pub quote: &'a dyn Fn(&str) -> String,
     /// A title for the formats that have one (the sheet, the HTML page).
     pub title: &'a str,
+    /// Whether CSV and TSV start with the column names.
+    pub headers: bool,
 }
 
 /// The file's bytes.
 pub fn render(set: &ResultSet, format: Format, options: &Options<'_>) -> anyhow::Result<Vec<u8>> {
     Ok(match format {
-        Format::Csv => to_delimited(set, ',').into_bytes(),
-        Format::Tsv => to_delimited(set, '\t').into_bytes(),
+        Format::Csv | Format::Tsv => {
+            let separator = if format == Format::Csv { ',' } else { '\t' };
+            let text = to_delimited(set, separator);
+            if options.headers {
+                text.into_bytes()
+            } else {
+                // The header is the first line; the rest are the rows.
+                text.split_once('\n')
+                    .map_or_else(Vec::new, |(_, rows)| rows.as_bytes().to_vec())
+            }
+        }
         Format::Xlsx => xlsx(set, options.title)?,
         Format::Json => json(set).into_bytes(),
         Format::Sql => sql(set, options).into_bytes(),
@@ -602,6 +632,7 @@ mod tests {
             table: "\"notes\"",
             quote: &|name| format!("\"{name}\""),
             title: "notes",
+            headers: true,
         }
     }
 

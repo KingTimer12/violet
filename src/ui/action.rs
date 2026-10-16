@@ -113,6 +113,10 @@ pub enum Action {
     RemoveProvider(DriverId),
     ToggleSidebar,
     Copy(String),
+    /// Opens advanced copy for a tab's picked cells.
+    AdvancedCopy(TabId),
+    /// The format and header choice advanced copy starts with next time.
+    RememberCopy(crate::export::Format, bool),
     /// Writes the shown rows of a tab to a file in a format.
     Export(TabId, crate::export::Format),
     /// Closes the referenced row beside a tab's grid.

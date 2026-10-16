@@ -408,7 +408,10 @@ fn grid(
                 .iter()
                 .any(|event| matches!(event, egui::Event::Copy))
         });
-        if copy {
+        // Ctrl+Shift+C also arrives as a copy: it opens advanced copy.
+        if copy && ui.input(|input| input.modifiers.shift) {
+            actions.push(Action::AdvancedCopy(tab));
+        } else if copy {
             actions.push(Action::Copy(copy_selection(set, edits, selected, false)));
         }
         if ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::A)) {
@@ -550,6 +553,7 @@ fn grid(
                             }
                             response.context_menu(|ui| {
                                 rows_menu(ui, set, edits, selected, actions);
+                                advanced_copy_item(ui, tab, actions);
                             });
                         }
                         let Some(cells) = set.rows.row(index) else {
@@ -666,6 +670,7 @@ fn grid(
                                         set, edits, selected, true,
                                     )));
                                 }
+                                advanced_copy_item(ui, tab, actions);
                                 ui.separator();
                                 rows_menu(ui, set, edits, selected, actions);
                                 ui.separator();
@@ -678,6 +683,17 @@ fn grid(
                     });
                 });
         });
+}
+
+/// Opens advanced copy, with its shortcut shown.
+fn advanced_copy_item(ui: &mut Ui, tab: u64, actions: &mut Vec<Action>) {
+    let shortcut = ui.ctx().format_shortcut(&egui::KeyboardShortcut::new(
+        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+        egui::Key::C,
+    ));
+    if super::sidebar::menu_item(ui, Icon::Copy, &format!("Advanced copy…   {shortcut}")) {
+        actions.push(Action::AdvancedCopy(tab));
+    }
 }
 
 /// Copying the whole rows that hold picked cells.
