@@ -31,6 +31,7 @@ pub struct PendingDefinition {
 pub(super) enum Family {
     Postgres,
     MySql,
+    Sqlite,
     Other,
 }
 
@@ -41,6 +42,8 @@ impl Family {
             Self::Postgres
         } else if driver.contains("mysql") || driver.contains("maria") {
             Self::MySql
+        } else if driver.contains("sqlite") {
+            Self::Sqlite
         } else {
             Self::Other
         }
@@ -104,6 +107,16 @@ fn definition_sql(
             "\n",
         ),
         Family::MySql => (format!("SHOW CREATE VIEW {qualified}"), None, ";\n"),
+        // SQLite keeps every object's statement in its schema table.
+        Family::Sqlite => (
+            format!(
+                "SELECT sql FROM {}.sqlite_schema WHERE name = {}",
+                dialect.quote_ident(schema),
+                string_literal(name)?,
+            ),
+            None,
+            ";\n",
+        ),
         Family::Other if routine => (
             format!(
                 "SELECT routine_definition FROM information_schema.routines \
@@ -171,6 +184,14 @@ fn trigger_sql(
                 dialect.quote_ident(name)
             ),
             "\n",
+        ),
+        Family::Sqlite => (
+            format!(
+                "SELECT sql FROM {}.sqlite_schema WHERE type = 'trigger' AND name = {}",
+                dialect.quote_ident(schema),
+                string_literal(name)?,
+            ),
+            ";\n",
         ),
         Family::Other => (
             format!(
@@ -365,7 +386,8 @@ mod tests {
         assert_eq!(Family::of("postgres"), Family::Postgres);
         assert_eq!(Family::of("mysql"), Family::MySql);
         assert_eq!(Family::of("mariadb"), Family::MySql);
-        assert_eq!(Family::of("sqlite"), Family::Other);
+        assert_eq!(Family::of("sqlite"), Family::Sqlite);
+        assert_eq!(Family::of("oracle"), Family::Other);
     }
 
     #[test]

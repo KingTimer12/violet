@@ -27,7 +27,7 @@ pub fn folders(family: Family) -> &'static [Folder] {
             Folder::Extensions,
         ],
         Family::MySql => &[Folder::Schemas, Folder::Triggers, Folder::Roles],
-        Family::Other => &[Folder::Schemas, Folder::Triggers],
+        Family::Sqlite | Family::Other => &[Folder::Schemas, Folder::Triggers],
     }
 }
 
@@ -63,12 +63,18 @@ fn folder_sql(family: Family, folder: Folder) -> Option<&'static str> {
         (Family::MySql, Folder::Roles) => {
             "SELECT CONCAT(User, '@', Host), NULL FROM mysql.user ORDER BY 1"
         }
+        (Family::Sqlite, Folder::Triggers) => {
+            "SELECT name, 'main', tbl_name FROM main.sqlite_schema \
+             WHERE type = 'trigger' \
+             ORDER BY 3, 1"
+        }
         (Family::Other, Folder::Triggers) => {
             "SELECT DISTINCT trigger_name, trigger_schema, event_object_table \
              FROM information_schema.triggers \
              ORDER BY 2, 3, 1"
         }
-        (Family::MySql | Family::Other, Folder::Extensions) | (Family::Other, Folder::Roles) => {
+        (Family::MySql | Family::Sqlite | Family::Other, Folder::Extensions)
+        | (Family::Sqlite | Family::Other, Folder::Roles) => {
             return None;
         }
     })
@@ -292,7 +298,12 @@ mod tests {
 
     #[test]
     fn every_family_has_schemas_first() {
-        for family in [Family::Postgres, Family::MySql, Family::Other] {
+        for family in [
+            Family::Postgres,
+            Family::MySql,
+            Family::Sqlite,
+            Family::Other,
+        ] {
             assert_eq!(folders(family).first(), Some(&Folder::Schemas));
             for folder in folders(family).iter().skip(1) {
                 assert!(
