@@ -546,7 +546,7 @@ pub fn show_cell_editor(
                     response.request_focus();
                 }
             });
-            ui.checkbox(&mut editor.null, "NULL");
+            widgets::checkbox(ui, &mut editor.null, "NULL");
             ui.label(
                 RichText::new("The change stays in the grid until you save the table's changes.")
                     .color(palette.dim),

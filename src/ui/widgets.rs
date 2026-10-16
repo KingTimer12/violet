@@ -311,3 +311,128 @@ pub fn paint_text(
     let pos = align.align_size_within_rect(galley.size(), rect).min;
     ui.painter().with_clip_rect(rect).galley(pos, galley, color);
 }
+
+/// A checkbox as JetBrains IDEs draw one: a 16 px square with softly
+/// rounded corners, filled with the accent and a white tick when on.
+/// `indeterminate` draws a dash, for a choice only partly made.
+pub struct Check<'a> {
+    checked: &'a mut bool,
+    text: egui::WidgetText,
+    indeterminate: bool,
+}
+
+impl<'a> Check<'a> {
+    pub fn new(checked: &'a mut bool, text: impl Into<egui::WidgetText>) -> Self {
+        Self {
+            checked,
+            text: text.into(),
+            indeterminate: false,
+        }
+    }
+
+    pub fn indeterminate(mut self, indeterminate: bool) -> Self {
+        self.indeterminate = indeterminate;
+        self
+    }
+}
+
+impl egui::Widget for Check<'_> {
+    fn ui(self, ui: &mut Ui) -> Response {
+        const BOX: f32 = 16.0;
+        const GAP: f32 = 8.0;
+        let palette = Palette::current(ui.ctx());
+        let Self {
+            checked,
+            text,
+            indeterminate,
+        } = self;
+        let has_text = !text.is_empty();
+        let galley = text.into_galley(
+            ui,
+            Some(egui::TextWrapMode::Extend),
+            f32::INFINITY,
+            egui::TextStyle::Body,
+        );
+        let width = if has_text {
+            BOX + GAP + galley.size().x
+        } else {
+            BOX
+        };
+        let size = egui::vec2(width, galley.size().y.max(BOX) + 4.0);
+        let (rect, mut response) = ui.allocate_exact_size(size, Sense::click());
+        if response.clicked() {
+            *checked = !*checked;
+            response.mark_changed();
+        }
+        let enabled = ui.is_enabled();
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, *checked, galley.text())
+        });
+        if !ui.is_rect_visible(rect) {
+            return response;
+        }
+
+        let fade = |color: Color32| {
+            if enabled {
+                color
+            } else {
+                color.gamma_multiply(0.45)
+            }
+        };
+        let on = *checked || indeterminate;
+        let hovered = enabled && response.hovered();
+        let square = egui::Rect::from_center_size(
+            egui::pos2(rect.left() + BOX / 2.0, rect.center().y),
+            Vec2::splat(BOX),
+        );
+        let (fill, border) = if on {
+            let accent = if hovered {
+                palette.accent_hover
+            } else {
+                palette.accent
+            };
+            (accent, accent)
+        } else if hovered {
+            (palette.surface, palette.accent)
+        } else {
+            (palette.surface, palette.secondary.gamma_multiply(0.55))
+        };
+        let painter = ui.painter();
+        if response.has_focus() {
+            painter.rect_stroke(
+                square.expand(2.0),
+                CornerRadius::same(5),
+                Stroke::new(2.0, palette.accent.gamma_multiply(0.5)),
+                StrokeKind::Outside,
+            );
+        }
+        painter.rect(
+            square,
+            CornerRadius::same(3),
+            fade(fill),
+            Stroke::new(1.0, fade(border)),
+            StrokeKind::Inside,
+        );
+        let mark = Stroke::new(1.8, fade(palette.on_accent));
+        let at = |x: f32, y: f32| square.min + Vec2::new(x * BOX, y * BOX);
+        if *checked {
+            painter.line(vec![at(0.25, 0.52), at(0.43, 0.70), at(0.76, 0.33)], mark);
+        } else if indeterminate {
+            painter.line_segment([at(0.28, 0.5), at(0.72, 0.5)], mark);
+        }
+        if has_text {
+            let color = if enabled { palette.text } else { palette.dim };
+            let pos = egui::pos2(
+                square.right() + GAP,
+                rect.center().y - galley.size().y / 2.0,
+            );
+            painter.galley(pos, galley, color);
+        }
+        response
+    }
+}
+
+/// Adds a [`Check`].
+pub fn checkbox(ui: &mut Ui, checked: &mut bool, text: impl Into<egui::WidgetText>) -> Response {
+    ui.add(Check::new(checked, text))
+}
