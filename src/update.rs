@@ -1,15 +1,21 @@
 //! Self-update from Violet's GitHub releases, through fastframe-update.
 //!
-//! A worker thread checks once at start-up and then daily. When a newer
-//! release exists and this copy may replace itself (a downloaded copy, not
-//! one a package manager owns), it downloads and verifies it against the
-//! signed `checksums.txt`; the interface then offers to restart into it.
-//! Debug builds never check.
+//! A worker thread checks once at start-up and then daily, or right away
+//! when the user retries. When a newer release exists and this copy may
+//! replace itself (a copy the installer or the portable archive put there,
+//! not one a package manager owns), it downloads and verifies it against
+//! the signed `checksums.txt`; the interface then offers to restart into
+//! it. Handing the update over runs off the interface thread, and once the
+//! helper has it the window closes and the process exits at once (see
+//! [`handed_off`]). Debug builds never check.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
-use fastframe_update::{MacConfig, Prepared, Request, Response, Transport, UpdateConfig, Updater};
+use fastframe_update::{
+    MacConfig, Prepared, Request, Response, Transport, Unsupported, UpdateConfig, Updater,
+};
 
 /// Where releases come from and how they are signed. The public key's
 /// private half signs `checksums.txt` in the release workflow.
@@ -41,6 +47,8 @@ pub enum Status {
     },
     /// Downloaded and verified: restarting installs it.
     Ready { version: String },
+    /// Handing the update to the helper; the window closes once it has it.
+    Installing { version: String },
     /// A newer release this copy cannot install itself, and why.
     Manual {
         version: String,
@@ -57,12 +65,35 @@ pub enum Status {
 struct Shared {
     status: Status,
     prepared: Option<Prepared>,
+    /// Asks the worker to check again now.
+    wake: bool,
+    /// The helper has the update: the app must quit.
+    quit: bool,
+}
+
+/// What the worker and the interface share.
+struct State {
+    shared: Mutex<Shared>,
+    /// Signalled with `wake`.
+    woken: Condvar,
+}
+
+/// Set once the helper has taken an update. The helper waits for this
+/// process to exit, so `main` exits right after the window closes instead
+/// of waiting on anything still shutting down.
+static HANDED_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Whether an update was handed to the helper, which waits for Violet to
+/// exit before installing it.
+pub fn handed_off() -> bool {
+    HANDED_OFF.load(Ordering::SeqCst)
 }
 
 /// The update worker and what it found.
 pub struct Updates {
     updater: Updater,
-    shared: Arc<Mutex<Shared>>,
+    state: Arc<State>,
+    repaint: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl Updates {
@@ -77,50 +108,161 @@ impl Updates {
             return None;
         }
         let updater = Updater::new(UPDATES, UreqTransport::new());
-        let shared = Arc::new(Mutex::new(Shared {
-            status: Status::Idle,
-            prepared: None,
-        }));
-        let worker = (updater.clone(), Arc::clone(&shared));
+        let state = Arc::new(State {
+            shared: Mutex::new(Shared {
+                status: Status::Idle,
+                prepared: None,
+                wake: false,
+                quit: false,
+            }),
+            woken: Condvar::new(),
+        });
+        let repaint: Arc<dyn Fn() + Send + Sync> = Arc::new(repaint);
+        let worker = (updater.clone(), Arc::clone(&state), Arc::clone(&repaint));
         let spawned = std::thread::Builder::new()
             .name("updates".into())
             .spawn(move || {
-                let (updater, shared) = worker;
+                let (updater, state, repaint) = worker;
                 // Let the window come up first.
                 std::thread::sleep(Duration::from_secs(5));
                 loop {
-                    if cycle(&updater, &shared, &repaint) {
-                        // Downloaded: nothing more to do until a restart.
-                        return;
-                    }
-                    std::thread::sleep(fastframe_update::CHECK_INTERVAL);
+                    let ready = cycle(&updater, &state.shared, &*repaint);
+                    // Downloaded: nothing more to do until a restart, unless
+                    // handing it over fails and the user tries again.
+                    let wait = if ready {
+                        Duration::from_secs(365 * 24 * 60 * 60)
+                    } else {
+                        fastframe_update::CHECK_INTERVAL
+                    };
+                    state.sleep(wait);
                 }
             });
         if let Err(error) = spawned {
             log::error!("updates: {error}");
             return None;
         }
-        Some(Self { updater, shared })
+        Some(Self {
+            updater,
+            state,
+            repaint,
+        })
     }
 
     pub fn status(&self) -> Status {
-        lock(&self.shared).status.clone()
+        lock(&self.state.shared).status.clone()
     }
 
-    /// Hands the downloaded update to the helper. Quit right after it
-    /// returns: the helper installs once Violet has exited, then starts
-    /// the new version.
+    /// True once the helper has the update: close the window, and `main`
+    /// exits so the helper can install it.
+    pub fn should_quit(&self) -> bool {
+        lock(&self.state.shared).quit
+    }
+
+    /// Checks, and downloads, again now: after a failure.
+    pub fn retry(&self) {
+        let mut shared = lock(&self.state.shared);
+        shared.status = Status::Idle;
+        shared.wake = true;
+        drop(shared);
+        self.state.woken.notify_all();
+        (self.repaint)();
+    }
+
+    /// Hands the downloaded update to the helper, off the interface thread:
+    /// the helper is a copy of Violet and takes a moment to start. Once it
+    /// has the update, [`Updates::should_quit`] turns true; the helper
+    /// installs it after Violet exits, then starts the new version.
     pub fn restart(&self) -> anyhow::Result<()> {
-        let prepared = lock(&self.shared)
+        let mut shared = lock(&self.state.shared);
+        let Status::Ready { version } = shared.status.clone() else {
+            anyhow::bail!("No update is ready. Try again.");
+        };
+        let prepared = shared
             .prepared
             .take()
-            .ok_or_else(|| anyhow::anyhow!("No update is ready"))?;
-        self.updater.handoff(prepared, Vec::new())
+            .ok_or_else(|| anyhow::anyhow!("No update is ready. Try again."))?;
+        shared.status = Status::Installing {
+            version: version.clone(),
+        };
+        drop(shared);
+        (self.repaint)();
+        let (updater, state, repaint) = (
+            self.updater.clone(),
+            Arc::clone(&self.state),
+            Arc::clone(&self.repaint),
+        );
+        let spawned = std::thread::Builder::new()
+            .name("update-handoff".into())
+            .spawn(move || {
+                let handed = updater.handoff(prepared, Vec::new());
+                let mut shared = lock(&state.shared);
+                match handed {
+                    Ok(()) => {
+                        log::info!("updates: the helper has Violet {version}; quitting");
+                        HANDED_OFF.store(true, Ordering::SeqCst);
+                        shared.quit = true;
+                    }
+                    Err(error) => {
+                        log::error!("updates: could not hand over {version}: {error:#}");
+                        shared.status = Status::Failed {
+                            url: release_page(&version),
+                            version,
+                            error: format!("{error:#}"),
+                        };
+                    }
+                }
+                drop(shared);
+                repaint();
+            });
+        if let Err(error) = spawned {
+            // The update went with the thread: download it again.
+            self.retry();
+            return Err(error.into());
+        }
+        Ok(())
+    }
+}
+
+impl State {
+    /// Waits for `timeout`, or until [`Updates::retry`] wakes it.
+    fn sleep(&self, timeout: Duration) {
+        let shared = lock(&self.shared);
+        let (mut shared, _) = self
+            .woken
+            .wait_timeout_while(shared, timeout, |shared| !shared.wake)
+            .unwrap_or_else(PoisonError::into_inner);
+        shared.wake = false;
     }
 }
 
 fn lock(shared: &Mutex<Shared>) -> std::sync::MutexGuard<'_, Shared> {
     shared.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The release page of `version`.
+fn release_page(version: &str) -> String {
+    format!(
+        "https://github.com/{}/releases/tag/v{version}",
+        UPDATES.repository
+    )
+}
+
+/// Why this copy cannot update itself, in Violet's words.
+fn manual_reason(reason: &Unsupported) -> String {
+    match reason {
+        Unsupported::NotPortable if cfg!(windows) => {
+            "This copy cannot update itself: it was not installed with Violet's installer. \
+             Install the .msi from the release page once, and Violet keeps itself up to date \
+             from then on."
+                .into()
+        }
+        Unsupported::NotPortable => {
+            "This copy cannot update itself: it is not in the folder it was unpacked in. \
+             Download the new version from the release page."
+                .into()
+        }
+        reason => reason.to_string(),
+    }
 }
 
 /// One check: finds a newer release and downloads it. True once an update
@@ -140,10 +282,11 @@ fn cycle(updater: &Updater, shared: &Mutex<Shared>, repaint: &dyn Fn()) -> bool 
     };
     log::info!("updates: Violet {} is available", release.version);
     if let Err(reason) = updater.installation() {
+        log::info!("updates: this copy cannot update itself: {reason}");
         set(Status::Manual {
             version: release.version.clone(),
             url: release.url.clone(),
-            reason: reason.to_string(),
+            reason: manual_reason(&reason),
         });
         return false;
     }

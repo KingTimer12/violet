@@ -17,6 +17,8 @@ wasmtime-wasi = { version = "49.0.2", default-features = false, features = ["p2"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "1"
+# SQLite's byte-range locks on a file-based provider's database.
+file-guard = "0.2"
 
 [lints]
 workspace = true

@@ -1323,13 +1323,18 @@ impl VioletApp {
                 let Some(updates) = &self.updates else {
                     return;
                 };
-                match updates.restart() {
-                    // The helper installs once Violet has quit.
-                    Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-                    Err(error) => self.toasts.push(
+                // The window closes once the helper has the update (see
+                // `ui`); it installs it after Violet has quit.
+                if let Err(error) = updates.restart() {
+                    self.toasts.push(
                         ctx,
                         Toast::error("The update could not start", format!("{error:#}")),
-                    ),
+                    );
+                }
+            }
+            Action::RetryUpdate => {
+                if let Some(updates) = &self.updates {
+                    updates.retry();
                 }
             }
             Action::OpenUrl(url) => ctx.open_url(egui::OpenUrl::new_tab(url)),
@@ -1909,6 +1914,13 @@ impl eframe::App for VioletApp {
                     .stroke(Stroke::new(1.0, palette.outline)),
             )
             .show(ui, |ui| {
+                if self
+                    .updates
+                    .as_ref()
+                    .is_some_and(crate::update::Updates::should_quit)
+                {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
                 let update = self
                     .updates
                     .as_ref()
