@@ -14,6 +14,7 @@ mod sql;
 mod ui;
 mod update;
 
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use violet_app::{Backend, ProfileService};
@@ -73,16 +74,14 @@ fn main() -> eframe::Result {
         .with_titlebar_shown(false)
         .with_title_shown(false);
 
-    let options = eframe::NativeOptions {
-        viewport,
-        centered: true,
-        ..Default::default()
-    };
-
-    eframe::run_native(
-        "Violet",
-        options,
-        Box::new(move |cc| {
+    // What the app is built from, taken by the renderer that gets the
+    // window up.
+    let start = RefCell::new(Some((dirs, launch)));
+    let create =
+        |cc: &eframe::CreationContext<'_>| -> Result<Box<dyn eframe::App>, Box<dyn std::error::Error + Send + Sync>> {
+            let Some((dirs, launch)) = start.take() else {
+                return Err("Violet has already started".into());
+            };
             let ctx = cc.egui_ctx.clone();
             let settings_file: JsonFile<Settings> = JsonFile::new(dirs.settings_file());
             let mut startup_errors = Vec::new();
@@ -174,9 +173,39 @@ fn main() -> eframe::Result {
                 settings,
                 startup_errors,
             )))
-        }),
-    )
+        };
+
+    let mut result = Ok(());
+    for &renderer in RENDERERS {
+        let options = eframe::NativeOptions {
+            viewport: viewport.clone(),
+            centered: true,
+            renderer,
+            ..Default::default()
+        };
+        result = eframe::run_native("Violet", options, Box::new(&create));
+        // Only a renderer that could not open the window is worth another
+        // try: once the app has started, its error is the app's.
+        match &result {
+            Err(error) if start.borrow().is_some() => {
+                log::warn!("the {renderer} renderer could not start: {error}");
+            }
+            _ => break,
+        }
+    }
+    result
 }
+
+/// The renderers to open the window with, in order.
+///
+/// On Windows, OpenGL (glow) first: it takes about a third of the memory
+/// wgpu does (~70 MB against ~250 MB), which sets up a Direct3D 12 or
+/// Vulkan device with its shader compilers. wgpu stays for machines with
+/// no usable OpenGL, such as some virtual machines and remote desktops.
+#[cfg(windows)]
+const RENDERERS: &[eframe::Renderer] = &[eframe::Renderer::Glow, eframe::Renderer::Wgpu];
+#[cfg(not(windows))]
+const RENDERERS: &[eframe::Renderer] = &[eframe::Renderer::Wgpu];
 
 fn init_logging(dirs: &AppDirs) {
     let state = dirs.state_dir();
