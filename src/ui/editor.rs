@@ -220,9 +220,19 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
                 // The gutter is its own column so it never covers text.
                 let (gutter, _) =
                     ui.allocate_exact_size(egui::vec2(GUTTER, height), egui::Sense::hover());
+                // The text edit only takes clicks on the rows it is sized
+                // for (`min_size` leaves its height alone), so it asks for
+                // as many as fill the pane: a click below the text still
+                // lands in it.
+                let font = theme::mono(FONT_SIZE);
+                let line_height = ui.fonts_mut(|fonts| fonts.row_height(&font))
+                    + ui.spacing().extra_text_line_spacing;
+                let rows = (height / line_height).floor().max(1.0) as usize;
                 let output = egui::TextEdit::multiline(sql)
                     .id(text_id)
                     .code_editor()
+                    .font(font)
+                    .desired_rows(rows)
                     .frame(egui::Frame::NONE)
                     .lock_focus(true)
                     .desired_width(f32::INFINITY)
@@ -242,6 +252,8 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
                     )
                     .layouter(&mut layouter)
                     .show(ui);
+
+                autoscroll(ui, &output.response);
 
                 if let Some(range) = output.cursor_range {
                     let [start, end] = range.sorted_cursors();
@@ -320,6 +332,35 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
         ui.ctx().memory_mut(|memory| memory.request_focus(text_id));
         ui.ctx().request_repaint();
     }
+}
+
+/// While a selection is dragged near or past the top or bottom of the
+/// pane, scrolls towards the pointer, faster the further out it is. The
+/// text edit only scrolls when the selection changes, which stops as soon
+/// as the pointer holds still.
+fn autoscroll(ui: &Ui, response: &egui::Response) {
+    /// How close to an edge the pointer starts scrolling.
+    const EDGE: f32 = 24.0;
+    if !response.dragged() {
+        return;
+    }
+    let Some(pointer) = ui.ctx().pointer_latest_pos() else {
+        return;
+    };
+    let view = ui.clip_rect();
+    let above = view.top() + EDGE - pointer.y;
+    let below = pointer.y - (view.bottom() - EDGE);
+    // Positive moves the content down, showing what is above.
+    let delta = if above > 0.0 {
+        above
+    } else if below > 0.0 {
+        -below
+    } else {
+        return;
+    };
+    let step = delta.signum() * (delta.abs() * 0.5).clamp(2.0, 60.0);
+    ui.scroll_with_delta_animation(egui::vec2(0.0, step), egui::style::ScrollAnimation::none());
+    ui.ctx().request_repaint();
 }
 
 /// Opens, keeps or closes the list after the editor had its turn.

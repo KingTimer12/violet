@@ -9,10 +9,12 @@ mod connection_form;
 mod devtools;
 mod edit_flow;
 mod editor;
+mod export_flow;
 mod fonts;
 mod history;
 pub mod icons;
 mod providers;
+mod reference;
 mod results;
 mod script_flow;
 mod shortcuts;
@@ -102,6 +104,10 @@ pub struct VioletApp {
     run_review: Option<edit_flow::RunReview>,
     /// Grid changes being written.
     applying: HashMap<violet_app::RequestId, edit_flow::Applying>,
+    /// The row the selected foreign key cell points at.
+    reference: Option<reference::Reference>,
+    /// Exports waiting for every row to be read.
+    exports: HashMap<violet_app::RequestId, export_flow::PendingExport>,
     confirm_delete: Option<ConnectionId>,
     /// Runs waiting for their tab's connection to open.
     queued: Vec<(TabId, RunScope)>,
@@ -211,6 +217,8 @@ impl VioletApp {
             edit_review: None,
             run_review: None,
             applying: HashMap::new(),
+            reference: None,
+            exports: HashMap::new(),
             confirm_delete: None,
             queued: Vec::new(),
             actions: Vec::new(),
@@ -383,6 +391,17 @@ impl VioletApp {
     }
 
     /// Whether `id` is a saved connection that lists its server's databases.
+    /// The SQL dialect of a connection's driver.
+    fn dialect(&self, id: ConnectionId) -> violet_core::SqlDialect {
+        connections(&self.profiles, &self.explorer)
+            .iter()
+            .find(|profile| profile.id == id)
+            .and_then(|profile| self.backend.registry().get(&profile.driver))
+            .map_or(violet_core::SqlDialect::ANSI, |driver| {
+                driver.info().dialect
+            })
+    }
+
     fn shows_all_databases(&self, id: ConnectionId) -> bool {
         self.profiles.get(id).is_some_and(|profile| {
             profile.show_all_databases
@@ -541,6 +560,14 @@ impl VioletApp {
             Event::QueryFinished { request, result } => {
                 if let Some(applying) = self.applying.remove(&request) {
                     self.edits_applied(ctx, applying, &result);
+                    return;
+                }
+                if let Some(pending) = self.exports.remove(&request) {
+                    self.export_read(ctx, pending, result);
+                    return;
+                }
+                if self.awaits_reference(request) {
+                    self.reference_finished(result);
                     return;
                 }
                 let Some(tab) = self.workspace.by_request(request) else {
@@ -1510,6 +1537,13 @@ impl VioletApp {
                 self.settings.sidebar = !self.settings.sidebar;
                 self.save_settings(ctx);
             }
+            Action::Export(tab_id, format) => self.export(ctx, tab_id, format),
+            Action::CloseReference(tab_id) => {
+                if let Some(tab) = self.workspace.get_mut(tab_id) {
+                    tab.selected_cell = None;
+                }
+                self.reference = None;
+            }
             Action::Copy(text) => {
                 ctx.copy_text(text);
                 self.toasts.push(ctx, Toast::success("Copied to clipboard"));
@@ -1665,9 +1699,11 @@ impl VioletApp {
             return;
         };
         let editing = self.editing(active);
+        let links = self.sync_reference(active);
         let profiles = &*connections(&self.profiles, &self.explorer);
         let explorer = &self.explorer;
         let actions = &mut self.actions;
+        let reference = self.reference.as_mut().filter(|r| r.tab == active);
         let Some(tab) = self.workspace.tabs.iter_mut().find(|tab| tab.id == active) else {
             return;
         };
@@ -1688,6 +1724,22 @@ impl VioletApp {
                 chrome::toolbar(ui, tab, profiles, explorer, actions)
             });
 
+        if let Some(reference) = reference {
+            Panel::right("reference")
+                .resizable(true)
+                .default_size(320.0)
+                .size_range(240.0..=600.0)
+                .frame(
+                    Frame::NONE
+                        .fill(palette.panel)
+                        .stroke(Stroke::new(1.0, palette.outline)),
+                )
+                .show(ui, |ui| {
+                    ui.set_min_height(ui.available_height());
+                    reference::show(ui, reference, actions);
+                });
+        }
+
         // A data tab is all grid, under its filter bar.
         if tab.data().is_some() {
             Panel::top(Id::new(("filter", tab.id)))
@@ -1701,7 +1753,9 @@ impl VioletApp {
                 .show(ui, |ui| chrome::filter_bar(ui, tab, actions));
             egui::CentralPanel::default()
                 .frame(Frame::NONE.fill(palette.window))
-                .show(ui, |ui| results::show(ui, tab, &editing, actions));
+                .show(ui, |ui| {
+                    results::show(ui, tab, &editing, &links.columns, actions)
+                });
             return;
         }
 
@@ -1721,7 +1775,7 @@ impl VioletApp {
                 // The panel remembers the height its contents take: they
                 // fill it, or it would shrink to a smaller result each run.
                 ui.set_min_height(ui.available_height());
-                results::show(ui, tab, &editing, actions);
+                results::show(ui, tab, &editing, &links.columns, actions);
             });
         self.layout.results = (total > 0.0).then(|| results.response.rect.height() / total);
 
