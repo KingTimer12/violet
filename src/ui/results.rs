@@ -14,6 +14,7 @@ use violet_core::{DbError, ResultSet};
 use super::action::Action;
 use super::edit_flow::{EditTarget, Editing};
 use super::icons::Icon;
+use super::selection::{Mode, Selection};
 use super::theme::{self, Palette};
 use super::widgets::{self, Tone};
 use super::workspace::{
@@ -152,7 +153,7 @@ pub fn show(
                                 .collect();
                             if widgets::segmented(ui, &mut chosen, &options) {
                                 tab.active_set = chosen;
-                                tab.selected_cell = None;
+                                tab.grid_selection.clear();
                             }
                         } else {
                             let label = if set.has_rows() { "Result" } else { "Command" };
@@ -276,7 +277,7 @@ pub fn show(
                     tab.id,
                     set,
                     sort,
-                    &mut tab.selected_cell,
+                    &mut tab.grid_selection,
                     target,
                     &tab.edits,
                     links,
@@ -385,7 +386,7 @@ fn grid(
     tab: u64,
     set: &ResultSet,
     sort: Sorting,
-    selected: &mut Option<(usize, usize)>,
+    selected: &mut Selection,
     target: Option<&EditTarget>,
     edits: &BTreeMap<(usize, usize), Option<String>>,
     links: &[bool],
@@ -394,19 +395,28 @@ fn grid(
     let palette = Palette::current(ui.ctx());
     let number_width = 14.0 + 7.5 * set.rows.len().max(1).to_string().len() as f32;
 
-    // Copy the selected cell with the platform shortcut.
-    let copy = ui.input(|input| {
-        input
-            .events
-            .iter()
-            .any(|event| matches!(event, egui::Event::Copy))
-    });
-    if copy
-        && !ui.ctx().egui_wants_keyboard_input()
-        && let Some((row, column)) = *selected
-        && let Some(value) = set.rows.get(row, column)
-    {
-        actions.push(Action::Copy(value.unwrap_or_default().to_owned()));
+    // Clicks pick cells as DBeaver does: Ctrl (⌘) adds, Shift extends.
+    let mode = Mode::from_modifiers(ui.input(|input| input.modifiers));
+    let columns = set.columns.len();
+
+    // The platform shortcuts copy the picked cells and pick them all,
+    // once the grid is in use and no text field takes the keys.
+    if !selected.is_empty() && !ui.ctx().egui_wants_keyboard_input() {
+        let copy = ui.input(|input| {
+            input
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::Copy))
+        });
+        // Ctrl+Shift+C also arrives as a copy: it opens advanced copy.
+        if copy && ui.input(|input| input.modifiers.shift) {
+            actions.push(Action::AdvancedCopy(tab));
+        } else if copy {
+            actions.push(Action::Copy(copy_selection(set, edits, selected, false)));
+        }
+        if ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::A)) {
+            selected.select_all(set.rows.len(), columns);
+        }
     }
 
     egui::ScrollArea::horizontal()
@@ -523,10 +533,29 @@ fn grid(
                 .body(|body| {
                     body.rows(ROW_HEIGHT, set.rows.len(), |mut row| {
                         let index = row.index();
-                        row.set_selected(selected.is_some_and(|(r, _)| r == index));
+                        row.set_selected(selected.has_row(index));
+                        // The row number picks the whole row.
+                        let mut number = None;
                         row.col(|ui| {
                             paint_cell(ui, Cell::RowNumber(index), true, palette.dim);
+                            number = Some(ui.interact(
+                                ui.max_rect(),
+                                ui.id().with("row-number"),
+                                Sense::click(),
+                            ));
                         });
+                        if let Some(response) = number {
+                            if response.clicked() {
+                                selected.click_row(index, columns, mode);
+                            }
+                            if response.secondary_clicked() && !selected.has_row(index) {
+                                selected.click_row(index, columns, Mode::Replace);
+                            }
+                            response.context_menu(|ui| {
+                                rows_menu(ui, set, edits, selected, actions);
+                                advanced_copy_item(ui, tab, actions);
+                            });
+                        }
                         let Some(cells) = set.rows.row(index) else {
                             return;
                         };
@@ -550,13 +579,18 @@ fn grid(
                                         palette.warning.gamma_multiply(0.22),
                                     );
                                 }
-                                let is_selected = *selected == Some((index, column));
-                                if is_selected {
+                                if selected.contains((index, column)) {
+                                    // The cell clicked last gets the outline.
+                                    let stroke = if selected.focus == Some((index, column)) {
+                                        Stroke::new(1.0, palette.accent)
+                                    } else {
+                                        Stroke::NONE
+                                    };
                                     ui.painter().rect(
                                         ui.max_rect().shrink(1.0),
                                         CornerRadius::same(3),
                                         palette.accent_soft,
-                                        Stroke::new(1.0, palette.accent),
+                                        stroke,
                                         egui::StrokeKind::Inside,
                                     );
                                 }
@@ -578,7 +612,12 @@ fn grid(
                                 continue;
                             };
                             if response.clicked() {
-                                *selected = Some((index, column));
+                                selected.click((index, column), mode);
+                            }
+                            // Right-clicking outside the selection picks the
+                            // cell; inside, the menu acts on all of it.
+                            if response.secondary_clicked() && !selected.contains((index, column)) {
+                                selected.click((index, column), Mode::Replace);
                             }
                             if response.double_clicked() && editable {
                                 actions.push(Action::EditCell(tab, index, column));
@@ -594,7 +633,6 @@ fn grid(
                                 });
                             }
                             response.context_menu(|ui| {
-                                *selected = Some((index, column));
                                 if editable {
                                     if super::sidebar::menu_item(ui, Icon::Pencil, "Edit value…")
                                     {
@@ -614,15 +652,28 @@ fn grid(
                                     }
                                     ui.separator();
                                 }
-                                if super::sidebar::menu_item(ui, Icon::Copy, "Copy value") {
-                                    actions
-                                        .push(Action::Copy(value.unwrap_or_default().to_owned()));
+                                let label = match selected.len() {
+                                    0 | 1 => "Copy value".to_owned(),
+                                    count => format!("Copy {} cells", thousands(count)),
+                                };
+                                if super::sidebar::menu_item(ui, Icon::Copy, &label) {
+                                    actions.push(Action::Copy(copy_selection(
+                                        set, edits, selected, false,
+                                    )));
                                 }
-                                if super::sidebar::menu_item(ui, Icon::Rows, "Copy row") {
-                                    let mut text = String::new();
-                                    write_row(&mut text, cells.iter(), '\t');
-                                    actions.push(Action::Copy(text));
+                                if super::sidebar::menu_item(
+                                    ui,
+                                    Icon::Copy,
+                                    "Copy with column names",
+                                ) {
+                                    actions.push(Action::Copy(copy_selection(
+                                        set, edits, selected, true,
+                                    )));
                                 }
+                                advanced_copy_item(ui, tab, actions);
+                                ui.separator();
+                                rows_menu(ui, set, edits, selected, actions);
+                                ui.separator();
                                 if super::sidebar::menu_item(ui, Icon::Columns, "Copy column name")
                                 {
                                     actions.push(Action::Copy(meta.name.clone()));
@@ -632,6 +683,141 @@ fn grid(
                     });
                 });
         });
+}
+
+/// Opens advanced copy, with its shortcut shown.
+fn advanced_copy_item(ui: &mut Ui, tab: u64, actions: &mut Vec<Action>) {
+    let shortcut = ui.ctx().format_shortcut(&egui::KeyboardShortcut::new(
+        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+        egui::Key::C,
+    ));
+    if super::sidebar::menu_item(ui, Icon::Copy, &format!("Advanced copy…   {shortcut}")) {
+        actions.push(Action::AdvancedCopy(tab));
+    }
+}
+
+/// Copying the whole rows that hold picked cells.
+fn rows_menu(
+    ui: &mut Ui,
+    set: &ResultSet,
+    edits: &BTreeMap<(usize, usize), Option<String>>,
+    selected: &Selection,
+    actions: &mut Vec<Action>,
+) {
+    let rows = selected.rows();
+    let noun = if rows.len() == 1 { "row" } else { "rows" };
+    let count = if rows.len() > 1 {
+        format!("{} ", thousands(rows.len()))
+    } else {
+        String::new()
+    };
+    if super::sidebar::menu_item(ui, Icon::Rows, &format!("Copy {count}{noun}")) {
+        actions.push(Action::Copy(copy_rows(set, edits, &rows, false)));
+    }
+    if super::sidebar::menu_item(
+        ui,
+        Icon::Rows,
+        &format!("Copy {count}{noun} with column names"),
+    ) {
+        actions.push(Action::Copy(copy_rows(set, edits, &rows, true)));
+    }
+}
+
+/// What a cell shows: a change not saved yet, else the server's value.
+fn shown<'a>(
+    set: &'a ResultSet,
+    edits: &'a BTreeMap<(usize, usize), Option<String>>,
+    row: usize,
+    column: usize,
+) -> Option<&'a str> {
+    match edits.get(&(row, column)) {
+        Some(change) => change.as_deref(),
+        None => set.rows.get(row, column).flatten(),
+    }
+}
+
+/// The picked cells as text to paste. One value is copied as it is; more
+/// are tab-separated, a line per row. With `headers`, they are laid out as
+/// a block of the picked columns under their names, cells not picked left
+/// empty.
+fn copy_selection(
+    set: &ResultSet,
+    edits: &BTreeMap<(usize, usize), Option<String>>,
+    selected: &Selection,
+    headers: bool,
+) -> String {
+    let mut out = String::new();
+    if headers {
+        let columns = selected.columns();
+        write_row(
+            &mut out,
+            columns.iter().map(|c| Some(set.columns[*c].name.as_str())),
+            '\t',
+        );
+        for row in selected.rows() {
+            out.push('\n');
+            let cells = columns.iter().map(|column| {
+                if selected.contains((row, *column)) {
+                    shown(set, edits, row, *column)
+                } else {
+                    None
+                }
+            });
+            write_row(&mut out, cells, '\t');
+        }
+        return out;
+    }
+    if selected.len() == 1
+        && let Some((row, column)) = selected.cells().next()
+    {
+        return shown(set, edits, row, column)
+            .unwrap_or_default()
+            .to_owned();
+    }
+    let mut current = None;
+    let mut line = Vec::new();
+    let flush = |out: &mut String, line: &mut Vec<Option<&str>>| {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        write_row(out, line.drain(..), '\t');
+    };
+    for (row, column) in selected.cells() {
+        if current.is_some_and(|current| current != row) {
+            flush(&mut out, &mut line);
+        }
+        current = Some(row);
+        line.push(shown(set, edits, row, column));
+    }
+    if current.is_some() {
+        flush(&mut out, &mut line);
+    }
+    out
+}
+
+/// Whole rows, tab-separated, optionally under the column names.
+fn copy_rows(
+    set: &ResultSet,
+    edits: &BTreeMap<(usize, usize), Option<String>>,
+    rows: &[usize],
+    headers: bool,
+) -> String {
+    let mut out = String::new();
+    if headers {
+        write_row(
+            &mut out,
+            set.columns.iter().map(|c| Some(c.name.as_str())),
+            '\t',
+        );
+    }
+    for row in rows {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        let cells = (0..set.columns.len()).map(|column| shown(set, edits, *row, column));
+        write_row(&mut out, cells, '\t');
+    }
+    out
 }
 
 /// Whether a grid's columns can be sorted, and by which one now: its
@@ -785,6 +971,53 @@ fn error_card(ui: &mut Ui, error: &DbError, executed: &Executed, editor: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample() -> ResultSet {
+        let column = |name: &str| violet_core::ColumnMeta {
+            name: name.into(),
+            type_name: None,
+            numeric: false,
+        };
+        let mut set = ResultSet {
+            columns: vec![column("a"), column("b"), column("c")],
+            ..ResultSet::default()
+        };
+        set.rows.push([Some("a0"), Some("b0"), Some("c0")]);
+        set.rows.push([Some("a1"), None, Some("c1")]);
+        set.rows.push([Some("a2"), Some("b2"), Some("c2")]);
+        set
+    }
+
+    #[test]
+    fn copies_what_is_picked() {
+        let set = sample();
+        let mut edits = BTreeMap::new();
+        let mut selected = Selection::default();
+        selected.click((0, 1), Mode::Replace);
+        assert_eq!(copy_selection(&set, &edits, &selected, false), "b0");
+        selected.click((1, 2), Mode::Extend);
+        assert_eq!(
+            copy_selection(&set, &edits, &selected, false),
+            "b0\tc0\n\tc1"
+        );
+        selected.click((2, 0), Mode::Toggle);
+        edits.insert((2, 0), Some("new".to_owned()));
+        assert_eq!(
+            copy_selection(&set, &edits, &selected, true),
+            "a\tb\tc\n\tb0\tc0\n\t\tc1\nnew\t\t"
+        );
+    }
+
+    #[test]
+    fn copies_whole_rows() {
+        let set = sample();
+        let edits = BTreeMap::new();
+        assert_eq!(
+            copy_rows(&set, &edits, &[0, 2], false),
+            "a0\tb0\tc0\na2\tb2\tc2"
+        );
+        assert_eq!(copy_rows(&set, &edits, &[1], true), "a\tb\tc\na1\t\tc1");
+    }
 
     #[test]
     fn previews_show_the_first_line() {

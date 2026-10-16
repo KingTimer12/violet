@@ -546,7 +546,7 @@ pub fn show_cell_editor(
                     response.request_focus();
                 }
             });
-            ui.checkbox(&mut editor.null, "NULL");
+            widgets::checkbox(ui, &mut editor.null, "NULL");
             ui.label(
                 RichText::new("The change stays in the grid until you save the table's changes.")
                     .color(palette.dim),
@@ -708,7 +708,7 @@ pub fn show_run_review(ctx: &egui::Context, review: &RunReview, actions: &mut Ve
     open && !modal.should_close()
 }
 
-fn frame(palette: &Palette) -> egui::Frame {
+pub(super) fn frame(palette: &Palette) -> egui::Frame {
     egui::Frame::new()
         .fill(palette.surface)
         .stroke(Stroke::new(1.0, palette.outline))

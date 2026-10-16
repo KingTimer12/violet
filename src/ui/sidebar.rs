@@ -6,8 +6,10 @@ use violet_core::{ConnectionId, ConnectionProfile, DbObject, ObjectKind, ObjectR
 use violet_storage::SavedScript;
 
 use super::action::Action;
+use super::catalog_flow;
+use super::definition_flow::Family;
 use super::icons::Icon;
-use super::state::{Explorer, Link, Loadable, NodeKey};
+use super::state::{Explorer, Folder, FolderItem, Link, Loadable, NodeKey};
 use super::theme::{self, Palette};
 use super::widgets;
 
@@ -239,6 +241,7 @@ fn connection(
 ) {
     let palette = Palette::current(ui.ctx());
     let id = profile.id;
+    let family = Family::of(profile.driver.as_str());
     let key = NodeKey::Connection(id);
     let link = explorer.link(id).clone();
     let expanded = explorer.is_expanded(&key) && link.is_online();
@@ -270,7 +273,7 @@ fn connection(
     };
 
     if response.clicked() {
-        explorer.selected = Some(key.clone());
+        explorer.pick(key.clone());
         match link {
             Link::Online(_) => {
                 explorer.toggle(key.clone());
@@ -353,13 +356,13 @@ fn connection(
             Loadable::Failed(error) => error_row(ui, 1, &error),
             Loadable::Ready(databases) => {
                 for database in databases.iter() {
-                    database_node(ui, id, database, explorer, actions);
+                    database_node(ui, id, family, database, explorer, actions);
                 }
             }
         }
         return;
     }
-    schemas(ui, id, 1, explorer, actions);
+    folders(ui, id, family, 1, explorer, actions);
 }
 
 /// The scripts saved for a connection, each opening on its database.
@@ -423,20 +426,92 @@ fn scripts_node(
     }
 }
 
-/// `id`'s schemas, at `depth`.
-fn schemas(
+/// The folders of session `id`'s database, at `depth`, as DBeaver lays
+/// them out: schemas, then triggers, roles and extensions where the
+/// database has them.
+fn folders(
+    ui: &mut Ui,
+    id: ConnectionId,
+    family: Family,
+    depth: usize,
+    explorer: &mut Explorer,
+    actions: &mut Vec<Action>,
+) {
+    for folder in catalog_flow::folders(family) {
+        if *folder == Folder::Schemas {
+            schemas_folder(ui, id, depth, explorer, actions);
+        } else {
+            folder_node(ui, id, *folder, depth, explorer, actions);
+        }
+    }
+}
+
+/// The schemas folder: the schemas picked for the database, or all.
+fn schemas_folder(
     ui: &mut Ui,
     id: ConnectionId,
     depth: usize,
     explorer: &mut Explorer,
     actions: &mut Vec<Action>,
 ) {
-    match explorer.schemas.get(&id).cloned().unwrap_or_default() {
-        Loadable::Idle | Loadable::Loading => loading_row(ui, depth),
-        Loadable::Failed(error) => error_row(ui, depth, &error),
+    let key = NodeKey::Folder(id, Folder::Schemas);
+    let filtering = !explorer.filter.trim().is_empty();
+    let expanded = filtering || explorer.is_expanded(&key);
+    let all = explorer.schemas.get(&id).cloned().unwrap_or_default();
+    let picked = explorer
+        .schema_scope(id)
+        .and_then(|scope| explorer.schema_filters.get(&scope).cloned());
+    let detail = match (&all, &picked) {
+        (Loadable::Ready(all), Some(picked)) => Some(format!(
+            "{} of {}",
+            all.iter().filter(|s| picked.contains(*s)).count(),
+            all.len()
+        )),
+        (Loadable::Ready(all), None) => Some(all.len().to_string()),
+        _ => None,
+    };
+    let mut row = Row::new(depth, Icon::Folder, Folder::Schemas.label());
+    row.expanded = Some(expanded);
+    row.selected = explorer.selected.as_ref() == Some(&key);
+    row.detail = detail.as_deref();
+    let response = row.show(ui);
+    let response = if picked.is_some() {
+        response.on_hover_text("Showing the schemas picked for this database")
+    } else {
+        response
+    };
+    if response.clicked() {
+        explorer.pick(key.clone());
+        explorer.toggle(key);
+    }
+    response.context_menu(|ui| {
+        if menu_item(ui, Icon::Funnel, "Choose schemas…") {
+            actions.push(Action::ChooseSchemas(id));
+        }
+        if picked.is_some()
+            && let Some(scope) = explorer.schema_scope(id)
+            && menu_item(ui, Icon::Close, "Show all schemas")
+        {
+            actions.push(Action::SetSchemaFilter(scope, None));
+        }
+        if menu_item(ui, Icon::Refresh, "Refresh") {
+            actions.push(Action::Refresh(id));
+        }
+    });
+    if !expanded {
+        return;
+    }
+    match all {
+        Loadable::Idle | Loadable::Loading => loading_row(ui, depth + 1),
+        Loadable::Failed(error) => error_row(ui, depth + 1, &error),
         Loadable::Ready(schemas) => {
-            for schema in schemas.iter() {
-                schema_node(ui, id, schema, depth, explorer, actions);
+            let shown = schemas.iter().filter(|schema| {
+                picked
+                    .as_ref()
+                    .is_none_or(|picked| picked.contains(*schema))
+            });
+            for schema in shown {
+                schema_node(ui, id, schema, depth + 1, explorer, actions);
             }
         }
     }
@@ -447,6 +522,7 @@ fn schemas(
 fn database_node(
     ui: &mut Ui,
     parent: ConnectionId,
+    family: Family,
     database: &str,
     explorer: &mut Explorer,
     actions: &mut Vec<Action>,
@@ -470,21 +546,19 @@ fn database_node(
     row.selected = explorer.selected.as_ref() == Some(&key);
     row.loading = matches!(link, Link::Connecting);
     row.strong = own;
-    if !own {
-        row.status = Some(match &link {
-            Link::Online(_) => palette.success,
-            Link::Connecting => palette.warning,
-            Link::Failed(_) => palette.danger,
-            Link::Offline => palette.dim.gamma_multiply(0.6),
-        });
-    }
+    row.status = Some(match &link {
+        Link::Online(_) => palette.success,
+        Link::Connecting => palette.warning,
+        Link::Failed(_) => palette.danger,
+        Link::Offline => palette.dim.gamma_multiply(0.6),
+    });
     let response = row.show(ui);
     let response = match &link {
         Link::Failed(error) => response.on_hover_text(error),
         _ => response,
     };
     if response.clicked() {
-        explorer.selected = Some(key.clone());
+        explorer.pick(key.clone());
         if expanded && link.is_online() {
             explorer.toggle(key.clone());
         } else {
@@ -538,12 +612,133 @@ fn database_node(
         return;
     }
     match (session, &link) {
-        (Some(session), Link::Online(_)) => schemas(ui, session, 2, explorer, actions),
+        (Some(session), Link::Online(_)) => folders(ui, session, family, 2, explorer, actions),
         (_, Link::Failed(error)) => error_row(ui, 2, error),
         (_, Link::Connecting) => loading_row(ui, 2),
         // Closed since it was opened: a click opens it again.
         _ => {}
     }
+}
+
+/// The triggers, roles or extensions folder, listed the first time it
+/// opens.
+fn folder_node(
+    ui: &mut Ui,
+    id: ConnectionId,
+    folder: Folder,
+    depth: usize,
+    explorer: &mut Explorer,
+    actions: &mut Vec<Action>,
+) {
+    let key = NodeKey::Folder(id, folder);
+    let filter = explorer.filter.trim().to_lowercase();
+    let items = explorer
+        .folders
+        .get(&(id, folder))
+        .cloned()
+        .unwrap_or_default();
+    // While filtering, a folder shows only when something in it matches.
+    if !filter.is_empty() {
+        let matches = matches!(&items, Loadable::Ready(items)
+            if items.iter().any(|item| matches_filter(&item.name, &filter)));
+        if !matches {
+            return;
+        }
+    }
+    let expanded = !filter.is_empty() || explorer.is_expanded(&key);
+    let count = match &items {
+        Loadable::Ready(items) => Some(items.len().to_string()),
+        _ => None,
+    };
+    let mut row = Row::new(depth, Icon::Folder, folder.label());
+    row.expanded = Some(expanded);
+    row.selected = explorer.selected.as_ref() == Some(&key);
+    row.loading = items.is_loading();
+    row.detail = count.as_deref();
+    let response = row.show(ui);
+    if response.clicked() {
+        explorer.pick(key.clone());
+        if explorer.toggle(key) && matches!(items, Loadable::Idle | Loadable::Failed(_)) {
+            actions.push(Action::LoadFolder(id, folder));
+        }
+    }
+    response.context_menu(|ui| {
+        if menu_item(ui, Icon::Refresh, "Refresh") {
+            actions.push(Action::LoadFolder(id, folder));
+        }
+    });
+    if !expanded {
+        return;
+    }
+    let icon = match folder {
+        Folder::Triggers => Icon::Zap,
+        Folder::Roles => Icon::Lock,
+        Folder::Extensions => Icon::Package,
+        Folder::Schemas => Icon::Schema,
+    };
+    match items {
+        Loadable::Idle | Loadable::Loading => loading_row(ui, depth + 1),
+        Loadable::Failed(error) => error_row(ui, depth + 1, &error),
+        Loadable::Ready(items) if items.is_empty() => {
+            let palette = Palette::current(ui.ctx());
+            let mut row = Row::new(depth + 1, Icon::Info, "None");
+            row.icon_tint = Some(palette.dim);
+            row.show(ui);
+        }
+        Loadable::Ready(items) => {
+            for item in items.iter() {
+                if !filter.is_empty() && !matches_filter(&item.name, &filter) {
+                    continue;
+                }
+                folder_item(ui, id, folder, icon, item, depth + 1, actions);
+            }
+        }
+    }
+}
+
+/// A trigger, role or extension. A trigger opens its definition.
+fn folder_item(
+    ui: &mut Ui,
+    id: ConnectionId,
+    folder: Folder,
+    icon: Icon,
+    item: &FolderItem,
+    depth: usize,
+    actions: &mut Vec<Action>,
+) {
+    let mut row = Row::new(depth, icon, &item.name);
+    row.detail = item.detail.as_deref();
+    let response = row.show(ui);
+    // A trigger knows its table, which reading its definition needs.
+    let trigger = match (folder, &item.schema, &item.table) {
+        (Folder::Triggers, Some(schema), Some(table)) => Some((schema, table)),
+        _ => None,
+    };
+    let open = |(schema, table): (&String, &String)| Action::OpenTrigger {
+        connection: id,
+        schema: schema.clone(),
+        table: table.clone(),
+        name: item.name.clone(),
+    };
+    let response = match (&item.schema, &item.table) {
+        (Some(schema), Some(table)) => response.on_hover_text(format!("On {schema}.{table}")),
+        _ => response,
+    };
+    if response.clicked()
+        && let Some(trigger) = trigger
+    {
+        actions.push(open(trigger));
+    }
+    response.context_menu(|ui| {
+        if let Some(trigger) = trigger
+            && menu_item(ui, Icon::FileCode, "Open definition")
+        {
+            actions.push(open(trigger));
+        }
+        if menu_item(ui, Icon::Copy, "Copy name") {
+            actions.push(Action::Copy(item.name.clone()));
+        }
+    });
 }
 
 fn schema_node(
@@ -579,7 +774,7 @@ fn schema_node(
     row.loading = objects.is_loading();
     let response = row.show(ui);
     if response.clicked() {
-        explorer.selected = Some(key.clone());
+        explorer.pick(key.clone());
         if explorer.toggle(key.clone()) && matches!(objects, Loadable::Idle | Loadable::Failed(_)) {
             actions.push(Action::LoadObjects(id, schema.to_owned()));
         }
@@ -721,7 +916,7 @@ fn object_node(
     // As in DBeaver: clicking a table opens its data; the chevron shows
     // its columns.
     if response.clicked() {
-        explorer.selected = Some(key.clone());
+        explorer.pick(key.clone());
         if toggled {
             if explorer.toggle(key.clone())
                 && matches!(columns, Loadable::Idle | Loadable::Failed(_))
@@ -737,6 +932,13 @@ fn object_node(
                 connection: id,
                 schema: object.schema.clone(),
                 relation: object.name.clone(),
+            });
+        } else if object.kind == ObjectKind::Function {
+            actions.push(Action::OpenDefinition {
+                connection: id,
+                schema: object.schema.clone(),
+                name: object.name.clone(),
+                kind: object.kind,
             });
         }
     }
@@ -759,6 +961,18 @@ fn object_node(
                     ),
                 });
             }
+        }
+        let has_source = matches!(
+            object.kind,
+            ObjectKind::Function | ObjectKind::View | ObjectKind::MaterializedView
+        );
+        if has_source && menu_item(ui, Icon::FileCode, "Open definition") {
+            actions.push(Action::OpenDefinition {
+                connection: id,
+                schema: object.schema.clone(),
+                name: object.name.clone(),
+                kind: object.kind,
+            });
         }
         if menu_item(ui, Icon::Copy, "Copy name") {
             actions.push(Action::Copy(object.name.clone()));

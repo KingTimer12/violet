@@ -156,7 +156,7 @@ impl VioletApp {
         let source = tab.source.clone()?;
         let names: Vec<String> = set.columns.iter().map(|c| c.name.clone()).collect();
         let numeric: Vec<bool> = set.columns.iter().map(|c| c.numeric).collect();
-        let selected = tab.selected_cell.and_then(|(row, column)| {
+        let selected = tab.grid_selection.focus.and_then(|(row, column)| {
             let cells = set.rows.row(row)?;
             let values = cells.iter().map(|v| v.map(str::to_owned)).collect();
             (column < names.len()).then_some(((row, column), values))

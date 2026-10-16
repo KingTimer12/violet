@@ -3,7 +3,9 @@
 
 use std::path::PathBuf;
 
-use violet_core::{ConnectionId, ConnectionProfile, DriverId, ObjectRef, Secret, TaskKind};
+use violet_core::{
+    ConnectionId, ConnectionProfile, DriverId, ObjectKind, ObjectRef, Secret, TaskKind,
+};
 
 use super::workspace::TabId;
 use crate::completion::Need;
@@ -113,6 +115,32 @@ pub enum Action {
     RemoveProvider(DriverId),
     ToggleSidebar,
     Copy(String),
+    /// Opens the source of a function, procedure or view in an editor.
+    OpenDefinition {
+        connection: ConnectionId,
+        schema: String,
+        name: String,
+        kind: ObjectKind,
+    },
+    /// Opens a trigger's definition in an editor.
+    OpenTrigger {
+        connection: ConnectionId,
+        schema: String,
+        table: String,
+        name: String,
+    },
+    /// Lists a folder (triggers, roles, extensions) of a session's
+    /// database.
+    LoadFolder(ConnectionId, super::state::Folder),
+    /// Opens the dialog picking which schemas a session's database shows.
+    ChooseSchemas(ConnectionId),
+    /// Keeps the schemas picked for a `connection/database`; `None` shows
+    /// them all.
+    SetSchemaFilter(String, Option<std::collections::BTreeSet<String>>),
+    /// Opens advanced copy for a tab's picked cells.
+    AdvancedCopy(TabId),
+    /// The format and header choice advanced copy starts with next time.
+    RememberCopy(crate::export::Format, bool),
     /// Writes the shown rows of a tab to a file in a format.
     Export(TabId, crate::export::Format),
     /// Closes the referenced row beside a tab's grid.

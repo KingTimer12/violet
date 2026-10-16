@@ -647,6 +647,32 @@ fn objects(
         "Filter schemas and tables",
     ));
     let filter = dialog.filter.trim().to_lowercase();
+    // Picks every schema the filter shows, whole; tables picked in them
+    // give way to the schema.
+    ui.horizontal(|ui| {
+        let label = if filter.is_empty() {
+            "Select all schemas"
+        } else {
+            "Select shown schemas"
+        };
+        if widgets::button(ui, Tone::Secondary, Some(Icon::Check), label).clicked() {
+            for schema in schemas
+                .iter()
+                .filter(|schema| filter.is_empty() || schema.to_lowercase().contains(&filter))
+            {
+                dialog.objects.retain(|o| o.schema != *schema);
+                dialog.objects.insert(ObjectRef {
+                    schema: schema.clone(),
+                    name: None,
+                });
+            }
+        }
+        if !dialog.objects.is_empty()
+            && widgets::button(ui, Tone::Ghost, Some(Icon::Close), "Clear").clicked()
+        {
+            dialog.objects.clear();
+        }
+    });
     for schema in schemas.iter() {
         let key = (id, schema.clone());
         let loaded = match env.explorer.objects.get(&key) {
@@ -710,7 +736,11 @@ fn objects(
             } else {
                 schema.clone()
             };
-            if ui.checkbox(&mut checked, label).changed() {
+            let partly = some && !checked;
+            if ui
+                .add(widgets::Check::new(&mut checked, label).indeterminate(partly))
+                .changed()
+            {
                 dialog.objects.retain(|o| o.schema != *schema);
                 if checked {
                     dialog.objects.insert(whole.clone());
@@ -738,7 +768,7 @@ fn objects(
                         let (rect, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
                         widgets::paint_icon(ui, Icon::for_kind(relation.kind), rect, palette.dim);
                         let response =
-                            ui.add_enabled(!checked, egui::Checkbox::new(&mut on, &relation.name));
+                            ui.add_enabled(!checked, widgets::Check::new(&mut on, &relation.name));
                         if response.changed() {
                             if on {
                                 dialog.objects.insert(item.clone());
@@ -819,7 +849,7 @@ fn field_row(ui: &mut egui::Ui, field: &Field, value: &mut String, palette: &Pal
         FieldKind::Flag => {
             ui.label("");
             let mut on = value == "true";
-            let response = ui.checkbox(&mut on, &field.label);
+            let response = widgets::checkbox(ui, &mut on, &field.label);
             if response.changed() {
                 *value = on.to_string();
             }

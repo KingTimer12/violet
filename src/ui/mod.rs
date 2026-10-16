@@ -3,8 +3,11 @@
 //! against the application layer.
 
 mod action;
+mod catalog_flow;
 mod chrome;
 mod connection_form;
+mod copy_flow;
+mod definition_flow;
 #[cfg(debug_assertions)]
 mod devtools;
 mod edit_flow;
@@ -17,6 +20,7 @@ mod providers;
 mod reference;
 mod results;
 mod script_flow;
+mod selection;
 mod shortcuts;
 mod sidebar;
 mod state;
@@ -108,6 +112,16 @@ pub struct VioletApp {
     reference: Option<reference::Reference>,
     /// Exports waiting for every row to be read.
     exports: HashMap<violet_app::RequestId, export_flow::PendingExport>,
+    copy_dialog: Option<copy_flow::CopyDialog>,
+    /// Definitions being read.
+    definitions: HashMap<violet_app::RequestId, definition_flow::PendingDefinition>,
+    /// Folder listings being read.
+    folder_requests: HashMap<violet_app::RequestId, (ConnectionId, state::Folder)>,
+    schema_chooser: Option<catalog_flow::SchemaChooser>,
+    /// Actions to run once their connection opens.
+    waiting: Vec<(ConnectionId, Action)>,
+    /// The format and header choice advanced copy starts with.
+    copy_choice: (crate::export::Format, bool),
     confirm_delete: Option<ConnectionId>,
     /// Runs waiting for their tab's connection to open.
     queued: Vec<(TabId, RunScope)>,
@@ -198,12 +212,16 @@ impl VioletApp {
         settings: Settings,
         startup_errors: Vec<Toast>,
     ) -> Self {
+        let schema_filters = settings.schema_filters.clone();
         let mut app = Self {
             backend: services.backend,
             profiles: services.profiles,
             settings_file: services.settings,
             settings,
-            explorer: Explorer::default(),
+            explorer: Explorer {
+                schema_filters,
+                ..Explorer::default()
+            },
             workspace: Workspace::default(),
             toasts: Toasts::default(),
             form: None,
@@ -219,6 +237,12 @@ impl VioletApp {
             applying: HashMap::new(),
             reference: None,
             exports: HashMap::new(),
+            copy_dialog: None,
+            definitions: HashMap::new(),
+            waiting: Vec::new(),
+            folder_requests: HashMap::new(),
+            schema_chooser: None,
+            copy_choice: (crate::export::Format::Tsv, true),
             confirm_delete: None,
             queued: Vec::new(),
             actions: Vec::new(),
@@ -391,6 +415,66 @@ impl VioletApp {
     }
 
     /// Whether `id` is a saved connection that lists its server's databases.
+    /// The saved connection a session belongs to: itself, or the one it
+    /// opened another database of.
+    fn root(&self, id: ConnectionId) -> ConnectionId {
+        self.explorer
+            .opened
+            .get(&id)
+            .map_or(id, |(parent, _)| *parent)
+    }
+
+    /// The tree's selection moved: when it is on a database (or something
+    /// inside one) of the server the active editor runs on, the editor
+    /// switches to that database, as DBeaver's navigator links to its
+    /// editor. An editor with no connection takes it too. Running editors
+    /// and ones with unsaved grid changes stay where they are.
+    fn follow_tree(&mut self, ctx: &egui::Context) {
+        let session = match self.explorer.selected.clone() {
+            Some(NodeKey::Database(parent, database)) => self.database_session(parent, &database),
+            Some(
+                NodeKey::Connection(id)
+                | NodeKey::Schema(id, _)
+                | NodeKey::Group(id, _, _)
+                | NodeKey::Object(id, _, _),
+            ) => Some(id),
+            Some(NodeKey::Folder(id, _)) => Some(id),
+            Some(NodeKey::Scripts(_)) | None => None,
+        };
+        let Some(session) = session else {
+            return;
+        };
+        let root = self.root(session);
+        let Some(tab) = self.workspace.active() else {
+            return;
+        };
+        let follows = matches!(tab.kind, TabKind::Script)
+            && tab.running.is_none()
+            && tab.edits.is_empty()
+            && tab.connection != Some(session)
+            && tab
+                .connection
+                .is_none_or(|current| self.root(current) == root);
+        if !follows {
+            return;
+        }
+        let tab_id = tab.id;
+        if let Some(name) = self.connection_name(session) {
+            self.toasts
+                .push(ctx, Toast::info(format!("The editor now runs on {name}")));
+        }
+        self.actions
+            .push(Action::SetTabConnection(tab_id, Some(session)));
+    }
+
+    /// The id of a connection's driver, such as `postgres`.
+    fn driver_of(&self, id: ConnectionId) -> Option<String> {
+        connections(&self.profiles, &self.explorer)
+            .iter()
+            .find(|profile| profile.id == id)
+            .map(|profile| profile.driver.as_str().to_owned())
+    }
+
     /// The SQL dialect of a connection's driver.
     fn dialect(&self, id: ConnectionId) -> violet_core::SqlDialect {
         connections(&self.profiles, &self.explorer)
@@ -439,6 +523,12 @@ impl VioletApp {
                     ctx,
                     Toast::success(format!("Connected to {}", self.profile_name(id))),
                 );
+                let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.waiting)
+                    .into_iter()
+                    .partition(|(connection, _)| *connection == id);
+                self.waiting = waiting;
+                self.actions
+                    .extend(ready.into_iter().map(|(_, action)| action));
                 self.explorer.links.insert(id, Link::Online(server));
                 self.explorer.forget(id);
                 self.explorer.schemas.insert(id, Loadable::Loading);
@@ -464,6 +554,7 @@ impl VioletApp {
                 }
             }
             Event::ConnectFailed { id, error } => {
+                self.waiting.retain(|(connection, _)| *connection != id);
                 self.queued.retain(|(tab, _)| {
                     !self
                         .workspace
@@ -562,6 +653,14 @@ impl VioletApp {
                     self.edits_applied(ctx, applying, &result);
                     return;
                 }
+                if let Some(folder) = self.folder_requests.remove(&request) {
+                    self.folder_read(folder, result);
+                    return;
+                }
+                if let Some(pending) = self.definitions.remove(&request) {
+                    self.definition_read(ctx, pending, result);
+                    return;
+                }
                 if let Some(pending) = self.exports.remove(&request) {
                     self.export_read(ctx, pending, result);
                     return;
@@ -642,7 +741,7 @@ impl VioletApp {
                 }
                 if !running.append {
                     tab.active_set = 0;
-                    tab.selected_cell = None;
+                    tab.grid_selection.clear();
                 }
                 tab.outcome = Some(match result {
                     Ok(output) => {
@@ -1543,9 +1642,26 @@ impl VioletApp {
                 self.save_settings(ctx);
             }
             Action::Export(tab_id, format) => self.export(ctx, tab_id, format),
+            Action::OpenDefinition {
+                connection,
+                schema,
+                name,
+                kind,
+            } => self.open_definition(ctx, connection, schema, name, kind),
+            Action::OpenTrigger {
+                connection,
+                schema,
+                table,
+                name,
+            } => self.open_trigger(ctx, connection, schema, table, name),
+            Action::LoadFolder(connection, folder) => self.load_folder(connection, folder),
+            Action::ChooseSchemas(session) => self.choose_schemas(ctx, session),
+            Action::SetSchemaFilter(scope, picked) => self.set_schema_filter(ctx, scope, picked),
+            Action::AdvancedCopy(tab_id) => self.open_copy_dialog(tab_id),
+            Action::RememberCopy(format, headers) => self.copy_choice = (format, headers),
             Action::CloseReference(tab_id) => {
                 if let Some(tab) = self.workspace.get_mut(tab_id) {
-                    tab.selected_cell = None;
+                    tab.grid_selection.clear();
                 }
                 self.reference = None;
             }
@@ -1832,6 +1948,16 @@ impl VioletApp {
         {
             self.cell_editor = None;
         }
+        if let Some(chooser) = &mut self.schema_chooser
+            && !catalog_flow::show_chooser(ctx, chooser, &mut self.actions)
+        {
+            self.schema_chooser = None;
+        }
+        if let Some(dialog) = &mut self.copy_dialog
+            && !copy_flow::show(ctx, dialog, &mut self.actions)
+        {
+            self.copy_dialog = None;
+        }
         if let Some(review) = &self.edit_review
             && !edit_flow::show_edit_review(ctx, review, &mut self.actions)
         {
@@ -1972,6 +2098,9 @@ impl eframe::App for VioletApp {
                     &mut self.actions,
                 );
             });
+        if std::mem::take(&mut self.explorer.picked) {
+            self.follow_tree(&ctx);
+        }
         self.layout.sidebar = sidebar.map(|sidebar| sidebar.response.rect.width());
         if sidebar_open != self.settings.sidebar {
             self.actions.push(Action::ToggleSidebar);

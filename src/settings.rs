@@ -56,6 +56,9 @@ pub struct Settings {
     pub script_folder: String,
     /// Where rows were last exported, for the file dialog.
     pub export_folder: String,
+    /// The schemas the tree shows, per `connection/database`; a database
+    /// missing here shows them all.
+    pub schema_filters: BTreeMap<String, BTreeSet<String>>,
     /// Check for new versions and download them in the background.
     pub updates: bool,
 }
@@ -74,6 +77,7 @@ impl Default for Settings {
             backup_name: String::new(),
             script_folder: String::new(),
             export_folder: String::new(),
+            schema_filters: BTreeMap::new(),
             updates: true,
         }
     }

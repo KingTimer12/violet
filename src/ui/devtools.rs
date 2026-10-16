@@ -158,6 +158,9 @@ impl VioletApp {
             ) => {
                 if let Some(id) = first {
                     self.explorer.expanded.insert(NodeKey::Connection(id));
+                    self.explorer
+                        .expanded
+                        .insert(NodeKey::Folder(id, super::state::Folder::Schemas));
                     // A profile whose password is not saved connects with
                     // `VIOLET_SCENE_PASSWORD`.
                     match std::env::var("VIOLET_SCENE_PASSWORD") {

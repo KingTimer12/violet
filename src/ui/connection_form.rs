@@ -268,7 +268,8 @@ pub fn show(
                     .response
                 });
                 ui.horizontal(|ui| {
-                    ui.checkbox(
+                    widgets::checkbox(
+                        ui,
                         &mut form.profile.save_password,
                         "Save password in the system keychain",
                     );
@@ -276,10 +277,14 @@ pub fn show(
             }
             if chosen.is_some_and(|driver| driver.info.capabilities.databases) {
                 ui.horizontal(|ui| {
-                    ui.checkbox(&mut form.profile.show_all_databases, "Show all databases")
-                        .on_hover_text(
-                            "List every database on the server in the tree, not only this one",
-                        );
+                    widgets::checkbox(
+                        ui,
+                        &mut form.profile.show_all_databases,
+                        "Show all databases",
+                    )
+                    .on_hover_text(
+                        "List every database on the server in the tree, not only this one",
+                    );
                 });
             }
 
@@ -470,8 +475,7 @@ fn database_file(ui: &mut egui::Ui, form: &mut ConnectionForm) {
         .response
     });
     let mut read_only = form.profile.options.get("read_only").map(String::as_str) == Some("true");
-    if ui
-        .checkbox(&mut read_only, "Read only")
+    if widgets::checkbox(ui, &mut read_only, "Read only")
         .on_hover_text("Open the database without changing it")
         .changed()
     {

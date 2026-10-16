@@ -9,7 +9,7 @@ use violet_core::{Dialect as _, Page, QueryOutput, Result, ResultSet};
 
 use super::VioletApp;
 use super::toasts::Toast;
-use super::workspace::{Executed, Outcome, TabId, TabKind};
+use super::workspace::{Executed, Outcome, QueryTab, TabId, TabKind};
 use crate::export::{self, Format};
 use crate::ui::workspace::thousands;
 
@@ -24,21 +24,12 @@ pub struct PendingExport {
 }
 
 impl VioletApp {
-    /// Asks where to write `tab_id`'s rows, then writes them, reading the
-    /// rows not fetched yet first.
-    pub(super) fn export(&mut self, ctx: &egui::Context, tab_id: TabId, format: Format) {
-        let Some(tab) = self.workspace.get(tab_id) else {
-            return;
-        };
-        let Some(Outcome::Done { output }) = &tab.outcome else {
-            return;
-        };
-        let Some(set) = output.sets.get(tab.active_set) else {
-            return;
-        };
-        if !set.has_rows() {
-            return;
-        }
+    /// For `tab`'s rows: the table `INSERT`s go into (quoted), a title, and
+    /// the connection's dialect.
+    pub(super) fn export_target(
+        &self,
+        tab: &QueryTab,
+    ) -> (String, String, violet_core::SqlDialect) {
         let dialect = tab
             .connection
             .map_or(violet_core::SqlDialect::ANSI, |id| self.dialect(id));
@@ -61,6 +52,25 @@ impl VioletApp {
             TabKind::Data(view) => view.relation.clone(),
             TabKind::Script => tab.title.trim_end_matches(".sql").to_owned(),
         };
+        (table, title, dialect)
+    }
+
+    /// Asks where to write `tab_id`'s rows, then writes them, reading the
+    /// rows not fetched yet first.
+    pub(super) fn export(&mut self, ctx: &egui::Context, tab_id: TabId, format: Format) {
+        let Some(tab) = self.workspace.get(tab_id) else {
+            return;
+        };
+        let Some(Outcome::Done { output }) = &tab.outcome else {
+            return;
+        };
+        let Some(set) = output.sets.get(tab.active_set) else {
+            return;
+        };
+        if !set.has_rows() {
+            return;
+        }
+        let (table, title, dialect) = self.export_target(tab);
 
         let mut picker = rfd::FileDialog::new()
             .set_title(format!("Export rows as {}", format.label()))
@@ -160,6 +170,7 @@ fn write(pending: &PendingExport, set: &ResultSet, more: bool) -> Toast {
         table: &pending.table,
         quote: &quote,
         title: &pending.title,
+        headers: true,
     };
     let written = export::render(set, pending.format, &options)
         .and_then(|bytes| Ok(std::fs::write(&pending.path, bytes)?));

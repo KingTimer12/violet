@@ -121,7 +121,8 @@ pub struct QueryTab {
     pub running: Option<Running>,
     pub outcome: Option<Outcome>,
     pub active_set: usize,
-    pub selected_cell: Option<(usize, usize)>,
+    /// The cells picked in the grid.
+    pub grid_selection: super::selection::Selection,
     pub kind: TabKind,
     /// Set while the shown result is read a page at a time.
     pub paging: Option<Paging>,
@@ -233,7 +234,7 @@ impl Workspace {
             running: None,
             outcome: None,
             active_set: 0,
-            selected_cell: None,
+            grid_selection: super::selection::Selection::default(),
             kind,
             paging: None,
             last_run: None,
