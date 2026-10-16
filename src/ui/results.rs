@@ -66,7 +66,13 @@ fn paint_cell(ui: &Ui, cell: Cell<'_>, right_aligned: bool, color: Color32) {
 }
 
 #[hotpath::measure]
-pub fn show(ui: &mut Ui, tab: &mut QueryTab, editing: &Editing, actions: &mut Vec<Action>) {
+pub fn show(
+    ui: &mut Ui,
+    tab: &mut QueryTab,
+    editing: &Editing,
+    links: &[bool],
+    actions: &mut Vec<Action>,
+) {
     let palette = Palette::current(ui.ctx());
     // Fetching another page keeps the rows on screen; the footer shows it.
     if let Some(running) = &tab.running
@@ -258,6 +264,7 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, editing: &Editing, actions: &mut Ve
                     &mut tab.selected_cell,
                     target,
                     &tab.edits,
+                    links,
                     actions,
                 );
             } else {
@@ -366,6 +373,7 @@ fn grid(
     selected: &mut Option<(usize, usize)>,
     target: Option<&EditTarget>,
     edits: &BTreeMap<(usize, usize), Option<String>>,
+    links: &[bool],
     actions: &mut Vec<Action>,
 ) {
     let palette = Palette::current(ui.ctx());
@@ -416,6 +424,13 @@ fn grid(
                         header.col(|ui| {
                             ui.painter().rect_filled(ui.max_rect(), 0.0, palette.panel);
                             ui.add_space(6.0);
+                            // A foreign key: picking a cell shows the row
+                            // it points at.
+                            if links.get(index).copied().unwrap_or(false) {
+                                let (rect, _) =
+                                    ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+                                widgets::paint_icon(ui, Icon::Key, rect, palette.accent);
+                            }
                             ui.label(
                                 RichText::new(&column.name)
                                     .font(theme::semibold(12.5))

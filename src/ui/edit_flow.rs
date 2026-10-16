@@ -141,7 +141,7 @@ impl VioletApp {
     }
 
     /// The schema and name the catalog has for `source`.
-    fn find_table(&mut self, connection: ConnectionId, source: &TableRef) -> Found {
+    pub(super) fn find_table(&mut self, connection: ConnectionId, source: &TableRef) -> Found {
         let schemas: Vec<String> = match &source.schema {
             Some(schema) => match self.explorer.schemas.get(&connection) {
                 Some(Loadable::Ready(all)) => all
@@ -461,7 +461,7 @@ impl VioletApp {
     }
 }
 
-enum Found {
+pub(super) enum Found {
     Table(String, String),
     NotTable,
     Missing,

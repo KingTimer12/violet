@@ -113,6 +113,8 @@ pub enum Action {
     RemoveProvider(DriverId),
     ToggleSidebar,
     Copy(String),
+    /// Closes the referenced row beside a tab's grid.
+    CloseReference(TabId),
     OpenHistory,
     ClearHistory,
     /// Puts SQL at the active editor's cursor.
