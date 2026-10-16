@@ -738,6 +738,13 @@ fn object_node(
                 schema: object.schema.clone(),
                 relation: object.name.clone(),
             });
+        } else if object.kind == ObjectKind::Function {
+            actions.push(Action::OpenDefinition {
+                connection: id,
+                schema: object.schema.clone(),
+                name: object.name.clone(),
+                kind: object.kind,
+            });
         }
     }
     response.context_menu(|ui| {
@@ -759,6 +766,18 @@ fn object_node(
                     ),
                 });
             }
+        }
+        let has_source = matches!(
+            object.kind,
+            ObjectKind::Function | ObjectKind::View | ObjectKind::MaterializedView
+        );
+        if has_source && menu_item(ui, Icon::FileCode, "Open definition") {
+            actions.push(Action::OpenDefinition {
+                connection: id,
+                schema: object.schema.clone(),
+                name: object.name.clone(),
+                kind: object.kind,
+            });
         }
         if menu_item(ui, Icon::Copy, "Copy name") {
             actions.push(Action::Copy(object.name.clone()));

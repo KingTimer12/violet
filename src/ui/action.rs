@@ -3,7 +3,9 @@
 
 use std::path::PathBuf;
 
-use violet_core::{ConnectionId, ConnectionProfile, DriverId, ObjectRef, Secret, TaskKind};
+use violet_core::{
+    ConnectionId, ConnectionProfile, DriverId, ObjectKind, ObjectRef, Secret, TaskKind,
+};
 
 use super::workspace::TabId;
 use crate::completion::Need;
@@ -113,6 +115,13 @@ pub enum Action {
     RemoveProvider(DriverId),
     ToggleSidebar,
     Copy(String),
+    /// Opens the source of a function, procedure or view in an editor.
+    OpenDefinition {
+        connection: ConnectionId,
+        schema: String,
+        name: String,
+        kind: ObjectKind,
+    },
     /// Opens advanced copy for a tab's picked cells.
     AdvancedCopy(TabId),
     /// The format and header choice advanced copy starts with next time.

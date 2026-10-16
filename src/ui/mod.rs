@@ -6,6 +6,7 @@ mod action;
 mod chrome;
 mod connection_form;
 mod copy_flow;
+mod definition_flow;
 #[cfg(debug_assertions)]
 mod devtools;
 mod edit_flow;
@@ -111,6 +112,10 @@ pub struct VioletApp {
     /// Exports waiting for every row to be read.
     exports: HashMap<violet_app::RequestId, export_flow::PendingExport>,
     copy_dialog: Option<copy_flow::CopyDialog>,
+    /// Definitions being read.
+    definitions: HashMap<violet_app::RequestId, definition_flow::PendingDefinition>,
+    /// Actions to run once their connection opens.
+    waiting: Vec<(ConnectionId, Action)>,
     /// The format and header choice advanced copy starts with.
     copy_choice: (crate::export::Format, bool),
     confirm_delete: Option<ConnectionId>,
@@ -225,6 +230,8 @@ impl VioletApp {
             reference: None,
             exports: HashMap::new(),
             copy_dialog: None,
+            definitions: HashMap::new(),
+            waiting: Vec::new(),
             copy_choice: (crate::export::Format::Tsv, true),
             confirm_delete: None,
             queued: Vec::new(),
@@ -449,6 +456,14 @@ impl VioletApp {
             .push(Action::SetTabConnection(tab_id, Some(session)));
     }
 
+    /// The id of a connection's driver, such as `postgres`.
+    fn driver_of(&self, id: ConnectionId) -> Option<String> {
+        connections(&self.profiles, &self.explorer)
+            .iter()
+            .find(|profile| profile.id == id)
+            .map(|profile| profile.driver.as_str().to_owned())
+    }
+
     /// The SQL dialect of a connection's driver.
     fn dialect(&self, id: ConnectionId) -> violet_core::SqlDialect {
         connections(&self.profiles, &self.explorer)
@@ -497,6 +512,12 @@ impl VioletApp {
                     ctx,
                     Toast::success(format!("Connected to {}", self.profile_name(id))),
                 );
+                let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.waiting)
+                    .into_iter()
+                    .partition(|(connection, _)| *connection == id);
+                self.waiting = waiting;
+                self.actions
+                    .extend(ready.into_iter().map(|(_, action)| action));
                 self.explorer.links.insert(id, Link::Online(server));
                 self.explorer.forget(id);
                 self.explorer.schemas.insert(id, Loadable::Loading);
@@ -522,6 +543,7 @@ impl VioletApp {
                 }
             }
             Event::ConnectFailed { id, error } => {
+                self.waiting.retain(|(connection, _)| *connection != id);
                 self.queued.retain(|(tab, _)| {
                     !self
                         .workspace
@@ -618,6 +640,10 @@ impl VioletApp {
             Event::QueryFinished { request, result } => {
                 if let Some(applying) = self.applying.remove(&request) {
                     self.edits_applied(ctx, applying, &result);
+                    return;
+                }
+                if let Some(pending) = self.definitions.remove(&request) {
+                    self.definition_read(ctx, pending, result);
                     return;
                 }
                 if let Some(pending) = self.exports.remove(&request) {
@@ -1596,6 +1622,12 @@ impl VioletApp {
                 self.save_settings(ctx);
             }
             Action::Export(tab_id, format) => self.export(ctx, tab_id, format),
+            Action::OpenDefinition {
+                connection,
+                schema,
+                name,
+                kind,
+            } => self.open_definition(ctx, connection, schema, name, kind),
             Action::AdvancedCopy(tab_id) => self.open_copy_dialog(tab_id),
             Action::RememberCopy(format, headers) => self.copy_choice = (format, headers),
             Action::CloseReference(tab_id) => {
