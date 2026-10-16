@@ -17,6 +17,7 @@ mod providers;
 mod reference;
 mod results;
 mod script_flow;
+mod selection;
 mod shortcuts;
 mod sidebar;
 mod state;
@@ -642,7 +643,7 @@ impl VioletApp {
                 }
                 if !running.append {
                     tab.active_set = 0;
-                    tab.selected_cell = None;
+                    tab.grid_selection.clear();
                 }
                 tab.outcome = Some(match result {
                     Ok(output) => {
@@ -1540,7 +1541,7 @@ impl VioletApp {
             Action::Export(tab_id, format) => self.export(ctx, tab_id, format),
             Action::CloseReference(tab_id) => {
                 if let Some(tab) = self.workspace.get_mut(tab_id) {
-                    tab.selected_cell = None;
+                    tab.grid_selection.clear();
                 }
                 self.reference = None;
             }
