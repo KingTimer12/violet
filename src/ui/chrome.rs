@@ -2,6 +2,7 @@
 //! the welcome page.
 
 use egui::{Align, Align2, CornerRadius, Layout, RichText, Sense, Stroke, Ui, Vec2};
+use violet_app::TxCommand;
 use violet_core::{ConnectionId, ConnectionProfile};
 
 use super::action::{Action, RunScope};
@@ -360,7 +361,7 @@ pub fn toolbar(
 ) {
     let palette = Palette::current(ui.ctx());
     if let Some(view) = tab.data() {
-        data_toolbar(ui, tab, view, profiles, actions);
+        data_toolbar(ui, tab, view, profiles, explorer, actions);
         return;
     }
     ui.horizontal_centered(|ui| {
@@ -478,6 +479,7 @@ pub fn toolbar(
                 actions.push(Action::OpenScriptFile);
             }
         });
+        transaction_controls(ui, tab, explorer, actions);
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.add_space(10.0);
@@ -492,6 +494,62 @@ pub fn toolbar(
             }
         });
     });
+}
+
+/// The tab's connection in auto-commit or manual commit, and while a
+/// transaction is open, Commit and Rollback.
+fn transaction_controls(
+    ui: &mut Ui,
+    tab: &QueryTab,
+    explorer: &Explorer,
+    actions: &mut Vec<Action>,
+) {
+    let Some(id) = tab.connection.filter(|id| explorer.link(*id).is_online()) else {
+        return;
+    };
+    let state = explorer.transaction(id);
+    ui.add_space(4.0);
+    let mut manual = state.manual;
+    let switch =
+        ui.scope(|ui| widgets::segmented(ui, &mut manual, &[(false, "Auto"), (true, "Manual")]));
+    if switch.inner {
+        actions.push(Action::Transact(id, TxCommand::AutoCommit(!manual)));
+    }
+    switch.response.on_hover_text(
+        "Auto: auto-commit, each statement is committed as it runs.\n\
+         Manual: changes wait in a transaction until you commit or roll them back.",
+    );
+    if !state.manual && !state.open {
+        return;
+    }
+    // Ending it while a statement runs would race that statement.
+    let idle = tab.running.is_none();
+    let label = match state.writes {
+        0 => "Commit".to_owned(),
+        n => format!("Commit ({n})"),
+    };
+    let commit = ui
+        .add_enabled_ui(idle && state.open, |ui| {
+            widgets::button(ui, Tone::Secondary, Some(Icon::Check), &label)
+        })
+        .inner;
+    let tip = if state.open {
+        "Make the transaction's changes permanent"
+    } else {
+        "No transaction is open: the next change opens one"
+    };
+    if commit.on_hover_text(tip).clicked() {
+        actions.push(Action::Transact(id, TxCommand::Commit));
+    }
+    if ui
+        .add_enabled_ui(idle && state.open, |ui| {
+            widgets::icon_button(ui, Icon::Undo, "Roll back: undo the transaction's changes")
+        })
+        .inner
+        .clicked()
+    {
+        actions.push(Action::Transact(id, TxCommand::Rollback));
+    }
 }
 
 /// A menu entry with its shortcut on the right.
@@ -512,6 +570,7 @@ fn data_toolbar(
     tab: &QueryTab,
     view: &DataView,
     profiles: &[ConnectionProfile],
+    explorer: &Explorer,
     actions: &mut Vec<Action>,
 ) {
     let palette = Palette::current(ui.ctx());
@@ -548,6 +607,7 @@ fn data_toolbar(
                 sql: format!("{};\n", tab.sql),
             });
         }
+        transaction_controls(ui, tab, explorer, actions);
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.add_space(12.0);
@@ -686,6 +746,17 @@ pub fn status_bar(
                 widgets::dot(ui, color, 3.5);
                 ui.label(small(profile.display_name(), palette.secondary));
                 ui.label(small(state, palette.dim));
+                let transaction = explorer.transaction(id);
+                if transaction.open {
+                    let text = match transaction.writes {
+                        0 => "· Transaction open".to_owned(),
+                        1 => "· Transaction open, 1 change not committed".to_owned(),
+                        n => format!("· Transaction open, {n} changes not committed"),
+                    };
+                    ui.label(small(text, palette.warning));
+                } else if transaction.manual {
+                    ui.label(small("· Manual commit".to_owned(), palette.dim));
+                }
             }
             None => {
                 ui.label(small("No connection selected".to_owned(), palette.dim));

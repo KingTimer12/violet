@@ -331,6 +331,33 @@ changed:
   Refresh button drops or bypasses the cache; entries also expire after
   five minutes. Results served from the cache are marked "Cached" with
   their age.
+- While a transaction is open nothing is read from or kept in the cache:
+  its rows may be rolled back. Ending it drops what was cached.
+
+## Transactions
+
+Connections start in auto-commit: each statement is committed as it runs.
+The **Auto | Manual** switch in the editor's and data tab's toolbar turns
+on manual commit for the tab's connection, as DBeaver's does. Violet then
+opens a transaction before the first statement that may write (anything
+the cache would not keep, saved grid edits included) and **Commit** and
+the rollback button end it; the button counts the runs waiting, and the
+status bar shows the transaction while one is open. Reads before it run on
+their own. PostgreSQL and SQLite get a `BEGIN`; MySQL and MariaDB turn
+`autocommit` off for the session instead, since a `BEGIN` there commits
+the transaction already open. The mode lasts while Violet runs, through
+reconnects; each database opened under a connection has its own.
+
+Transaction statements typed in the editor are followed: `BEGIN` or
+`START TRANSACTION` shows an open transaction even in auto-commit, and
+`COMMIT`, `END`, `ROLLBACK` and `ABORT` end it (a rollback to a savepoint
+does not). Violet adds no `BEGIN` to a script that has its own. A script
+that opens one and fails is taken to have left it open.
+
+Switching back to auto-commit, disconnecting or closing the window with a
+transaction open asks whether to commit or roll it back. When PostgreSQL
+answers a commit by rolling back, because a statement in the transaction
+had failed, Violet says so instead of reporting a commit.
 
 ## Security
 

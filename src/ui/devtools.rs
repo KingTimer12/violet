@@ -17,7 +17,8 @@
 //! [`VioletApp::task_scene`]), `edit` (a data tab of `VIOLET_SCENE_TABLE`,
 //! double-clicked at `VIOLET_SCENE_X`, `VIOLET_SCENE_Y`), `sort` (runs
 //! `VIOLET_SCENE_SQL`, clicks a header at `VIOLET_SCENE_X`, `_Y` and a menu
-//! item at `VIOLET_SCENE_APPLY_X`, `_Y`). A profile without
+//! item at `VIOLET_SCENE_APPLY_X`, `_Y`), `transaction` (manual commit,
+//! then a write into a temporary table, left uncommitted). A profile without
 //! a saved password connects with `VIOLET_SCENE_PASSWORD`. Add
 //! `VIOLET_THEME=light` for the light theme.
 
@@ -153,7 +154,7 @@ impl VioletApp {
             }
             (
                 "browse" | "error" | "data" | "menu" | "page" | "complete" | "explain" | "history"
-                | "task" | "edit" | "sort",
+                | "task" | "edit" | "sort" | "transaction",
                 0,
             ) => {
                 if let Some(id) = first {
@@ -617,7 +618,32 @@ impl VioletApp {
                 snapshot.step += 1;
                 false
             }
-            ("browse" | "error" | "data", _) => {
+            ("transaction", 1) => {
+                let Some(id) = first else { return true };
+                if self.explorer.link(id).is_online() {
+                    self.actions.push(Action::Transact(
+                        id,
+                        violet_app::TxCommand::AutoCommit(false),
+                    ));
+                    self.actions.push(Action::OpenEditor {
+                        connection: Some(id),
+                        sql: "CREATE TEMPORARY TABLE scratch (n int);\n\
+                              INSERT INTO scratch VALUES (1), (2);"
+                            .into(),
+                    });
+                    snapshot.step += 1;
+                }
+                false
+            }
+            ("transaction", 2) => {
+                let manual = first.is_some_and(|id| self.explorer.transaction(id).manual);
+                if manual && let Some(tab) = self.workspace.active {
+                    self.actions.push(Action::Run(tab, RunScope::Script));
+                    snapshot.step += 1;
+                }
+                false
+            }
+            ("browse" | "error" | "data" | "transaction", _) => {
                 let done = self.workspace.active().is_some_and(|tab| {
                     tab.running.is_none()
                         && matches!(

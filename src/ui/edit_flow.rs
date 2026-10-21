@@ -441,10 +441,19 @@ impl VioletApp {
                     tab.clear_changes();
                     tab.grid_selection.clear();
                 }
+                // In manual commit they wait for the transaction's commit.
+                let pending = if self.explorer.transaction(applying.connection).open {
+                    ", not committed yet"
+                } else {
+                    ""
+                };
                 if missed == 0 {
                     self.toasts.push(
                         ctx,
-                        Toast::success(format!("Saved {}: {}", applying.table, applying.summary)),
+                        Toast::success(format!(
+                            "Saved {}{pending}: {}",
+                            applying.table, applying.summary
+                        )),
                     );
                 } else {
                     self.toasts.push(

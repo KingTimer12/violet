@@ -34,7 +34,11 @@ pub enum Action {
     AskDeleteConnection(ConnectionId),
     DeleteConnection(ConnectionId),
     Connect(ConnectionId),
+    /// Disconnects, asking first about an open transaction.
     Disconnect(ConnectionId),
+    /// Commits, rolls back, or switches auto-commit; leaving manual commit
+    /// with a transaction open asks first.
+    Transact(ConnectionId, violet_app::TxCommand),
     /// Opens a database of a connection that shows them all, in a session
     /// of its own.
     OpenDatabase(ConnectionId, String),

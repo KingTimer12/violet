@@ -131,6 +131,8 @@ pub struct Explorer {
     /// The databases shown per saved connection (its id), as the settings
     /// keep them.
     pub database_filters: BTreeMap<String, BTreeSet<String>>,
+    /// Each connection's transaction, as the backend last reported it.
+    pub transactions: HashMap<ConnectionId, violet_app::Transaction>,
     /// A node was clicked since this was last cleared.
     pub picked: bool,
     pub filter: String,
@@ -140,6 +142,11 @@ impl Explorer {
     pub fn link(&self, id: ConnectionId) -> &Link {
         static OFFLINE: Link = Link::Offline;
         self.links.get(&id).unwrap_or(&OFFLINE)
+    }
+
+    /// `id`'s transaction: auto-commit, none open, until told otherwise.
+    pub fn transaction(&self, id: ConnectionId) -> violet_app::Transaction {
+        self.transactions.get(&id).copied().unwrap_or_default()
     }
 
     pub fn is_expanded(&self, key: &NodeKey) -> bool {

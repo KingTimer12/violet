@@ -65,6 +65,7 @@ fastframe_icons::icons! {
         Save => "save",
         ShieldAlert => "shield-alert",
         Keyboard => "keyboard",
+        Undo => "undo-2",
         PostgreSql => "postgresql",
         MySql => "mysql",
         MariaDb => "mariadb",
