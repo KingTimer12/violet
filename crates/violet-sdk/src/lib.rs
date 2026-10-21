@@ -193,6 +193,13 @@ pub trait Session: 'static {
         let _ = (schema, statement);
         Err(DbError::unsupported("Counting is not supported"))
     }
+
+    /// Runs statements in `schema` as [`Session::execute`] does, leaving
+    /// the state the editor set (its database, an open transaction) alone.
+    fn run(&self, schema: &str, statements: &str, max_rows: usize) -> Result<Vec<ResultSet>> {
+        let _ = (schema, statements, max_rows);
+        Err(DbError::unsupported("Running in a schema is not supported"))
+    }
 }
 
 impl ProviderInfo {
@@ -494,6 +501,20 @@ macro_rules! export_provider {
                     $crate::__private::adapter::<<$provider as $crate::Provider>::Session>(&s),
                     &schema,
                     &statement,
+                )
+            }
+
+            fn run(
+                s: $crate::__private::SessionBorrow<'_>,
+                schema: ::std::string::String,
+                statements: ::std::string::String,
+                max_rows: u32,
+            ) -> ::std::result::Result<::std::vec::Vec<$crate::ResultSet>, $crate::DbError> {
+                $crate::Session::run(
+                    $crate::__private::adapter::<<$provider as $crate::Provider>::Session>(&s),
+                    &schema,
+                    &statements,
+                    max_rows as usize,
                 )
             }
         }

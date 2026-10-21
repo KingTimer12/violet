@@ -164,6 +164,24 @@ async fn transactions_queue_and_name_their_results() {
 
     run(&*session, "SELECT 3").await;
     assert_eq!(session.server_info().await.expect("info").database, "db3");
+
+    // The tree's changes run in their own database, not the editor's.
+    let sets = session
+        .run_in("db2", "MULTI
+SET b 1
+EXPIRE b 100
+EXEC
+TTL b", ExecLimits::default())
+        .await
+        .expect("run in db2");
+    assert_eq!(cells(sets.last().expect("ttl")), [[Some("100".to_owned())]]);
+    assert_eq!(session.server_info().await.expect("info").database, "db3");
+    let open = session
+        .run_in("db2", "MULTI
+SET c 1", ExecLimits::default())
+        .await
+        .expect_err("left open");
+    assert_eq!(open.kind, ErrorKind::Query);
     session.close().await;
 }
 

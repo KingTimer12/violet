@@ -606,6 +606,11 @@ interface data {
 
     /// The rows a statement returns; `none` when it cannot tell.
     count: func(s: borrow<session>, schema: string, statement: string) -> result<option<u64>, db-error>;
+
+    /// Runs statements in `schema`, as `execute` does, without touching
+    /// the state the editor gave the session: the tree's and data views'
+    /// changes, such as a key's new TTL.
+    run: func(s: borrow<session>, schema: string, statements: string, max-rows: u32) -> result<list<result-set>, db-error>;
 }
 
 world provider-world {

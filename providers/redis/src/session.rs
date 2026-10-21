@@ -380,6 +380,93 @@ fn ttl_text(pttl: i64) -> String {
     }
 }
 
+/// Runs a script on `client`, one command per line, sent together.
+/// `queued` carries an open `MULTI` from one call to the next.
+fn script(
+client: &mut Client,
+queued: &mut Option<Vec<Vec<String>>>,
+sql: &str,
+max_rows: usize,
+) -> Result<Vec<ResultSet>> {
+    let mut commands = Vec::new();
+    let mut starts = Vec::new();
+    for range in statements(sql) {
+        let line = &sql[range.clone()];
+        let position = sql[..range.start].chars().count() as u32 + 1;
+        let args = lang::argv(line).map_err(|message| {
+            let mut error = DbError::query(message);
+            error.position = Some(position);
+            error
+        })?;
+        if let Some(why) = refused(&strings(&args)) {
+            let mut error = DbError::unsupported(why);
+            error.position = Some(position);
+            return Err(error);
+        }
+        commands.push(args);
+        starts.push(position);
+    }
+    if commands.is_empty() {
+        return Ok(Vec::new());
+    }
+    let replies = client.pipeline(&commands, max_rows)?;
+    let mut sets = Vec::new();
+    let mut failure = None;
+    for ((args, (reply, truncated)), position) in commands.iter().zip(replies).zip(starts) {
+        let args = strings(args);
+        let name = args.first().map(|a| a.to_ascii_uppercase()).unwrap_or_default();
+        let ok = !matches!(reply, Reply::Error(_));
+        match name.as_str() {
+            "MULTI" if ok => *queued = Some(Vec::new()),
+            "DISCARD" if ok => *queued = None,
+            "SELECT" if ok => {
+                if let Some(db) = args.get(1).and_then(|n| n.parse().ok()) {
+                    client.db = db;
+                }
+            }
+            "EXEC" => {
+                let names = queued.take().unwrap_or_default();
+                if let Some(items) = reply.clone().into_array() {
+                    for (args, item) in names.iter().zip(items) {
+                        match item {
+                            Reply::Error(message) => {
+                                sets.push(ResultSet::command(format!("(error) {message}"), None));
+                            }
+                            item => sets.push(render::result_set(args, item, false, max_rows)?),
+                        }
+                    }
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        if let Some(list) = queued.as_mut()
+            && matches!(&reply, Reply::Status(s) if s == "QUEUED")
+        {
+            list.push(args);
+            continue;
+        }
+        if name == "MULTI" && ok {
+            continue;
+        }
+        match render::result_set(&args, reply, truncated, max_rows) {
+            Ok(set) => sets.push(set),
+            Err(mut error) => {
+                // The rest already ran; the first error is the answer,
+                // pointing at its line.
+                if failure.is_none() {
+                    error.position = Some(position);
+                    failure = Some(error);
+                }
+            }
+        }
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(sets),
+    }
+}
+
 impl Session for RedisSession {
     fn server_info(&self) -> Result<ServerInfo> {
         let user = self.params.username.trim();
@@ -443,85 +530,19 @@ impl Session for RedisSession {
     }
 
     fn execute(&self, sql: &str, max_rows: usize) -> Result<Vec<ResultSet>> {
-        let mut commands = Vec::new();
-        let mut starts = Vec::new();
-        for range in statements(sql) {
-            let line = &sql[range.clone()];
-            let position = sql[..range.start].chars().count() as u32 + 1;
-            let args = lang::argv(line).map_err(|message| {
-                let mut error = DbError::query(message);
-                error.position = Some(position);
-                error
-            })?;
-            if let Some(why) = refused(&strings(&args)) {
-                let mut error = DbError::unsupported(why);
-                error.position = Some(position);
-                return Err(error);
+        script(&mut self.main.borrow_mut(), &mut self.queued.borrow_mut(), sql, max_rows)
+    }
+
+    fn run(&self, schema: &str, statements: &str, max_rows: usize) -> Result<Vec<ResultSet>> {
+        self.browse(schema, |client| {
+            let mut queued = None;
+            let result = script(client, &mut queued, statements, max_rows);
+            if queued.is_some() {
+                let _ = client.call(&["DISCARD"]);
+                return Err(DbError::query("MULTI must end with EXEC or DISCARD in the same run"));
             }
-            commands.push(args);
-            starts.push(position);
-        }
-        if commands.is_empty() {
-            return Ok(Vec::new());
-        }
-        let replies = self.main.borrow_mut().pipeline(&commands, max_rows)?;
-        let mut sets = Vec::new();
-        let mut failure = None;
-        for ((args, (reply, truncated)), position) in commands.iter().zip(replies).zip(starts) {
-            let args = strings(args);
-            let name = args.first().map(|a| a.to_ascii_uppercase()).unwrap_or_default();
-            let ok = !matches!(reply, Reply::Error(_));
-            let mut queued = self.queued.borrow_mut();
-            match name.as_str() {
-                "MULTI" if ok => *queued = Some(Vec::new()),
-                "DISCARD" if ok => *queued = None,
-                "SELECT" if ok => {
-                    if let Some(db) = args.get(1).and_then(|n| n.parse().ok()) {
-                        self.main.borrow_mut().db = db;
-                    }
-                }
-                "EXEC" => {
-                    let names = queued.take().unwrap_or_default();
-                    if let Some(items) = reply.clone().into_array() {
-                        for (args, item) in names.iter().zip(items) {
-                            match item {
-                                Reply::Error(message) => {
-                                    sets.push(ResultSet::command(format!("(error) {message}"), None));
-                                }
-                                item => sets.push(render::result_set(args, item, false, max_rows)?),
-                            }
-                        }
-                        continue;
-                    }
-                }
-                _ => {}
-            }
-            if let Some(list) = queued.as_mut()
-                && matches!(&reply, Reply::Status(s) if s == "QUEUED")
-            {
-                list.push(args);
-                continue;
-            }
-            if name == "MULTI" && ok {
-                continue;
-            }
-            drop(queued);
-            match render::result_set(&args, reply, truncated, max_rows) {
-                Ok(set) => sets.push(set),
-                Err(mut error) => {
-                    // The rest already ran; the first error is the answer,
-                    // pointing at its line.
-                    if failure.is_none() {
-                        error.position = Some(position);
-                        failure = Some(error);
-                    }
-                }
-            }
-        }
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(sets),
-        }
+            result
+        })
     }
 
     fn entries(

@@ -186,6 +186,13 @@ pub trait Session: Send + Sync + 'static {
         Err(crate::DbError::unsupported("Counting is not supported"))
     }
 
+    /// Runs statements in `schema` as [`Session::execute`] does, leaving
+    /// the state the editor set alone. Only drivers that are not SQL do.
+    async fn run_in(&self, schema: &str, statements: &str, limits: ExecLimits) -> Result<Vec<ResultSet>> {
+        let _ = (schema, statements, limits);
+        Err(crate::DbError::unsupported("Running in a schema is not supported"))
+    }
+
     async fn close(&self);
 }
 

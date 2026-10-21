@@ -446,6 +446,29 @@ impl Session for WasmSession {
         Ok(converted)
     }
 
+    async fn run_in(&self, schema: &str, statements: &str, limits: ExecLimits) -> Result<Vec<ResultSet>> {
+        let max_rows = u32::try_from(limits.max_rows).unwrap_or(u32::MAX);
+        let sets = self
+            .with("WasmSession::run_in", async |store, world, session| {
+                let Some(data) = world.data() else {
+                    return Ok(Err(unsupported()));
+                };
+                data.call_run(store, session, schema, statements, max_rows)
+                    .await
+            })
+            .await?;
+        let mut converted = Vec::with_capacity(sets.len());
+        for set in sets {
+            let mut set = convert::result_set(set)?;
+            if set.rows.len() > limits.max_rows {
+                set.rows.truncate(limits.max_rows);
+                set.truncated = true;
+            }
+            converted.push(set);
+        }
+        Ok(converted)
+    }
+
     async fn count(&self, schema: &str, statement: &str) -> Result<Option<u64>> {
         self.with("WasmSession::count", async |store, world, session| {
             let Some(data) = world.data() else {
