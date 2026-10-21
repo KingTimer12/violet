@@ -216,7 +216,10 @@ pub fn rows(shape: Shape, reply: Reply, max_rows: usize) -> Result<(Vec<ColumnMe
                 let index = (first + at as u64).to_string();
                 rows.push([Some(index.as_str()), cell(item).as_deref()])?;
             }
-            (vec![number_column("#", "index"), text_column("value")], rows)
+            (
+                vec![number_column("#", "index"), text_column("value")],
+                rows,
+            )
         }
         Shape::Items(name) => {
             let mut rows = RowsBuilder::new(1, max_rows);
@@ -266,7 +269,12 @@ pub fn rows(shape: Shape, reply: Reply, max_rows: usize) -> Result<(Vec<ColumnMe
 
 /// The grid for one command's reply. Errors become [`DbError`]s, with the
 /// error's first word (`WRONGTYPE`, `ERR`, `NOAUTH`...) as their code.
-pub fn result_set(args: &[String], reply: Reply, truncated: bool, max_rows: usize) -> Result<ResultSet> {
+pub fn result_set(
+    args: &[String],
+    reply: Reply,
+    truncated: bool,
+    max_rows: usize,
+) -> Result<ResultSet> {
     if let Reply::Error(message) = &reply {
         return Err(error(message));
     }
@@ -308,7 +316,11 @@ mod tests {
         let mut start = 0;
         for &end in &set.rows.ends {
             let at = (end & !(1 << 31)) as usize;
-            out.push(if end & (1 << 31) != 0 { "NULL".into() } else { set.rows.text[start..at].to_owned() });
+            out.push(if end & (1 << 31) != 0 {
+                "NULL".into()
+            } else {
+                set.rows.text[start..at].to_owned()
+            });
             start = at;
         }
         out
@@ -335,7 +347,10 @@ mod tests {
         let set = result_set(&args("XRANGE s - +"), entry, false, 10).expect("set");
         assert_eq!(cells(&set), ["1-0", r#"{"k": "v"}"#]);
 
-        let scan = Reply::Array(Some(vec![bulk("0"), Reply::Array(Some(vec![bulk("m"), bulk("2")]))]));
+        let scan = Reply::Array(Some(vec![
+            bulk("0"),
+            Reply::Array(Some(vec![bulk("m"), bulk("2")])),
+        ]));
         let set = result_set(&args("ZSCAN z 0"), scan, false, 10).expect("set");
         assert_eq!(cells(&set), ["m", "2"]);
 
@@ -349,8 +364,13 @@ mod tests {
 
     #[test]
     fn errors_carry_their_code() {
-        let error = result_set(&args("GET h"), Reply::Error("WRONGTYPE Operation".into()), false, 1)
-            .expect_err("error");
+        let error = result_set(
+            &args("GET h"),
+            Reply::Error("WRONGTYPE Operation".into()),
+            false,
+            1,
+        )
+        .expect_err("error");
         assert_eq!(error.code.as_deref(), Some("WRONGTYPE"));
     }
 }

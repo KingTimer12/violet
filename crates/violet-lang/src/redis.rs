@@ -763,6 +763,59 @@ pub fn display(bytes: &[u8]) -> String {
     }
 }
 
+/// The bytes a cell's text stands for: the inverse of [`display`]. Text
+/// that only reads as binary once its `\xHH`, `\\` and `\"` escapes are
+/// undone (not UTF-8 any more) is that binary; any other text is itself,
+/// backslashes included. (A UTF-8 value spelling out an invalid escape,
+/// such as the four characters `\xff`, reads as binary: the one case
+/// that does not round-trip.)
+#[must_use]
+pub fn raw(text: &str) -> Vec<u8> {
+    if !text.contains('\\') {
+        return text.as_bytes().to_vec();
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if bytes[at] == b'\\' {
+            match bytes.get(at + 1) {
+                Some(b'\\' | b'"') => {
+                    out.push(bytes[at + 1]);
+                    at += 2;
+                    continue;
+                }
+                Some(b'x') => {
+                    if let (Some(h), Some(l)) = (
+                        bytes.get(at + 2).copied().and_then(hex),
+                        bytes.get(at + 3).copied().and_then(hex),
+                    ) {
+                        out.push((h * 16 + l) as u8);
+                        at += 4;
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.push(bytes[at]);
+        at += 1;
+    }
+    if std::str::from_utf8(&out).is_ok() {
+        text.as_bytes().to_vec()
+    } else {
+        out
+    }
+}
+
+/// A cell's or a key's shown text as one argument, for the exact bytes it
+/// stands for.
+#[must_use]
+pub fn argument(text: &str) -> String {
+    quote(&raw(text))
+}
+
 /// The words of a command as text, for deciding what it does.
 fn words(statement: &str) -> Vec<String> {
     argv(statement)
@@ -931,7 +984,7 @@ pub fn subtype(type_reply: &str) -> String {
 /// a glob on fields or members, for the types that scan.
 #[must_use]
 pub fn browse(subtype: Option<&str>, key: &str, filter: Option<&str>) -> String {
-    let key = quote(key.as_bytes());
+    let key = argument(key);
     let filter = filter.map(str::trim).filter(|f| !f.is_empty());
     let matching = |scan: &str| match filter {
         Some(filter) => format!("{scan} {key} 0 MATCH {}", quote(filter.as_bytes())),
@@ -953,7 +1006,8 @@ pub fn browse(subtype: Option<&str>, key: &str, filter: Option<&str>) -> String 
         Some("set") => format!("SMEMBERS {key}"),
         Some("zset") => format!("ZRANGE {key} 0 -1 WITHSCORES"),
         Some("stream") => format!("XRANGE {key} - +"),
-        Some("json") => format!("JSON.GET {key} $"),
+        // The root as it is; `$` would wrap it in an array of matches.
+        Some("json") => format!("JSON.GET {key}"),
         _ => format!("TYPE {key}"),
     }
 }
@@ -999,17 +1053,10 @@ pub struct CellChange<'a> {
 ///
 /// A type or column that cannot be written back.
 pub fn edit(subtype: &str, key: &str, changes: &[CellChange<'_>]) -> Result<String, String> {
-    let key = quote(key.as_bytes());
+    let key = argument(key);
     let mut lines = Vec::new();
     // Values are typed as they show, escapes included for binary ones.
-    let arg = |text: &str| {
-        quote(
-            &argv(&format!("\"{}\"", text.replace('"', "\\\"")))
-                .ok()
-                .and_then(|mut words| words.pop())
-                .unwrap_or_else(|| text.as_bytes().to_vec()),
-        )
-    };
+    let arg = argument;
     for change in changes {
         let cell = |at: usize| change.row.get(at).copied().flatten().unwrap_or_default();
         let value = arg(change.value);
@@ -1051,12 +1098,12 @@ pub fn edit(subtype: &str, key: &str, changes: &[CellChange<'_>]) -> Result<Stri
 
 /// Commands for the tree's actions on a key.
 pub mod actions {
-    use super::quote;
+    use super::argument;
 
     /// `seconds` to live, or none to keep it for ever.
     #[must_use]
     pub fn expire(key: &str, seconds: Option<u64>) -> String {
-        let key = quote(key.as_bytes());
+        let key = argument(key);
         match seconds {
             Some(seconds) => format!("EXPIRE {key} {seconds}"),
             None => format!("PERSIST {key}"),
@@ -1066,16 +1113,12 @@ pub mod actions {
     /// Refuses when `to` exists.
     #[must_use]
     pub fn rename(key: &str, to: &str) -> String {
-        format!(
-            "RENAMENX {} {}",
-            quote(key.as_bytes()),
-            quote(to.as_bytes())
-        )
+        format!("RENAMENX {} {}", argument(key), argument(to))
     }
 
     #[must_use]
     pub fn delete(keys: &[&str]) -> String {
-        let keys: Vec<String> = keys.iter().map(|key| quote(key.as_bytes())).collect();
+        let keys: Vec<String> = keys.iter().map(|key| argument(key)).collect();
         format!("UNLINK {}", keys.join(" "))
     }
 
@@ -1091,21 +1134,6 @@ pub mod actions {
 pub fn database_index(name: &str) -> Option<u32> {
     let name = name.trim();
     name.strip_prefix("db").unwrap_or(name).parse().ok()
-}
-
-/// A glob matching `prefix` and anything after it, with the glob's own
-/// characters in `prefix` escaped.
-#[must_use]
-pub fn prefix_glob(prefix: &str) -> String {
-    let mut glob = String::with_capacity(prefix.len() + 1);
-    for ch in prefix.chars() {
-        if matches!(ch, '*' | '?' | '[' | ']' | '\\') {
-            glob.push('\\');
-        }
-        glob.push(ch);
-    }
-    glob.push('*');
-    glob
 }
 
 #[cfg(test)]
@@ -1255,6 +1283,34 @@ mod tests {
         );
         assert!(edit("stream", "s", &[change(vec![Some("1-0"), None], 1, "x")]).is_err());
         assert_eq!(actions::select("db3").as_deref(), Some("SELECT 3"));
-        assert_eq!(prefix_glob("a*b"), "a\\*b*");
+    }
+
+    #[test]
+    fn shown_text_goes_back_as_the_same_bytes() {
+        for bytes in [
+            &b"plain"[..],
+            b"tab\\tliteral",
+            b"C:\\x41",
+            b"\xff\x00bin\"q\\",
+            "ação".as_bytes(),
+        ] {
+            assert_eq!(raw(&display(bytes)), bytes, "{:?}", display(bytes));
+            let arg = argument(&display(bytes));
+            assert_eq!(argv(&arg).expect("argv"), vec![bytes.to_vec()], "{arg}");
+        }
+        assert_eq!(browse(Some("json"), "j", None), "JSON.GET j");
+        assert_eq!(
+            edit(
+                "hash",
+                "h",
+                &[CellChange {
+                    row: vec![Some("a\\tb"), Some("x")],
+                    column: 1,
+                    value: "y"
+                }]
+            )
+            .expect("edit"),
+            "HSET h \"a\\\\tb\" y"
+        );
     }
 }

@@ -279,7 +279,10 @@ pub mod tests {
     fn replies_parse_one_byte_at_a_time() {
         assert_eq!(parse(b"+OK\r\n", 10).0, Reply::Status("OK".into()));
         assert_eq!(parse(b":-3\r\n", 10).0, Reply::Integer(-3));
-        assert_eq!(parse(b"$3\r\na\r\n\r\n", 10).0, Reply::Bulk(Some(b"a\r\n".to_vec())));
+        assert_eq!(
+            parse(b"$3\r\na\r\n\r\n", 10).0,
+            Reply::Bulk(Some(b"a\r\n".to_vec()))
+        );
         assert_eq!(parse(b"$-1\r\n", 10).0, Reply::Bulk(None));
         assert_eq!(
             parse(b"*2\r\n$1\r\na\r\n*1\r\n:1\r\n", 10).0,
@@ -290,7 +293,10 @@ pub mod tests {
         );
         assert_eq!(
             parse(b"%1\r\n+k\r\n,1.5\r\n", 10).0,
-            Reply::Map(vec![(Reply::Status("k".into()), Reply::Double("1.5".into()))])
+            Reply::Map(vec![(
+                Reply::Status("k".into()),
+                Reply::Double("1.5".into())
+            )])
         );
         // A push before the answer is not the answer.
         assert_eq!(parse(b">1\r\n+x\r\n:7\r\n", 10).0, Reply::Integer(7));
@@ -300,7 +306,10 @@ pub mod tests {
     fn long_arrays_and_values_are_cut() {
         let (reply, truncated) = parse(b"*3\r\n:1\r\n:2\r\n:3\r\n", 2);
         assert!(truncated);
-        assert_eq!(reply, Reply::Array(Some(vec![Reply::Integer(1), Reply::Integer(2)])));
+        assert_eq!(
+            reply,
+            Reply::Array(Some(vec![Reply::Integer(1), Reply::Integer(2)]))
+        );
         let big = MAX_BULK + 1;
         let mut data = format!("${big}\r\n").into_bytes();
         data.extend(std::iter::repeat_n(b'x', big));
@@ -311,7 +320,10 @@ pub mod tests {
             step: 1 << 20,
         };
         assert_eq!(read(&mut source, 1).expect("big").0, Reply::Skipped(big));
-        assert_eq!(read(&mut source, 1).expect("next").0, Reply::Status("next".into()));
+        assert_eq!(
+            read(&mut source, 1).expect("next").0,
+            Reply::Status("next".into())
+        );
     }
 
     #[test]

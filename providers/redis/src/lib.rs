@@ -23,7 +23,8 @@ impl Provider for Redis {
 
     fn info() -> ProviderInfo {
         ProviderInfo {
-            description: "Redis 6 and later, Valkey, KeyDB, Dragonfly and compatible servers".into(),
+            description: "Redis 6 and later, Valkey, KeyDB, Dragonfly and compatible servers"
+                .into(),
             default_database: "db0".into(),
             capabilities: Capabilities {
                 databases: false,

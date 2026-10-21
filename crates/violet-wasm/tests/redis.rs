@@ -356,3 +356,49 @@ async fn a_wrong_password_is_an_authentication_error() {
         .expect("refused");
     assert_eq!(error.kind, ErrorKind::Authentication);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn backups_run_the_cli_with_the_profiles_connection() {
+    let Some(wasm) = provider_wasm() else { return };
+    let runtime = Runtime::new(None).expect("runtime");
+    let info = runtime.inspect(wasm.clone()).await.expect("inspect").info;
+    let driver = WasmDriver::new(runtime, info, Box::new(move || Ok(wasm.clone())));
+    let tasks = driver.tasks().await.expect("tasks");
+    let backup = &tasks[0];
+    let mut profile = ConnectionProfile::new(DriverId::new("redis"), 6380);
+    profile.host = "cache.local".into();
+    profile.username = "app".into();
+    profile.ssl = violet_core::SslMode::Disable;
+    let path = std::env::temp_dir()
+        .join("dump.rdb")
+        .to_string_lossy()
+        .into_owned();
+    for client in ["valkey-cli", "redis-cli"] {
+        let mut settings = violet_core::TaskSettings::new();
+        settings.insert("client".into(), client.into());
+        let request = violet_core::TaskRequest {
+            kind: violet_core::TaskKind::Backup,
+            settings,
+            objects: Vec::new(),
+            path: path.clone(),
+        };
+        let command = backup.build(&profile, &request).expect("command");
+        assert_eq!(command.program, client);
+        assert_eq!(
+            command.args,
+            [
+                "-h",
+                "cache.local",
+                "-p",
+                "6380",
+                "--user",
+                "app",
+                "--rdb",
+                path.as_str()
+            ]
+        );
+        assert_eq!(command.password_env.as_deref(), Some("REDISCLI_AUTH"));
+    }
+    let downloads = driver.downloads().await.expect("downloads");
+    assert!(downloads.iter().all(|d| d.extract == ["bin/valkey-cli"]));
+}

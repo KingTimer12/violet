@@ -75,7 +75,11 @@ impl Client {
 
     /// Sends commands together and reads their replies, keeping `keep`
     /// elements of each.
-    pub fn pipeline(&mut self, commands: &[Vec<Vec<u8>>], keep: usize) -> Result<Vec<(Reply, bool)>> {
+    pub fn pipeline(
+        &mut self,
+        commands: &[Vec<Vec<u8>>],
+        keep: usize,
+    ) -> Result<Vec<(Reply, bool)>> {
         let mut out = Vec::new();
         for command in commands {
             resp::encode(command, &mut out);
@@ -102,7 +106,9 @@ impl Client {
 }
 
 fn is_auth_error(message: &str) -> bool {
-    message.starts_with("NOAUTH") || message.starts_with("WRONGPASS") || message.contains("invalid password")
+    message.starts_with("NOAUTH")
+        || message.starts_with("WRONGPASS")
+        || message.contains("invalid password")
 }
 
 fn schema_db(schema: &str) -> Result<u32> {
@@ -242,7 +248,10 @@ impl RedisSession {
         };
         let result = client.select(db).and_then(|()| work(client));
         // A broken connection is opened again next time.
-        if result.as_ref().is_err_and(|error| error.kind == ErrorKind::Connection) {
+        if result
+            .as_ref()
+            .is_err_and(|error| error.kind == ErrorKind::Connection)
+        {
             *catalog = None;
         }
         result
@@ -253,13 +262,19 @@ impl RedisSession {
         while scan.buffer.len() < count && !scan.done {
             let mut command = scan.command.clone();
             command.insert(scan.cursor_at, scan.cursor.clone());
-            command.extend([b"COUNT".to_vec(), SCAN_COUNT.max(count).to_string().into_bytes()]);
+            command.extend([
+                b"COUNT".to_vec(),
+                SCAN_COUNT.max(count).to_string().into_bytes(),
+            ]);
             let reply = client.call(&command)?;
             if let Reply::Error(message) = reply {
                 return Err(render::error(&message));
             }
             let mut parts = reply.into_array().unwrap_or_default().into_iter();
-            let cursor = parts.next().and_then(|c| c.text()).unwrap_or_else(|| "0".into());
+            let cursor = parts
+                .next()
+                .and_then(|c| c.text())
+                .unwrap_or_else(|| "0".into());
             let items = parts.next().and_then(Reply::into_array).unwrap_or_default();
             let mut items = items.into_iter();
             loop {
@@ -310,7 +325,9 @@ impl RedisSession {
             let mut scan = fresh();
             // Walk up to the page asked for.
             while scan.position < offset {
-                let want = usize::try_from(offset - scan.position).unwrap_or(usize::MAX).min(10_000);
+                let want = usize::try_from(offset - scan.position)
+                    .unwrap_or(usize::MAX)
+                    .min(10_000);
                 Self::pull(client, &mut scan, want)?;
                 let drop = want.min(scan.buffer.len());
                 if drop == 0 {
@@ -325,7 +342,13 @@ impl RedisSession {
             return Err(DbError::protocol("No scan"));
         };
         Self::pull(client, scan, limit + 1)?;
-        let items: Vec<Reply> = scan.buffer.iter().take(limit + 1).flatten().cloned().collect();
+        let items: Vec<Reply> = scan
+            .buffer
+            .iter()
+            .take(limit + 1)
+            .flatten()
+            .cloned()
+            .collect();
         let handed = limit.min(scan.buffer.len());
         scan.buffer.drain(..handed);
         scan.position += handed as u64;
@@ -342,7 +365,10 @@ fn product(info: &str) -> String {
             .map(str::trim)
     };
     if let Some(version) = field("dragonfly_version") {
-        return format!("Dragonfly {}", version.trim_start_matches(['d', 'f', '-', 'v']));
+        return format!(
+            "Dragonfly {}",
+            version.trim_start_matches(['d', 'f', '-', 'v'])
+        );
     }
     if let Some(version) = field("valkey_version") {
         return format!("Valkey {version}");
@@ -383,10 +409,10 @@ fn ttl_text(pttl: i64) -> String {
 /// Runs a script on `client`, one command per line, sent together.
 /// `queued` carries an open `MULTI` from one call to the next.
 fn script(
-client: &mut Client,
-queued: &mut Option<Vec<Vec<String>>>,
-sql: &str,
-max_rows: usize,
+    client: &mut Client,
+    queued: &mut Option<Vec<Vec<String>>>,
+    sql: &str,
+    max_rows: usize,
 ) -> Result<Vec<ResultSet>> {
     let mut commands = Vec::new();
     let mut starts = Vec::new();
@@ -414,7 +440,10 @@ max_rows: usize,
     let mut failure = None;
     for ((args, (reply, truncated)), position) in commands.iter().zip(replies).zip(starts) {
         let args = strings(args);
-        let name = args.first().map(|a| a.to_ascii_uppercase()).unwrap_or_default();
+        let name = args
+            .first()
+            .map(|a| a.to_ascii_uppercase())
+            .unwrap_or_default();
         let ok = !matches!(reply, Reply::Error(_));
         match name.as_str() {
             "MULTI" if ok => *queued = Some(Vec::new()),
@@ -473,7 +502,11 @@ impl Session for RedisSession {
         Ok(ServerInfo {
             version: self.version.clone(),
             database: format!("db{}", self.main.borrow().db),
-            user: if user.is_empty() { "default".into() } else { user.into() },
+            user: if user.is_empty() {
+                "default".into()
+            } else {
+                user.into()
+            },
         })
     }
 
@@ -492,10 +525,19 @@ impl Session for RedisSession {
                 // Managed servers often refuse CONFIG: the databases with
                 // keys, and the session's own.
                 None => {
-                    let keyspace = client.call(&["INFO", "keyspace"])?.text().unwrap_or_default();
+                    let keyspace = client
+                        .call(&["INFO", "keyspace"])?
+                        .text()
+                        .unwrap_or_default();
                     keyspace
                         .lines()
-                        .filter_map(|line| line.strip_prefix("db")?.split(':').next()?.parse::<u32>().ok())
+                        .filter_map(|line| {
+                            line.strip_prefix("db")?
+                                .split(':')
+                                .next()?
+                                .parse::<u32>()
+                                .ok()
+                        })
                         .max()
                         .map_or(1, |max| max + 1)
                 }
@@ -512,7 +554,10 @@ impl Session for RedisSession {
 
     fn columns(&self, schema: &str, key: &str) -> Result<Vec<ColumnInfo>> {
         self.browse(schema, |client| {
-            let subtype = client.call(&["TYPE", key])?.text().unwrap_or_default();
+            let subtype = client
+                .call(&[b"TYPE".as_slice(), &lang::raw(key)])?
+                .text()
+                .unwrap_or_default();
             let subtype = lang::subtype(&subtype);
             Ok(lang::columns(&subtype)
                 .iter()
@@ -530,7 +575,12 @@ impl Session for RedisSession {
     }
 
     fn execute(&self, sql: &str, max_rows: usize) -> Result<Vec<ResultSet>> {
-        script(&mut self.main.borrow_mut(), &mut self.queued.borrow_mut(), sql, max_rows)
+        script(
+            &mut self.main.borrow_mut(),
+            &mut self.queued.borrow_mut(),
+            sql,
+            max_rows,
+        )
     }
 
     fn run(&self, schema: &str, statements: &str, max_rows: usize) -> Result<Vec<ResultSet>> {
@@ -539,7 +589,9 @@ impl Session for RedisSession {
             let result = script(client, &mut queued, statements, max_rows);
             if queued.is_some() {
                 let _ = client.call(&["DISCARD"]);
-                return Err(DbError::query("MULTI must end with EXEC or DISCARD in the same run"));
+                return Err(DbError::query(
+                    "MULTI must end with EXEC or DISCARD in the same run",
+                ));
             }
             result
         })
@@ -552,7 +604,10 @@ impl Session for RedisSession {
         cursor: Option<&str>,
         limit: usize,
     ) -> Result<EntryPage> {
-        let pattern = pattern.map(str::trim).filter(|p| !p.is_empty()).unwrap_or("*");
+        let pattern = pattern
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .unwrap_or("*");
         let limit = limit.max(1);
         self.browse(schema, |client| {
             let mut cursor = cursor.unwrap_or("0").to_owned();
@@ -560,13 +615,25 @@ impl Session for RedisSession {
             for _ in 0..SCAN_ROUNDS {
                 // A batch cannot be split (the cursor resumes after all of
                 // it), so ask for about what is still missing.
-                let count = (limit - names.len().min(limit)).clamp(10, SCAN_COUNT).to_string();
-                let reply = client.call(&["SCAN", cursor.as_str(), "MATCH", pattern, "COUNT", count.as_str()])?;
+                let count = (limit - names.len().min(limit))
+                    .clamp(10, SCAN_COUNT)
+                    .to_string();
+                let reply = client.call(&[
+                    "SCAN",
+                    cursor.as_str(),
+                    "MATCH",
+                    pattern,
+                    "COUNT",
+                    count.as_str(),
+                ])?;
                 if let Reply::Error(message) = reply {
                     return Err(render::error(&message));
                 }
                 let mut parts = reply.into_array().unwrap_or_default().into_iter();
-                cursor = parts.next().and_then(|c| c.text()).unwrap_or_else(|| "0".into());
+                cursor = parts
+                    .next()
+                    .and_then(|c| c.text())
+                    .unwrap_or_else(|| "0".into());
                 for item in parts.next().and_then(Reply::into_array).unwrap_or_default() {
                     if let Reply::Bulk(Some(name)) = item
                         && !names.contains(&name)
@@ -625,7 +692,13 @@ impl Session for RedisSession {
         })
     }
 
-    fn page(&self, schema: &str, statement: &str, offset: u64, limit: usize) -> Result<Vec<ResultSet>> {
+    fn page(
+        &self,
+        schema: &str,
+        statement: &str,
+        offset: u64,
+        limit: usize,
+    ) -> Result<Vec<ResultSet>> {
         let args = lang::argv(statement.trim()).map_err(DbError::query)?;
         let text = strings(&args);
         let upper: Vec<String> = text.iter().map(|a| a.to_ascii_uppercase()).collect();
@@ -633,7 +706,8 @@ impl Session for RedisSession {
             return Err(DbError::unsupported(why));
         }
         let key = args.get(1).cloned().unwrap_or_default();
-        let whole = upper.get(2).is_some_and(|w| w == "0") && upper.get(3).is_some_and(|w| w == "-1");
+        let whole =
+            upper.get(2).is_some_and(|w| w == "0") && upper.get(3).is_some_and(|w| w == "-1");
         let end = (offset + limit as u64).to_string();
         let start = offset.to_string();
         self.browse(schema, |client| {
@@ -671,7 +745,9 @@ impl Session for RedisSession {
                 _ => None,
             };
             if let Some(walk) = walk {
-                return Ok(vec![self.scanned(client, schema, statement, walk, offset, limit)?]);
+                return Ok(vec![
+                    self.scanned(client, schema, statement, walk, offset, limit)?,
+                ]);
             }
             let ranged: Option<Vec<Vec<u8>>> = match upper.first().map(String::as_str) {
                 Some("LRANGE") if whole => Some(vec![
@@ -694,11 +770,20 @@ impl Session for RedisSession {
             };
             if let Some(command) = ranged {
                 let reply = client.call(&command)?;
-                return Ok(vec![render::result_set(&strings(&command), reply, false, limit + 1)?]);
+                return Ok(vec![render::result_set(
+                    &strings(&command),
+                    reply,
+                    false,
+                    limit + 1,
+                )?]);
             }
             // Anything else runs whole; the page is cut from its rows.
-            let keep = usize::try_from(offset).unwrap_or(usize::MAX).saturating_add(limit + 1);
-            let command = if upper.first().is_some_and(|w| w == "XRANGE" || w == "XREVRANGE")
+            let keep = usize::try_from(offset)
+                .unwrap_or(usize::MAX)
+                .saturating_add(limit + 1);
+            let command = if upper
+                .first()
+                .is_some_and(|w| w == "XRANGE" || w == "XREVRANGE")
                 && !upper.iter().any(|w| w == "COUNT")
             {
                 let mut command = args.clone();
@@ -707,10 +792,16 @@ impl Session for RedisSession {
             } else {
                 args.clone()
             };
-            let (reply, truncated) = client.pipeline(std::slice::from_ref(&command), keep)?.remove(0);
+            let (reply, truncated) = client
+                .pipeline(std::slice::from_ref(&command), keep)?
+                .remove(0);
             let mut set = render::result_set(&text, reply, truncated, keep)?;
             let width = set.columns.len();
-            set.rows = skip_rows(set.rows, width, usize::try_from(offset).unwrap_or(usize::MAX));
+            set.rows = skip_rows(
+                set.rows,
+                width,
+                usize::try_from(offset).unwrap_or(usize::MAX),
+            );
             set.affected = Some((set.rows.ends.len() / width.max(1)) as u64);
             Ok(vec![set])
         })
@@ -718,11 +809,15 @@ impl Session for RedisSession {
 
     fn count(&self, schema: &str, statement: &str) -> Result<Option<u64>> {
         let args = lang::argv(statement.trim()).map_err(DbError::query)?;
-        let upper: Vec<String> = strings(&args).iter().map(|a| a.to_ascii_uppercase()).collect();
+        let upper: Vec<String> = strings(&args)
+            .iter()
+            .map(|a| a.to_ascii_uppercase())
+            .collect();
         let Some(key) = args.get(1) else {
             return Ok(None);
         };
-        let whole = upper.get(2).is_some_and(|w| w == "0") && upper.get(3).is_some_and(|w| w == "-1");
+        let whole =
+            upper.get(2).is_some_and(|w| w == "0") && upper.get(3).is_some_and(|w| w == "-1");
         let filtered = upper.iter().any(|w| w == "MATCH");
         let length = match upper[0].as_str() {
             "HGETALL" => "HLEN",
@@ -732,7 +827,11 @@ impl Session for RedisSession {
             "ZSCAN" if !filtered => "ZCARD",
             "LRANGE" if whole => "LLEN",
             "ZRANGE" if whole && upper.len() <= 5 => "ZCARD",
-            "XRANGE" | "XREVRANGE" if upper.len() == 4 && matches!(upper[2].as_str(), "-" | "+") => "XLEN",
+            "XRANGE" | "XREVRANGE"
+                if upper.len() == 4 && matches!(upper[2].as_str(), "-" | "+") =>
+            {
+                "XLEN"
+            }
             "GET" | "JSON.GET" | "TYPE" => return Ok(Some(1)),
             _ => return Ok(None),
         };
@@ -751,12 +850,18 @@ mod tests {
 
     #[test]
     fn products_are_told_apart() {
-        assert_eq!(product("# Server\r\nredis_version:7.4.1\r\n"), "Redis 7.4.1");
+        assert_eq!(
+            product("# Server\r\nredis_version:7.4.1\r\n"),
+            "Redis 7.4.1"
+        );
         assert_eq!(
             product("redis_version:7.2.4\r\nserver_name:valkey\r\nvalkey_version:8.0.2\r\n"),
             "Valkey 8.0.2"
         );
-        assert_eq!(product("redis_version:7.4.0\r\ndragonfly_version:df-v1.25.0\r\n"), "Dragonfly 1.25.0");
+        assert_eq!(
+            product("redis_version:7.4.0\r\ndragonfly_version:df-v1.25.0\r\n"),
+            "Dragonfly 1.25.0"
+        );
     }
 
     #[test]
