@@ -224,6 +224,7 @@ impl VioletApp {
             &key.ref_table,
             Some(&filter.join(" AND ")),
             None,
+            None,
         )
     }
 
@@ -312,6 +313,7 @@ pub fn show(ui: &mut Ui, reference: &mut Reference, actions: &mut Vec<Action>) {
                     connection: reference.connection,
                     schema: key.ref_schema.clone(),
                     relation: key.ref_table.clone(),
+                    subtype: None,
                 });
             }
         });

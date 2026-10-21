@@ -62,10 +62,31 @@ fastframe_icons::icons! {
         FolderOpen => "folder-open",
         Save => "save",
         ShieldAlert => "shield-alert",
+        Text => "type",
+        List => "list",
+        ListOrdered => "list-ordered",
+        Shapes => "shapes",
+        Activity => "activity",
+        Code => "code",
+        Link => "link",
     }
 }
 
 impl Icon {
+    /// A key-value store's key, by its type.
+    pub fn for_subtype(subtype: Option<&str>) -> Self {
+        match subtype {
+            Some("string") => Self::Text,
+            Some("hash") => Self::Function,
+            Some("list") => Self::List,
+            Some("set") => Self::Shapes,
+            Some("zset") => Self::ListOrdered,
+            Some("stream") => Self::Activity,
+            Some("json") => Self::Code,
+            _ => Self::Key,
+        }
+    }
+
     pub fn for_kind(kind: violet_core::ObjectKind) -> Self {
         use violet_core::ObjectKind;
         match kind {
@@ -75,6 +96,7 @@ impl Icon {
             ObjectKind::ForeignTable => Self::ForeignTable,
             ObjectKind::Function => Self::Function,
             ObjectKind::Sequence => Self::Sequence,
+            ObjectKind::Key => Self::Key,
         }
     }
 }

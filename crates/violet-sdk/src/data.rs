@@ -11,7 +11,7 @@
 //! [`Session::count`]: crate::Session::count
 
 pub use crate::bindings::exports::violet::provider::data::{
-    Entry, EntryPage, ProviderExtras, Language, Login,
+    Entry, EntryPage, Language, Login, ProviderExtras,
 };
 
 impl Default for ProviderExtras {

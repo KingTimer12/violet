@@ -3,8 +3,8 @@
 
 use violet_core::{
     Capabilities, ColumnInfo, ColumnMeta, ConnectionProfile, Credentials, DbError, DbObject,
-    DriverId, DriverInfo, EntryPage, ErrorKind, Language, Login, ObjectKind, Paging, ResultSet, Rows, ServerInfo, SqlDialect,
-    SslMode,
+    DriverId, DriverInfo, EntryPage, ErrorKind, Language, Login, ObjectKind, Paging, ResultSet,
+    Rows, ServerInfo, SqlDialect, SslMode,
 };
 
 use crate::bindings::exports::violet::provider::data as data_api;

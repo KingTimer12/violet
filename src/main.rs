@@ -9,6 +9,7 @@
 
 mod completion;
 mod export;
+mod lang;
 mod settings;
 mod sql;
 mod ui;

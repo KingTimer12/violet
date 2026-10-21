@@ -74,10 +74,18 @@ pub const COMMANDS: &[Command] = &[
     c("BGREWRITEAOF", "", A),
     c("BGSAVE", "[SCHEDULE]", A),
     c("BITCOUNT", "key [start end [BYTE | BIT]]", R),
-    c("BITFIELD", "key [GET encoding offset | SET encoding offset value | INCRBY encoding offset increment ...]", W),
+    c(
+        "BITFIELD",
+        "key [GET encoding offset | SET encoding offset value | INCRBY encoding offset increment ...]",
+        W,
+    ),
     c("BITOP", "AND | OR | XOR | NOT destkey key [key ...]", W),
     c("BITPOS", "key bit [start [end [BYTE | BIT]]]", R),
-    c("BLMOVE", "source destination LEFT | RIGHT LEFT | RIGHT timeout", W),
+    c(
+        "BLMOVE",
+        "source destination LEFT | RIGHT LEFT | RIGHT timeout",
+        W,
+    ),
     c("BLPOP", "key [key ...] timeout", W),
     c("BRPOP", "key [key ...] timeout", W),
     c("BZPOPMAX", "key [key ...] timeout", W),
@@ -85,8 +93,16 @@ pub const COMMANDS: &[Command] = &[
     c("CLIENT GETNAME", "", A),
     c("CLIENT ID", "", A),
     c("CLIENT INFO", "", A),
-    c("CLIENT KILL", "[ID client-id] [ADDR ip:port] [USER username] ...", A),
-    c("CLIENT LIST", "[TYPE NORMAL | MASTER | REPLICA | PUBSUB]", A),
+    c(
+        "CLIENT KILL",
+        "[ID client-id] [ADDR ip:port] [USER username] ...",
+        A,
+    ),
+    c(
+        "CLIENT LIST",
+        "[TYPE NORMAL | MASTER | REPLICA | PUBSUB]",
+        A,
+    ),
     c("CLIENT SETNAME", "connection-name", A),
     c("CLUSTER INFO", "", A),
     c("CLUSTER NODES", "", A),
@@ -97,7 +113,11 @@ pub const COMMANDS: &[Command] = &[
     c("CONFIG RESETSTAT", "", A),
     c("CONFIG REWRITE", "", A),
     c("CONFIG SET", "parameter value [parameter value ...]", A),
-    c("COPY", "source destination [DB destination-db] [REPLACE]", W),
+    c(
+        "COPY",
+        "source destination [DB destination-db] [REPLACE]",
+        W,
+    ),
     c("DBSIZE", "", R),
     c("DEBUG", "subcommand [argument ...]", A),
     c("DECR", "key", W),
@@ -108,33 +128,69 @@ pub const COMMANDS: &[Command] = &[
     c("ECHO", "message", R),
     c("EVAL", "script numkeys [key [key ...]] [arg [arg ...]]", W),
     c("EVALSHA", "sha1 numkeys [key [key ...]] [arg [arg ...]]", W),
-    c("EVAL_RO", "script numkeys [key [key ...]] [arg [arg ...]]", R),
+    c(
+        "EVAL_RO",
+        "script numkeys [key [key ...]] [arg [arg ...]]",
+        R,
+    ),
     c("EXEC", "", A),
     c("EXISTS", "key [key ...]", R),
     c("EXPIRE", "key seconds [NX | XX | GT | LT]", W),
     c("EXPIREAT", "key unix-time-seconds [NX | XX | GT | LT]", W),
     c("EXPIRETIME", "key", R),
-    c("FCALL", "function numkeys [key [key ...]] [arg [arg ...]]", W),
-    c("FCALL_RO", "function numkeys [key [key ...]] [arg [arg ...]]", R),
+    c(
+        "FCALL",
+        "function numkeys [key [key ...]] [arg [arg ...]]",
+        W,
+    ),
+    c(
+        "FCALL_RO",
+        "function numkeys [key [key ...]] [arg [arg ...]]",
+        R,
+    ),
     c("FLUSHALL", "[ASYNC | SYNC]", W),
     c("FLUSHDB", "[ASYNC | SYNC]", W),
     c("FUNCTION FLUSH", "[ASYNC | SYNC]", A),
-    c("FUNCTION LIST", "[LIBRARYNAME library-name-pattern] [WITHCODE]", A),
-    c("GEOADD", "key [NX | XX] [CH] longitude latitude member [longitude latitude member ...]", W),
+    c(
+        "FUNCTION LIST",
+        "[LIBRARYNAME library-name-pattern] [WITHCODE]",
+        A,
+    ),
+    c(
+        "GEOADD",
+        "key [NX | XX] [CH] longitude latitude member [longitude latitude member ...]",
+        W,
+    ),
     c("GEODIST", "key member1 member2 [M | KM | FT | MI]", R),
     c("GEOHASH", "key [member [member ...]]", R),
     c("GEOPOS", "key [member [member ...]]", R),
-    c("GEOSEARCH", "key FROMMEMBER member | FROMLONLAT longitude latitude BYRADIUS radius M | KM | FT | MI | BYBOX width height M | KM | FT | MI [ASC | DESC] [COUNT count [ANY]] [WITHCOORD] [WITHDIST] [WITHHASH]", R),
+    c(
+        "GEOSEARCH",
+        "key FROMMEMBER member | FROMLONLAT longitude latitude BYRADIUS radius M | KM | FT | MI | BYBOX width height M | KM | FT | MI [ASC | DESC] [COUNT count [ANY]] [WITHCOORD] [WITHDIST] [WITHHASH]",
+        R,
+    ),
     c("GET", "key", R),
     c("GETBIT", "key offset", R),
     c("GETDEL", "key", W),
-    c("GETEX", "key [EX seconds | PX milliseconds | EXAT unix-time-seconds | PXAT unix-time-milliseconds | PERSIST]", W),
+    c(
+        "GETEX",
+        "key [EX seconds | PX milliseconds | EXAT unix-time-seconds | PXAT unix-time-milliseconds | PERSIST]",
+        W,
+    ),
     c("GETRANGE", "key start end", R),
     c("GETSET", "key value", W),
     c("HDEL", "key field [field ...]", W),
-    c("HELLO", "[protover [AUTH username password] [SETNAME clientname]]", A),
+    c(
+        "HELLO",
+        "[protover [AUTH username password] [SETNAME clientname]]",
+        A,
+    ),
     c("HEXISTS", "key field", R),
-    c("HEXPIRE", "key seconds [NX | XX | GT | LT] FIELDS numfields field [field ...]", W),
+    c(
+        "HEXPIRE",
+        "key seconds [NX | XX | GT | LT] FIELDS numfields field [field ...]",
+        W,
+    ),
     c("HGET", "key field", R),
     c("HGETALL", "key", R),
     c("HINCRBY", "key field increment", W),
@@ -144,7 +200,11 @@ pub const COMMANDS: &[Command] = &[
     c("HMGET", "key field [field ...]", R),
     c("HMSET", "key field value [field value ...]", W),
     c("HRANDFIELD", "key [count [WITHVALUES]]", R),
-    c("HSCAN", "key cursor [MATCH pattern] [COUNT count] [NOVALUES]", R),
+    c(
+        "HSCAN",
+        "key cursor [MATCH pattern] [COUNT count] [NOVALUES]",
+        R,
+    ),
     c("HSET", "key field value [field value ...]", W),
     c("HSETNX", "key field value", W),
     c("HSTRLEN", "key field", R),
@@ -157,7 +217,11 @@ pub const COMMANDS: &[Command] = &[
     c("JSON.ARRAPPEND", "key path value [value ...]", W),
     c("JSON.ARRLEN", "key [path]", R),
     c("JSON.DEL", "key [path]", W),
-    c("JSON.GET", "key [INDENT indent] [NEWLINE newline] [SPACE space] [path [path ...]]", R),
+    c(
+        "JSON.GET",
+        "key [INDENT indent] [NEWLINE newline] [SPACE space] [path [path ...]]",
+        R,
+    ),
     c("JSON.MGET", "key [key ...] path", R),
     c("JSON.NUMINCRBY", "key path value", W),
     c("JSON.OBJKEYS", "key [path]", R),
@@ -170,7 +234,11 @@ pub const COMMANDS: &[Command] = &[
     c("LLEN", "key", R),
     c("LMOVE", "source destination LEFT | RIGHT LEFT | RIGHT", W),
     c("LPOP", "key [count]", W),
-    c("LPOS", "key element [RANK rank] [COUNT num-matches] [MAXLEN len]", R),
+    c(
+        "LPOS",
+        "key element [RANK rank] [COUNT num-matches] [MAXLEN len]",
+        R,
+    ),
     c("LPUSH", "key element [element ...]", W),
     c("LPUSHX", "key element [element ...]", W),
     c("LRANGE", "key start stop", R),
@@ -179,7 +247,11 @@ pub const COMMANDS: &[Command] = &[
     c("LTRIM", "key start stop", W),
     c("MEMORY USAGE", "key [SAMPLES count]", R),
     c("MGET", "key [key ...]", R),
-    c("MIGRATE", "host port key | \"\" destination-db timeout [COPY] [REPLACE] [AUTH password | AUTH2 username password] [KEYS key [key ...]]", W),
+    c(
+        "MIGRATE",
+        "host port key | \"\" destination-db timeout [COPY] [REPLACE] [AUTH password | AUTH2 username password] [KEYS key [key ...]]",
+        W,
+    ),
     c("MONITOR", "", A),
     c("MOVE", "key db", W),
     c("MSET", "key value [key value ...]", W),
@@ -191,7 +263,11 @@ pub const COMMANDS: &[Command] = &[
     c("OBJECT REFCOUNT", "key", R),
     c("PERSIST", "key", W),
     c("PEXPIRE", "key milliseconds [NX | XX | GT | LT]", W),
-    c("PEXPIREAT", "key unix-time-milliseconds [NX | XX | GT | LT]", W),
+    c(
+        "PEXPIREAT",
+        "key unix-time-milliseconds [NX | XX | GT | LT]",
+        W,
+    ),
     c("PEXPIRETIME", "key", R),
     c("PFADD", "key [element [element ...]]", W),
     c("PFCOUNT", "key [key ...]", R),
@@ -205,21 +281,33 @@ pub const COMMANDS: &[Command] = &[
     c("RANDOMKEY", "", R),
     c("RENAME", "key newkey", W),
     c("RENAMENX", "key newkey", W),
-    c("RESTORE", "key ttl serialized-value [REPLACE] [ABSTTL] [IDLETIME seconds] [FREQ frequency]", W),
+    c(
+        "RESTORE",
+        "key ttl serialized-value [REPLACE] [ABSTTL] [IDLETIME seconds] [FREQ frequency]",
+        W,
+    ),
     c("ROLE", "", A),
     c("RPOP", "key [count]", W),
     c("RPUSH", "key element [element ...]", W),
     c("RPUSHX", "key element [element ...]", W),
     c("SADD", "key member [member ...]", W),
     c("SAVE", "", A),
-    c("SCAN", "cursor [MATCH pattern] [COUNT count] [TYPE type]", R),
+    c(
+        "SCAN",
+        "cursor [MATCH pattern] [COUNT count] [TYPE type]",
+        R,
+    ),
     c("SCARD", "key", R),
     c("SCRIPT FLUSH", "[ASYNC | SYNC]", A),
     c("SCRIPT LOAD", "script", A),
     c("SDIFF", "key [key ...]", R),
     c("SDIFFSTORE", "destination key [key ...]", W),
     c("SELECT", "index", A),
-    c("SET", "key value [NX | XX] [GET] [EX seconds | PX milliseconds | EXAT unix-time-seconds | PXAT unix-time-milliseconds | KEEPTTL]", W),
+    c(
+        "SET",
+        "key value [NX | XX] [GET] [EX seconds | PX milliseconds | EXAT unix-time-seconds | PXAT unix-time-milliseconds | KEEPTTL]",
+        W,
+    ),
     c("SETBIT", "key offset value", W),
     c("SETEX", "key seconds value", W),
     c("SETNX", "key value", W),
@@ -234,8 +322,16 @@ pub const COMMANDS: &[Command] = &[
     c("SMEMBERS", "key", R),
     c("SMISMEMBER", "key member [member ...]", R),
     c("SMOVE", "source destination member", W),
-    c("SORT", "key [BY pattern] [LIMIT offset count] [GET pattern [GET pattern ...]] [ASC | DESC] [ALPHA] [STORE destination]", W),
-    c("SORT_RO", "key [BY pattern] [LIMIT offset count] [GET pattern [GET pattern ...]] [ASC | DESC] [ALPHA]", R),
+    c(
+        "SORT",
+        "key [BY pattern] [LIMIT offset count] [GET pattern [GET pattern ...]] [ASC | DESC] [ALPHA] [STORE destination]",
+        W,
+    ),
+    c(
+        "SORT_RO",
+        "key [BY pattern] [LIMIT offset count] [GET pattern [GET pattern ...]] [ASC | DESC] [ALPHA]",
+        R,
+    ),
     c("SPOP", "key [count]", W),
     c("SRANDMEMBER", "key [count]", R),
     c("SREM", "key member [member ...]", W),
@@ -254,29 +350,61 @@ pub const COMMANDS: &[Command] = &[
     c("WAIT", "numreplicas timeout", A),
     c("WATCH", "key [key ...]", A),
     c("XACK", "key group id [id ...]", W),
-    c("XADD", "key [NOMKSTREAM] [MAXLEN | MINID [= | ~] threshold] * | id field value [field value ...]", W),
+    c(
+        "XADD",
+        "key [NOMKSTREAM] [MAXLEN | MINID [= | ~] threshold] * | id field value [field value ...]",
+        W,
+    ),
     c("XDEL", "key id [id ...]", W),
     c("XGROUP CREATE", "key group id | $ [MKSTREAM]", W),
     c("XINFO STREAM", "key [FULL [COUNT count]]", R),
     c("XLEN", "key", R),
     c("XRANGE", "key start end [COUNT count]", R),
-    c("XREAD", "[COUNT count] [BLOCK milliseconds] STREAMS key [key ...] id [id ...]", R),
-    c("XREADGROUP", "GROUP group consumer [COUNT count] [BLOCK milliseconds] [NOACK] STREAMS key [key ...] id [id ...]", W),
+    c(
+        "XREAD",
+        "[COUNT count] [BLOCK milliseconds] STREAMS key [key ...] id [id ...]",
+        R,
+    ),
+    c(
+        "XREADGROUP",
+        "GROUP group consumer [COUNT count] [BLOCK milliseconds] [NOACK] STREAMS key [key ...] id [id ...]",
+        W,
+    ),
     c("XREVRANGE", "key end start [COUNT count]", R),
-    c("XTRIM", "key MAXLEN | MINID [= | ~] threshold [LIMIT count]", W),
-    c("ZADD", "key [NX | XX] [GT | LT] [CH] [INCR] score member [score member ...]", W),
+    c(
+        "XTRIM",
+        "key MAXLEN | MINID [= | ~] threshold [LIMIT count]",
+        W,
+    ),
+    c(
+        "ZADD",
+        "key [NX | XX] [GT | LT] [CH] [INCR] score member [score member ...]",
+        W,
+    ),
     c("ZCARD", "key", R),
     c("ZCOUNT", "key min max", R),
     c("ZDIFF", "numkeys key [key ...] [WITHSCORES]", R),
     c("ZINCRBY", "key increment member", W),
-    c("ZINTER", "numkeys key [key ...] [WEIGHTS weight [weight ...]] [AGGREGATE SUM | MIN | MAX] [WITHSCORES]", R),
+    c(
+        "ZINTER",
+        "numkeys key [key ...] [WEIGHTS weight [weight ...]] [AGGREGATE SUM | MIN | MAX] [WITHSCORES]",
+        R,
+    ),
     c("ZLEXCOUNT", "key min max", R),
     c("ZMSCORE", "key member [member ...]", R),
     c("ZPOPMAX", "key [count]", W),
     c("ZPOPMIN", "key [count]", W),
     c("ZRANDMEMBER", "key [count [WITHSCORES]]", R),
-    c("ZRANGE", "key start stop [BYSCORE | BYLEX] [REV] [LIMIT offset count] [WITHSCORES]", R),
-    c("ZRANGEBYSCORE", "key min max [WITHSCORES] [LIMIT offset count]", R),
+    c(
+        "ZRANGE",
+        "key start stop [BYSCORE | BYLEX] [REV] [LIMIT offset count] [WITHSCORES]",
+        R,
+    ),
+    c(
+        "ZRANGEBYSCORE",
+        "key min max [WITHSCORES] [LIMIT offset count]",
+        R,
+    ),
     c("ZRANK", "key member [WITHSCORE]", R),
     c("ZREM", "key member [member ...]", W),
     c("ZREMRANGEBYSCORE", "key min max", W),
@@ -284,8 +412,16 @@ pub const COMMANDS: &[Command] = &[
     c("ZREVRANK", "key member [WITHSCORE]", R),
     c("ZSCAN", "key cursor [MATCH pattern] [COUNT count]", R),
     c("ZSCORE", "key member", R),
-    c("ZUNION", "numkeys key [key ...] [WEIGHTS weight [weight ...]] [AGGREGATE SUM | MIN | MAX] [WITHSCORES]", R),
-    c("ZUNIONSTORE", "destination numkeys key [key ...] [WEIGHTS weight [weight ...]] [AGGREGATE SUM | MIN | MAX]", W),
+    c(
+        "ZUNION",
+        "numkeys key [key ...] [WEIGHTS weight [weight ...]] [AGGREGATE SUM | MIN | MAX] [WITHSCORES]",
+        R,
+    ),
+    c(
+        "ZUNIONSTORE",
+        "destination numkeys key [key ...] [WEIGHTS weight [weight ...]] [AGGREGATE SUM | MIN | MAX]",
+        W,
+    ),
 ];
 
 /// Commands that take subcommands: their name alone is not a command.
@@ -682,7 +818,10 @@ pub fn dangers(source: &str) -> Vec<String> {
             ("SHUTDOWN", _) => "SHUTDOWN stops the server".to_owned(),
             ("DEBUG", _) => "DEBUG can crash or freeze the server".to_owned(),
             ("CONFIG", Some("SET" | "RESETSTAT" | "REWRITE")) => {
-                format!("CONFIG {} changes the server's configuration", second.unwrap_or_default())
+                format!(
+                    "CONFIG {} changes the server's configuration",
+                    second.unwrap_or_default()
+                )
             }
             ("SCRIPT" | "FUNCTION", Some("FLUSH")) => {
                 format!("{first} FLUSH deletes every stored script")
@@ -726,9 +865,8 @@ fn secret_words(words: &[String]) -> Vec<usize> {
             }
         }
         "ACL" if upper.get(1).is_some_and(|w| w == "SETUSER") => {
-            secret.extend((3..words.len()).filter(|&at| {
-                words[at].starts_with(['>', '<', '#', '!'])
-            }));
+            secret
+                .extend((3..words.len()).filter(|&at| words[at].starts_with(['>', '<', '#', '!'])));
         }
         _ => {}
     }
@@ -864,16 +1002,23 @@ pub fn edit(subtype: &str, key: &str, changes: &[CellChange<'_>]) -> Result<Stri
     let key = quote(key.as_bytes());
     let mut lines = Vec::new();
     // Values are typed as they show, escapes included for binary ones.
-    let arg = |text: &str| quote(&argv(&format!("\"{}\"", text.replace('"', "\\\"")))
-        .ok()
-        .and_then(|mut words| words.pop())
-        .unwrap_or_else(|| text.as_bytes().to_vec()));
+    let arg = |text: &str| {
+        quote(
+            &argv(&format!("\"{}\"", text.replace('"', "\\\"")))
+                .ok()
+                .and_then(|mut words| words.pop())
+                .unwrap_or_else(|| text.as_bytes().to_vec()),
+        )
+    };
     for change in changes {
         let cell = |at: usize| change.row.get(at).copied().flatten().unwrap_or_default();
         let value = arg(change.value);
         match (subtype, change.column) {
             ("string", 0) => lines.push(format!("SET {key} {value} KEEPTTL")),
-            ("json", 0) => lines.push(format!("JSON.SET {key} $ {}", quote(change.value.as_bytes()))),
+            ("json", 0) => lines.push(format!(
+                "JSON.SET {key} $ {}",
+                quote(change.value.as_bytes())
+            )),
             ("hash", 1) => lines.push(format!("HSET {key} {} {value}", arg(cell(0)))),
             ("hash", 0) => {
                 lines.push(format!("HDEL {key} {}", arg(cell(0))));
@@ -888,7 +1033,11 @@ pub fn edit(subtype: &str, key: &str, changes: &[CellChange<'_>]) -> Result<Stri
                 if change.value.trim().parse::<f64>().is_err() {
                     return Err(format!("{:?} is not a score", change.value));
                 }
-                lines.push(format!("ZADD {key} XX {} {}", change.value.trim(), arg(cell(0))));
+                lines.push(format!(
+                    "ZADD {key} XX {} {}",
+                    change.value.trim(),
+                    arg(cell(0))
+                ));
             }
             ("zset", 0) => {
                 lines.push(format!("ZREM {key} {}", arg(cell(0))));
@@ -917,7 +1066,11 @@ pub mod actions {
     /// Refuses when `to` exists.
     #[must_use]
     pub fn rename(key: &str, to: &str) -> String {
-        format!("RENAMENX {} {}", quote(key.as_bytes()), quote(to.as_bytes()))
+        format!(
+            "RENAMENX {} {}",
+            quote(key.as_bytes()),
+            quote(to.as_bytes())
+        )
     }
 
     #[must_use]
@@ -963,7 +1116,10 @@ mod tests {
     fn commands_are_sorted_for_binary_search() {
         assert!(COMMANDS.windows(2).all(|pair| pair[0].name < pair[1].name));
         assert_eq!(command(&["get", "k"]).map(|c| c.name), Some("GET"));
-        assert_eq!(command(&["config", "get"]).map(|c| c.access), Some(Access::Admin));
+        assert_eq!(
+            command(&["config", "get"]).map(|c| c.access),
+            Some(Access::Admin)
+        );
         assert!(command(&["config"]).is_none());
     }
 
@@ -971,13 +1127,30 @@ mod tests {
     fn words_split_as_redis_cli_does() {
         assert_eq!(
             argv(r#"SET "a b" 'c\'d' "\x41\n" plain"#).expect("argv"),
-            vec![b"SET".to_vec(), b"a b".to_vec(), b"c'd".to_vec(), b"A\n".to_vec(), b"plain".to_vec()]
+            vec![
+                b"SET".to_vec(),
+                b"a b".to_vec(),
+                b"c'd".to_vec(),
+                b"A\n".to_vec(),
+                b"plain".to_vec()
+            ]
         );
         assert!(argv(r#"SET "open"#).is_err());
         assert!(argv(r#"SET "a"b"#).is_err());
-        for raw in [&b"plain"[..], b"with space", b"q\"uote", b"\xff\x00bin", b"#hash", b""] {
+        for raw in [
+            &b"plain"[..],
+            b"with space",
+            b"q\"uote",
+            b"\xff\x00bin",
+            b"#hash",
+            b"",
+        ] {
             let quoted = quote(raw);
-            assert_eq!(argv(&quoted).expect("round trip"), vec![raw.to_vec()], "{quoted}");
+            assert_eq!(
+                argv(&quoted).expect("round trip"),
+                vec![raw.to_vec()],
+                "{quoted}"
+            );
         }
         assert_eq!(display(b"\xffa"), r"\xffa");
     }
@@ -988,7 +1161,8 @@ mod tests {
         let texts: Vec<&str> = statements(script).into_iter().map(|r| &script[r]).collect();
         assert_eq!(texts, ["SET a 1", "MULTI", "INCR a", "EXEC", "GET a"]);
         let at = |needle: &str| {
-            let range = statement_at(script, script.find(needle).expect("in script")).expect("statement");
+            let range =
+                statement_at(script, script.find(needle).expect("in script")).expect("statement");
             &script[range]
         };
         assert_eq!(at("SET"), "SET a 1");
@@ -1002,7 +1176,12 @@ mod tests {
         let tokens = tokens(script);
         let joined: String = tokens.iter().map(|t| &script[t.range.clone()]).collect();
         assert_eq!(joined, script);
-        let kind = |text: &str| tokens.iter().find(|t| &script[t.range.clone()] == text).map(|t| t.kind);
+        let kind = |text: &str| {
+            tokens
+                .iter()
+                .find(|t| &script[t.range.clone()] == text)
+                .map(|t| t.kind)
+        };
         assert_eq!(kind("hset"), Some(TokenKind::Command));
         assert_eq!(kind("\"v w\""), Some(TokenKind::String));
         assert_eq!(kind("12"), Some(TokenKind::Number));
@@ -1016,8 +1195,14 @@ mod tests {
             ("AUTH s3cret", "AUTH •••"),
             ("auth alice s3cret", "auth ••• •••"),
             ("HELLO 3 AUTH alice s3cret", "HELLO 3 AUTH ••• •••"),
-            ("CONFIG SET requirepass s3cret", "CONFIG SET requirepass •••"),
-            ("ACL SETUSER bob on >s3cret ~* +@all", "ACL SETUSER bob on >••• ~* +@all"),
+            (
+                "CONFIG SET requirepass s3cret",
+                "CONFIG SET requirepass •••",
+            ),
+            (
+                "ACL SETUSER bob on >s3cret ~* +@all",
+                "ACL SETUSER bob on >••• ~* +@all",
+            ),
         ] {
             assert!(sets_secret(typed), "{typed}");
             assert_eq!(redact_secrets(typed), kept);
@@ -1038,11 +1223,20 @@ mod tests {
     #[test]
     fn data_views_read_and_write_by_type() {
         assert_eq!(browse(Some("hash"), "user:1", None), "HGETALL user:1");
-        assert_eq!(browse(Some("hash"), "a b", Some("n*")), "HSCAN \"a b\" 0 MATCH n*");
-        assert_eq!(browse(Some("zset"), "z", None), "ZRANGE z 0 -1 WITHSCORES");
-        let change = |row: Vec<Option<&'static str>>, column, value| CellChange { row, column, value };
         assert_eq!(
-            edit("hash", "h", &[change(vec![Some("f"), Some("old")], 1, "new v")]).expect("edit"),
+            browse(Some("hash"), "a b", Some("n*")),
+            "HSCAN \"a b\" 0 MATCH n*"
+        );
+        assert_eq!(browse(Some("zset"), "z", None), "ZRANGE z 0 -1 WITHSCORES");
+        let change =
+            |row: Vec<Option<&'static str>>, column, value| CellChange { row, column, value };
+        assert_eq!(
+            edit(
+                "hash",
+                "h",
+                &[change(vec![Some("f"), Some("old")], 1, "new v")]
+            )
+            .expect("edit"),
             "HSET h f \"new v\""
         );
         assert_eq!(
@@ -1051,7 +1245,12 @@ mod tests {
         );
         assert!(edit("zset", "z", &[change(vec![Some("m"), Some("1")], 1, "x")]).is_err());
         assert_eq!(
-            edit("list", "l", &[change(vec![Some("3"), Some("a")], 1, r"\xff")]).expect("edit"),
+            edit(
+                "list",
+                "l",
+                &[change(vec![Some("3"), Some("a")], 1, r"\xff")]
+            )
+            .expect("edit"),
             "LSET l 3 \"\\xff\""
         );
         assert!(edit("stream", "s", &[change(vec![Some("1-0"), None], 1, "x")]).is_err());

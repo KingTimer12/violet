@@ -227,6 +227,7 @@ impl VioletApp {
                         connection: id,
                         schema: "public".into(),
                         relation: "customers".into(),
+                        subtype: None,
                     });
                     snapshot.step += 1;
                 }
@@ -301,6 +302,7 @@ impl VioletApp {
                         connection: id,
                         schema: "public".into(),
                         relation: table,
+                        subtype: None,
                     });
                     snapshot.step += 1;
                 }

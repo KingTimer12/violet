@@ -257,6 +257,8 @@ pub fn show(
                         .show(ui, |ui| paging_bar(ui, tab.id, paging, fetching, actions));
                 }
                 let sort = match &tab.kind {
+                    // Redis returns a key's elements in its own order.
+                    TabKind::Data(view) if view.subtype.is_some() => Sorting::Off,
                     TabKind::Data(view) => Sorting::On(view.order.as_ref().and_then(|order| {
                         set.columns
                             .iter()
@@ -283,6 +285,9 @@ pub fn show(
                     links,
                     actions,
                 );
+            } else if let (Some(command), None) = (&set.command, set.affected) {
+                // A reply such as Redis's `OK`.
+                widgets::empty_state(ui, Icon::CircleCheck, command, "The command ran.");
             } else {
                 let affected = set.affected.unwrap_or(0);
                 widgets::empty_state(

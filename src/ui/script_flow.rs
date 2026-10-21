@@ -91,7 +91,7 @@ impl VioletApp {
             Action::OpenScriptFile => {
                 let mut picker = rfd::FileDialog::new()
                     .set_title("Open script")
-                    .add_filter("SQL", &[scripts::EXTENSION]);
+                    .add_filter("Scripts", scripts::EXTENSIONS);
                 if let Some(folder) = self.last_script_folder() {
                     picker = picker.set_directory(folder);
                 }
@@ -122,7 +122,15 @@ impl VioletApp {
                     (Some(saved), Some((connection, database)))
                         if (saved.connection, &saved.database) != (connection, &database) =>
                     {
-                        let moved = self.scripts.path_for(connection, &database, &saved.name);
+                        let extension = file
+                            .path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or(scripts::EXTENSION)
+                            .to_owned();
+                        let moved =
+                            self.scripts
+                                .path_for(connection, &database, &saved.name, &extension);
                         if moved.exists() {
                             self.toasts.push(
                                 ctx,
@@ -183,7 +191,10 @@ impl VioletApp {
             refuse(self, "Type a name.");
             return;
         }
-        let path = self.scripts.path_for(connection, &database, name);
+        let extension = crate::lang::extension(self.language(connection));
+        let path = self
+            .scripts
+            .path_for(connection, &database, name, extension);
         if path.exists() && self.workspace.script_tab(&path) != Some(tab_id) {
             refuse(self, "A script with this name is already saved here.");
             return;
@@ -199,10 +210,14 @@ impl VioletApp {
         if !matches!(tab.kind, TabKind::Script) {
             return;
         }
+        let extension = crate::lang::extension(
+            tab.connection
+                .map_or(violet_core::Language::Sql, |id| self.language(id)),
+        );
         let mut picker = rfd::FileDialog::new()
             .set_title("Save script as")
-            .add_filter("SQL", &[scripts::EXTENSION])
-            .set_file_name(format!("{}.{}", tab.title, scripts::EXTENSION));
+            .add_filter("Scripts", &[extension])
+            .set_file_name(format!("{}.{extension}", tab.title));
         let folder = match &tab.file {
             Some(file) => file.path.parent().map(Path::to_path_buf),
             None => self.last_script_folder(),
@@ -214,7 +229,7 @@ impl VioletApp {
             return;
         };
         if path.extension().is_none() {
-            path.set_extension(scripts::EXTENSION);
+            path.set_extension(extension);
         }
         self.write_script(ctx, tab_id, path);
     }

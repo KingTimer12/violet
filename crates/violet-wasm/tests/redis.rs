@@ -90,7 +90,11 @@ async fn run(session: &dyn Session, script: &str) -> Vec<ResultSet> {
 fn cells(set: &ResultSet) -> Vec<Vec<Option<String>>> {
     set.rows
         .iter()
-        .map(|row| (0..set.columns.len()).map(|i| row.get(i).flatten().map(str::to_owned)).collect())
+        .map(|row| {
+            (0..set.columns.len())
+                .map(|i| row.get(i).flatten().map(str::to_owned))
+                .collect()
+        })
         .collect()
 }
 
@@ -105,14 +109,19 @@ async fn describes_itself_as_redis() {
     let info = runtime.inspect(wasm).await.expect("inspect").info;
     assert_eq!(info.id.as_str(), "redis");
     assert_eq!(info.language, Language::Redis);
-    assert_eq!((info.user, info.password), (Login::Optional, Login::Optional));
+    assert_eq!(
+        (info.user, info.password),
+        (Login::Optional, Login::Optional)
+    );
     assert_eq!(info.default_port, 6379);
     assert_eq!(violet_wasm::api_level(&info), "0.2.0");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn connects_and_runs_scripts() {
-    let Some(server) = server(1).await else { return };
+    let Some(server) = server(1).await else {
+        return;
+    };
     let session = server.connect().await;
     let info = session.server_info().await.expect("info");
     assert_eq!(info.database, "db1");
@@ -150,7 +159,9 @@ async fn connects_and_runs_scripts() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn transactions_queue_and_name_their_results() {
-    let Some(server) = server(2).await else { return };
+    let Some(server) = server(2).await else {
+        return;
+    };
     let session = server.connect().await;
     let sets = run(&*session, "MULTI\nSET a 1\nINCR a\nGET a\nEXEC").await;
     let shown: Vec<Option<&str>> = sets.iter().map(|s| s.command.as_deref()).collect();
@@ -167,18 +178,26 @@ async fn transactions_queue_and_name_their_results() {
 
     // The tree's changes run in their own database, not the editor's.
     let sets = session
-        .run_in("db2", "MULTI
+        .run_in(
+            "db2",
+            "MULTI
 SET b 1
 EXPIRE b 100
 EXEC
-TTL b", ExecLimits::default())
+TTL b",
+            ExecLimits::default(),
+        )
         .await
         .expect("run in db2");
     assert_eq!(cells(sets.last().expect("ttl")), [[Some("100".to_owned())]]);
     assert_eq!(session.server_info().await.expect("info").database, "db3");
     let open = session
-        .run_in("db2", "MULTI
-SET c 1", ExecLimits::default())
+        .run_in(
+            "db2",
+            "MULTI
+SET c 1",
+            ExecLimits::default(),
+        )
         .await
         .expect_err("left open");
     assert_eq!(open.kind, ErrorKind::Query);
@@ -187,13 +206,17 @@ SET c 1", ExecLimits::default())
 
 #[tokio::test(flavor = "multi_thread")]
 async fn lists_keys_a_page_at_a_time() {
-    let Some(server) = server(4).await else { return };
+    let Some(server) = server(4).await else {
+        return;
+    };
     let session = server.connect().await;
     let mut script = String::new();
     for n in 0..1200 {
         script.push_str(&format!("SET user:{n} x\n"));
     }
-    script.push_str("HSET h f v\nRPUSH l a b c\nSADD s m\nZADD z 1 m\nXADD st * k v\nEXPIRE h 3600\n");
+    script.push_str(
+        "HSET h f v\nRPUSH l a b c\nSADD s m\nZADD z 1 m\nXADD st * k v\nEXPIRE h 3600\n",
+    );
     run(&*session, &script).await;
 
     let schemas = session.schemas().await.expect("schemas");
@@ -221,7 +244,10 @@ async fn lists_keys_a_page_at_a_time() {
     let mut all = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
-        let page = session.entries("db4", None, cursor.as_deref(), 500).await.expect("entries");
+        let page = session
+            .entries("db4", None, cursor.as_deref(), 500)
+            .await
+            .expect("entries");
         all.extend(page.objects);
         cursor = page.next;
         if cursor.is_none() {
@@ -232,18 +258,26 @@ async fn lists_keys_a_page_at_a_time() {
     let hash = find("h").expect("hash");
     assert_eq!(hash.subtype.as_deref(), Some("hash"));
     assert_eq!(hash.estimated_rows, Some(1));
-    assert!(hash.detail.as_deref().is_some_and(|d| d.contains("TTL")), "{hash:?}");
+    assert!(
+        hash.detail.as_deref().is_some_and(|d| d.contains("TTL")),
+        "{hash:?}"
+    );
     for (name, subtype) in [("l", "list"), ("s", "set"), ("z", "zset"), ("st", "stream")] {
         assert_eq!(find(name).and_then(|o| o.subtype).as_deref(), Some(subtype));
     }
     let columns = session.columns("db4", "z").await.expect("columns");
-    assert_eq!(columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["member", "score"]);
+    assert_eq!(
+        columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        ["member", "score"]
+    );
     session.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn data_views_page_without_gaps() {
-    let Some(server) = server(5).await else { return };
+    let Some(server) = server(5).await else {
+        return;
+    };
     let session = server.connect().await;
     let mut script = String::from("HSET big");
     for n in 0..2500 {
@@ -261,11 +295,17 @@ async fn data_views_page_without_gaps() {
     let mut fields = std::collections::BTreeSet::new();
     let mut offset = 0;
     loop {
-        let sets = session.page("db5", "HGETALL big", offset, 200).await.expect("page");
+        let sets = session
+            .page("db5", "HGETALL big", offset, 200)
+            .await
+            .expect("page");
         let rows = cells(&sets[0]);
         let shown = rows.len().min(200);
         for row in &rows[..shown] {
-            assert!(fields.insert(row[0].clone().expect("field")), "duplicate {row:?}");
+            assert!(
+                fields.insert(row[0].clone().expect("field")),
+                "duplicate {row:?}"
+            );
         }
         offset += shown as u64;
         if rows.len() <= 200 {
@@ -273,20 +313,34 @@ async fn data_views_page_without_gaps() {
         }
     }
     assert_eq!(fields.len(), 2500);
-    assert_eq!(session.count("db5", "HGETALL big").await.expect("count"), Some(2500));
+    assert_eq!(
+        session.count("db5", "HGETALL big").await.expect("count"),
+        Some(2500)
+    );
 
-    let sets = session.page("db5", "LRANGE list 0 -1", 400, 100).await.expect("list page");
+    let sets = session
+        .page("db5", "LRANGE list 0 -1", 400, 100)
+        .await
+        .expect("list page");
     let rows = cells(&sets[0]);
     assert_eq!(rows.len(), 50);
     assert_eq!(rows[0], [Some("400".to_owned()), Some("400".to_owned())]);
-    assert_eq!(session.count("db5", "LRANGE list 0 -1").await.expect("count"), Some(450));
+    assert_eq!(
+        session
+            .count("db5", "LRANGE list 0 -1")
+            .await
+            .expect("count"),
+        Some(450)
+    );
     run(&*session, "DISCARD").await;
     session.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_wrong_password_is_an_authentication_error() {
-    let Some(mut server) = server(6).await else { return };
+    let Some(mut server) = server(6).await else {
+        return;
+    };
     if server.password.is_none() {
         return;
     }

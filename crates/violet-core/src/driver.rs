@@ -163,7 +163,9 @@ pub trait Session: Send + Sync + 'static {
         limit: u32,
     ) -> Result<EntryPage> {
         let _ = (schema, pattern, cursor, limit);
-        Err(crate::DbError::unsupported("Listing entries is not supported"))
+        Err(crate::DbError::unsupported(
+            "Listing entries is not supported",
+        ))
     }
 
     /// Rows `offset .. offset + limit` of a statement's first result, run in
@@ -188,9 +190,16 @@ pub trait Session: Send + Sync + 'static {
 
     /// Runs statements in `schema` as [`Session::execute`] does, leaving
     /// the state the editor set alone. Only drivers that are not SQL do.
-    async fn run_in(&self, schema: &str, statements: &str, limits: ExecLimits) -> Result<Vec<ResultSet>> {
+    async fn run_in(
+        &self,
+        schema: &str,
+        statements: &str,
+        limits: ExecLimits,
+    ) -> Result<Vec<ResultSet>> {
         let _ = (schema, statements, limits);
-        Err(crate::DbError::unsupported("Running in a schema is not supported"))
+        Err(crate::DbError::unsupported(
+            "Running in a schema is not supported",
+        ))
     }
 
     async fn close(&self);

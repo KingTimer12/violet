@@ -5333,6 +5333,7 @@ dependencies = [
  "ureq",
  "violet-app",
  "violet-core",
+ "violet-lang",
  "violet-providers",
  "violet-storage",
  "violet-wasm",
@@ -5350,6 +5351,7 @@ dependencies = [
  "log",
  "tokio",
  "violet-core",
+ "violet-lang",
  "violet-storage",
 ]
 

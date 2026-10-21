@@ -34,6 +34,8 @@ pub struct Target {
     /// The active SQL editor, to insert into.
     pub editor: bool,
     pub connection: Option<ConnectionId>,
+    /// Connections whose commands are Redis, to colour them so.
+    pub redis: Vec<ConnectionId>,
 }
 
 /// Draws the dialog. Returns `false` once it should close.
@@ -133,7 +135,15 @@ pub fn show(
             } else {
                 list(ui, view, entries, &shown, actions, target, &palette);
                 if let Some(entry) = view.selected.and_then(|index| entries.get(index)) {
-                    preview(ui, entry, &palette);
+                    let language = if entry
+                        .connection
+                        .is_some_and(|id| target.redis.contains(&id))
+                    {
+                        violet_core::Language::Redis
+                    } else {
+                        violet_core::Language::Sql
+                    };
+                    preview(ui, entry, &palette, language);
                 }
             }
 
@@ -327,7 +337,12 @@ fn row(
     }
 }
 
-fn preview(ui: &mut egui::Ui, entry: &HistoryEntry, palette: &Palette) {
+fn preview(
+    ui: &mut egui::Ui,
+    entry: &HistoryEntry,
+    palette: &Palette,
+    language: violet_core::Language,
+) {
     egui::Frame::new()
         .fill(palette.window)
         .stroke(Stroke::new(1.0, palette.outline))
@@ -339,7 +354,7 @@ fn preview(ui: &mut egui::Ui, entry: &HistoryEntry, palette: &Palette) {
                 .max_height(150.0)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    let mut job = editor::highlighted(&entry.sql, palette);
+                    let mut job = editor::highlighted(&entry.sql, palette, language);
                     job.wrap.max_width = ui.available_width();
                     ui.add(egui::Label::new(job).selectable(true));
                 });

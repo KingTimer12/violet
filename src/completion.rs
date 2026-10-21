@@ -28,6 +28,8 @@ pub enum Need {
     Objects(String),
     Columns(String, String),
     ForeignKeys(String),
+    /// A key-value database's keys.
+    Keys(String),
 }
 
 /// What a suggestion is, in the order they are listed when equally good.
@@ -44,6 +46,8 @@ pub enum Kind {
     Function,
     Keyword,
     Type,
+    /// A key of a key-value store.
+    Key,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,6 +81,124 @@ pub struct Options<'a> {
 }
 
 const MAX_ITEMS: usize = 200;
+
+/// Completes a Redis command line: command names (with their syntax) in
+/// the first word, a container's subcommands in the second, and the keys
+/// listed in the tree for `schema` where the command takes keys. `keys` is
+/// `None` while they have not been listed.
+pub fn complete_redis(
+    text: &str,
+    cursor: usize,
+    schema: Option<&str>,
+    keys: Option<&[DbObject]>,
+) -> Option<Completion> {
+    use violet_lang::redis::{COMMANDS, is_container};
+    if cursor > text.len() || !text.is_char_boundary(cursor) {
+        return None;
+    }
+    let line_start = text[..cursor].rfind('\n').map_or(0, |at| at + 1);
+    let before = &text[line_start..cursor];
+    if before.trim_start().starts_with('#') || before.trim_start().starts_with("//") {
+        return None;
+    }
+    // Inside quotes nothing is offered.
+    if before.chars().filter(|c| *c == '"').count() % 2 == 1
+        || before.chars().filter(|c| *c == '\'').count() % 2 == 1
+    {
+        return None;
+    }
+    let start = line_start
+        + before
+            .rfind(|c: char| c.is_ascii_whitespace())
+            .map_or(0, |at| at + 1);
+    let end = cursor
+        + text[cursor..]
+            .find(|c: char| c.is_ascii_whitespace())
+            .unwrap_or(text.len() - cursor);
+    let prefix = text[start..cursor].to_owned();
+    let words: Vec<&str> = text[line_start..start].split_ascii_whitespace().collect();
+    let upper = prefix.to_ascii_uppercase();
+    let mut items = Vec::new();
+    let mut needs = Vec::new();
+    let command = |name: &str, syntax: &str, insert: String| Item {
+        label: name.to_owned(),
+        caret: insert.len(),
+        insert,
+        kind: Kind::Keyword,
+        detail: syntax.to_owned(),
+        key: name.to_owned(),
+    };
+    match words.as_slice() {
+        [] => {
+            let mut containers = Vec::new();
+            for c in COMMANDS {
+                let first = c.name.split(' ').next().unwrap_or(c.name);
+                if !first.starts_with(&upper) {
+                    continue;
+                }
+                if c.name.contains(' ') {
+                    // `CONFIG GET` and its siblings, under their container.
+                    if !containers.contains(&first) {
+                        containers.push(first);
+                        items.push(command(first, "subcommand ...", format!("{first} ")));
+                    }
+                } else {
+                    items.push(command(c.name, c.syntax, format!("{} ", c.name)));
+                }
+            }
+        }
+        [first] if is_container(&first.to_ascii_uppercase()) => {
+            let head = format!("{} ", first.to_ascii_uppercase());
+            for c in COMMANDS {
+                if let Some(sub) = c.name.strip_prefix(&head)
+                    && sub.starts_with(&upper)
+                {
+                    items.push(command(sub, c.syntax, format!("{sub} ")));
+                }
+            }
+        }
+        [first, ..] => {
+            let name = violet_lang::redis::command(&words);
+            let takes_keys = name.is_some_and(|c| {
+                c.syntax.contains("key")
+                    || c.syntax.contains("source")
+                    || c.syntax.contains("destination")
+            }) || name.is_none() && !is_container(&first.to_ascii_uppercase());
+            if takes_keys {
+                match keys {
+                    Some(keys) => {
+                        for key in keys.iter().filter(|k| k.name.starts_with(&prefix)) {
+                            let insert = violet_lang::redis::quote(key.name.as_bytes());
+                            items.push(Item {
+                                label: key.name.clone(),
+                                caret: insert.len(),
+                                insert,
+                                kind: Kind::Key,
+                                detail: key.subtype.clone().unwrap_or_default(),
+                                key: key.name.clone(),
+                            });
+                            if items.len() >= MAX_ITEMS {
+                                break;
+                            }
+                        }
+                    }
+                    None => {
+                        if let Some(schema) = schema {
+                            needs.push(Need::Keys(schema.to_owned()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    items.truncate(MAX_ITEMS);
+    Some(Completion {
+        range: start..end,
+        prefix,
+        items,
+        needs,
+    })
+}
 
 /// Statements, for an empty editor or after a `;`.
 const STARTS: &[&str] = &[
@@ -2134,5 +2256,32 @@ mod tests {
             inserts(&found)
         );
         assert_eq!(short_alias("order_items", &["oi".into()]), "oi2");
+    }
+
+    #[test]
+    fn redis_lines_complete_commands_and_keys() {
+        let labels = |c: Option<Completion>| -> Vec<String> {
+            c.expect("completion")
+                .items
+                .into_iter()
+                .map(|i| i.label)
+                .collect()
+        };
+        let got = labels(complete_redis("hge", 3, None, None));
+        assert!(
+            got.contains(&"HGET".to_owned()) && got.contains(&"HGETALL".to_owned()),
+            "{got:?}"
+        );
+        let got = labels(complete_redis("CONFIG g", 8, None, None));
+        assert_eq!(got, ["GET"]);
+        let keys = [
+            object("user:1", ObjectKind::Key),
+            object("order:9", ObjectKind::Key),
+        ];
+        let got = labels(complete_redis("GET us", 6, Some("db0"), Some(&keys)));
+        assert_eq!(got, ["user:1"]);
+        let waiting = complete_redis("GET us", 6, Some("db0"), None).expect("completion");
+        assert_eq!(waiting.needs, [Need::Keys("db0".into())]);
+        assert!(complete_redis("SET k \"open", 11, None, None).is_none());
     }
 }

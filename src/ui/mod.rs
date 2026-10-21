@@ -16,6 +16,7 @@ mod export_flow;
 mod fonts;
 mod history;
 pub mod icons;
+mod key_flow;
 mod providers;
 mod reference;
 mod results;
@@ -41,7 +42,7 @@ use std::time::{Duration, Instant, SystemTime};
 use egui::{Frame, Id, Panel, Stroke};
 use violet_app::{Backend, CachePolicy, Event, ExecOptions, ProfileService, TaskId};
 use violet_core::ports::{HistoryEntry, QueryHistory};
-use violet_core::{ConnectionId, ConnectionProfile, DriverId, ErrorKind, Page};
+use violet_core::{ConnectionId, ConnectionProfile, DriverId, ErrorKind, Language, Page};
 use violet_storage::{JsonFile, SavedScript, ScriptStore};
 
 use crate::completion::{self, Need};
@@ -118,11 +119,16 @@ pub struct VioletApp {
     /// Folder listings being read.
     folder_requests: HashMap<violet_app::RequestId, (ConnectionId, state::Folder)>,
     schema_chooser: Option<catalog_flow::SchemaChooser>,
+    key_dialog: Option<key_flow::KeyDialog>,
+    /// Commands the tree ran on keys, waiting for their answer.
+    key_requests: HashMap<violet_app::RequestId, key_flow::Pending>,
     /// Actions to run once their connection opens.
     waiting: Vec<(ConnectionId, Action)>,
     /// The format and header choice advanced copy starts with.
     copy_choice: (crate::export::Format, bool),
     confirm_delete: Option<ConnectionId>,
+    /// A connection string typed on the welcome screen.
+    welcome_uri: String,
     /// Runs waiting for their tab's connection to open.
     queued: Vec<(TabId, RunScope)>,
     actions: Vec<Action>,
@@ -242,8 +248,11 @@ impl VioletApp {
             waiting: Vec::new(),
             folder_requests: HashMap::new(),
             schema_chooser: None,
+            key_dialog: None,
+            key_requests: HashMap::new(),
             copy_choice: (crate::export::Format::Tsv, true),
             confirm_delete: None,
+            welcome_uri: String::new(),
             queued: Vec::new(),
             actions: Vec::new(),
             fonts: fonts::Fallbacks::default(),
@@ -475,6 +484,24 @@ impl VioletApp {
             .map(|profile| profile.driver.as_str().to_owned())
     }
 
+    /// What a connection's statements are written in.
+    fn language(&self, id: ConnectionId) -> Language {
+        connections(&self.profiles, &self.explorer)
+            .iter()
+            .find(|profile| profile.id == id)
+            .map_or(Language::Sql, |profile| {
+                self.explorer.language(profile.driver.as_str())
+            })
+    }
+
+    /// The language of a tab's connection; SQL without one.
+    fn tab_language(&self, tab_id: TabId) -> Language {
+        self.workspace
+            .get(tab_id)
+            .and_then(|tab| tab.connection)
+            .map_or(Language::Sql, |id| self.language(id))
+    }
+
     /// The SQL dialect of a connection's driver.
     fn dialect(&self, id: ConnectionId) -> violet_core::SqlDialect {
         connections(&self.profiles, &self.explorer)
@@ -595,7 +622,9 @@ impl VioletApp {
                     .insert(id, Loadable::from_result(result));
             }
             Event::Schemas { id, result } => {
-                if let Ok(schemas) = &result {
+                if self.language(id) == Language::Redis {
+                    self.keyspaces_listed(id, &result);
+                } else if let Ok(schemas) = &result {
                     let any_open = self
                         .explorer
                         .expanded
@@ -643,12 +672,23 @@ impl VioletApp {
                     .columns
                     .insert((id, schema, relation), Loadable::from_result(result));
             }
+            Event::Entries {
+                id,
+                schema,
+                pattern,
+                more,
+                result,
+            } => self.keys_listed(id, schema, pattern, more, result),
             Event::ForeignKeys { id, schema, result } => {
                 self.explorer
                     .foreign_keys
                     .insert((id, schema), Loadable::from_result(result));
             }
             Event::QueryFinished { request, result } => {
+                if let Some(pending) = self.key_requests.remove(&request) {
+                    self.key_command_done(ctx, pending, &result);
+                    return;
+                }
                 if let Some(applying) = self.applying.remove(&request) {
                     self.edits_applied(ctx, applying, &result);
                     return;
@@ -676,6 +716,14 @@ impl VioletApp {
                     return;
                 };
                 let connection = tab.connection;
+                let language = connection.map_or(Language::Sql, |id| {
+                    connections(&self.profiles, &self.explorer)
+                        .iter()
+                        .find(|profile| profile.id == id)
+                        .map_or(Language::Sql, |profile| {
+                            self.explorer.language(profile.driver.as_str())
+                        })
+                });
                 // Runs from editors go to the history; pages and data tabs
                 // do not.
                 let entry = (!running.append && tab.data().is_none()).then(|| HistoryEntry {
@@ -688,7 +736,7 @@ impl VioletApp {
                     source: connection
                         .and_then(|id| connection_name(&self.profiles, &self.explorer, id))
                         .unwrap_or_default(),
-                    sql: sql::redact_secrets(&running.executed.sql),
+                    sql: crate::lang::redact_secrets(language, &running.executed.sql),
                     elapsed_ms: u64::try_from(
                         result
                             .as_ref()
@@ -712,7 +760,7 @@ impl VioletApp {
                     // A server may quote the statement back, password
                     // included.
                     error: result.as_ref().err().map(|error| {
-                        if sql::sets_secret(&running.executed.sql) {
+                        if crate::lang::sets_secret(language, &running.executed.sql) {
                             "Failed (message hidden: the statement carries a password)".to_owned()
                         } else {
                             error.message.clone()
@@ -898,6 +946,16 @@ impl VioletApp {
                         self.load_columns(id, schema, relation);
                     }
                 }
+                Need::Keys(schema) => {
+                    let listed = self
+                        .explorer
+                        .keys
+                        .get(&(id, schema.clone()))
+                        .is_some_and(|keys| keys.listed || keys.loading);
+                    if !listed {
+                        self.load_keys(id, schema, false);
+                    }
+                }
                 Need::ForeignKeys(schema) => {
                     let key = (id, schema.clone());
                     if let std::collections::hash_map::Entry::Vacant(entry) =
@@ -976,6 +1034,14 @@ impl VioletApp {
         if tab.running.is_some() {
             return;
         }
+        let language = tab.connection.map_or(Language::Sql, |id| {
+            connections(&self.profiles, &self.explorer)
+                .iter()
+                .find(|profile| profile.id == id)
+                .map_or(Language::Sql, |profile| {
+                    self.explorer.language(profile.driver.as_str())
+                })
+        });
         let explain = matches!(scope, RunScope::Explain | RunScope::ExplainAnalyze);
         let range = match scope {
             RunScope::Script | RunScope::Data => 0..tab.sql.len(),
@@ -985,7 +1051,7 @@ impl VioletApp {
                 tab.selection.clone()
             }
             RunScope::Statement | RunScope::Explain | RunScope::ExplainAnalyze => {
-                match sql::statement_at(&tab.sql, tab.selection.start) {
+                match crate::lang::statement_at(language, &tab.sql, tab.selection.start) {
                     Some(range) => range,
                     None => 0..0,
                 }
@@ -1016,16 +1082,22 @@ impl VioletApp {
         let offset = range.start
             + (tab.sql[range.clone()].len() - tab.sql[range.clone()].trim_start().len());
         if explain {
+            if language != Language::Sql {
+                self.toasts
+                    .push(ctx, Toast::info("This database has no query plans to show"));
+                return;
+            }
             self.explain(ctx, tab_id, connection, offset, &text, scope);
             return;
         }
         if !confirmed {
-            let writes = self.unbounded_writes(&text, connection);
+            let writes = self.unbounded_writes(&text, connection, language);
             if !writes.is_empty() {
                 self.run_review = Some(edit_flow::RunReview {
                     tab: tab_id,
                     scope,
                     writes,
+                    language,
                 });
                 return;
             }
@@ -1034,6 +1106,16 @@ impl VioletApp {
         if let Some(tab) = self.workspace.get_mut(tab_id) {
             tab.sort = None;
             tab.unsorted = None;
+        }
+        if language != Language::Sql {
+            // Commands run as written, one reply each; nothing is cached.
+            let executed = Executed {
+                offset,
+                sql: text,
+                shift: 0,
+            };
+            self.start(tab_id, connection, executed, ExecOptions::WRITE, false);
+            return;
         }
         // Reads may come from the cache, and a single query is read a page
         // at a time, as DBeaver does.
@@ -1204,9 +1286,12 @@ impl VioletApp {
         let Some(tab) = self.workspace.get_mut(tab_id) else {
             return;
         };
+        // A key-value store's data view reads its own database, whatever
+        // the editor selected.
+        let schema = tab.data().map(|view| view.schema.clone());
         let request = self
             .backend
-            .execute(connection, executed.sql.clone(), options);
+            .execute_in(connection, schema, executed.sql.clone(), options);
         if !append {
             // New rows: changes to the old ones are gone with them.
             tab.edits.clear();
@@ -1265,7 +1350,7 @@ impl VioletApp {
             return;
         }
         let filter = view.filter.trim().to_owned();
-        if !sql::is_single_expression(&filter) {
+        if view.subtype.is_none() && !sql::is_single_expression(&filter) {
             self.toasts.push(
                 ctx,
                 Toast::error(
@@ -1281,6 +1366,7 @@ impl VioletApp {
             &view.relation,
             Some(&filter),
             view.order.as_ref(),
+            view.subtype.as_deref(),
         ) else {
             return;
         };
@@ -1360,7 +1446,8 @@ impl VioletApp {
         }
         // Changing every row again is asked for from the editor, not
         // repeated by a refresh.
-        if !sql::unbounded_writes(&executed.sql).is_empty() {
+        let language = tab.connection.map_or(Language::Sql, |id| self.language(id));
+        if !crate::lang::dangers(language, &executed.sql).is_empty() {
             self.toasts.push(
                 ctx,
                 Toast::error(
@@ -1385,13 +1472,14 @@ impl VioletApp {
         let Some(tab) = self.workspace.get_mut(tab_id) else {
             return;
         };
+        let schema = tab.data().map(|view| view.schema.clone());
         let (Some(connection), Some(paging)) = (tab.connection, &mut tab.paging) else {
             return;
         };
         if matches!(paging.total, Some(Count::Running(_))) {
             return;
         }
-        let request = self.backend.count(connection, paging.base.clone());
+        let request = self.backend.count(connection, schema, paging.base.clone());
         paging.total = Some(Count::Running(request));
     }
 
@@ -1416,6 +1504,37 @@ impl VioletApp {
                     if !matches!(self.providers.listing, providers::Listing::Loading) {
                         self.load_providers();
                     }
+                }
+            }
+            Action::NewConnectionFromUri(mut text) => {
+                let parsed = violet_core::uri::parse(&text);
+                zeroize::Zeroize::zeroize(&mut text);
+                match parsed {
+                    Ok(parsed) => {
+                        let choices = self.providers.choices(self.backend.registry().infos());
+                        match choices.iter().find(|c| c.info.id.as_str() == parsed.driver) {
+                            Some(choice) => {
+                                let mut form = ConnectionForm::create(&choice.info);
+                                form.apply_uri(parsed, &choice.info);
+                                self.form = Some(form);
+                            }
+                            None => self.toasts.push(
+                                ctx,
+                                Toast::error(
+                                    "No provider for that database",
+                                    format!(
+                                        "The {} provider is not on offer yet; open the providers \
+                                         dialog to refresh the catalogue.",
+                                        parsed.driver
+                                    ),
+                                ),
+                            ),
+                        }
+                    }
+                    Err(message) => self.toasts.push(
+                        ctx,
+                        Toast::error("Not a connection string Violet reads", message),
+                    ),
                 }
             }
             Action::RestartToUpdate => {
@@ -1518,6 +1637,19 @@ impl VioletApp {
                 }
             }
             Action::LoadObjects(id, schema) => self.load_objects(id, schema),
+            Action::LoadKeys(id, schema, more) => self.load_keys(id, schema, more),
+            Action::KeyDialog {
+                connection,
+                schema,
+                key,
+                op,
+            } => self.open_key_dialog(connection, schema, key, op),
+            Action::RunInSchema {
+                connection,
+                schema,
+                script,
+                done,
+            } => self.run_in_schema(ctx, connection, schema, script, done),
             Action::LoadColumns(id, schema, relation) => self.load_columns(id, schema, relation),
             Action::LoadForCompletion(id, needs) => self.load_for_completion(id, needs),
             Action::SaveProfile {
@@ -1563,12 +1695,14 @@ impl VioletApp {
                 connection,
                 schema,
                 relation,
+                subtype,
             } => {
                 if let Some(tab) = self.workspace.data_tab(connection, &schema, &relation) {
                     self.workspace.active = Some(tab);
                     return;
                 }
-                let view = DataView::new(schema, relation.clone());
+                let mut view = DataView::new(schema, relation.clone());
+                view.subtype = subtype;
                 let tab = self.workspace.open(
                     relation,
                     Some(connection),
@@ -1697,6 +1831,10 @@ impl VioletApp {
     /// Puts `text` at the active editor's cursor, replacing the selection,
     /// on lines of its own.
     fn insert_sql(&mut self, ctx: &egui::Context, text: &str) {
+        let language = self
+            .workspace
+            .active
+            .map_or(Language::Sql, |id| self.tab_language(id));
         let Some(tab) = self
             .workspace
             .active
@@ -1707,7 +1845,7 @@ impl VioletApp {
         };
         let range = tab.selection.start.min(tab.sql.len())..tab.selection.end.min(tab.sql.len());
         let mut block = text.trim().to_owned();
-        if !block.ends_with(';') {
+        if language == Language::Sql && !block.ends_with(';') {
             block.push(';');
         }
         let before = &tab.sql[..range.start];
@@ -1731,6 +1869,7 @@ impl VioletApp {
             || self.run_review.is_some()
             || self.confirm_delete.is_some()
             || self.history_view.is_some()
+            || self.key_dialog.is_some()
             || self.task_dialog.is_some();
         if modal_open {
             return;
@@ -1804,7 +1943,13 @@ impl VioletApp {
     fn central(&mut self, ui: &mut egui::Ui) {
         let palette = Palette::current(ui.ctx());
         if self.workspace.tabs.is_empty() {
-            chrome::welcome(ui, self.profiles.all(), &self.explorer, &mut self.actions);
+            chrome::welcome(
+                ui,
+                self.profiles.all(),
+                &self.explorer,
+                &mut self.welcome_uri,
+                &mut self.actions,
+            );
             return;
         }
         Panel::top("tab-strip")
@@ -1819,6 +1964,7 @@ impl VioletApp {
         let Some(active) = self.workspace.active else {
             return;
         };
+        let language = self.tab_language(active);
         let editing = self.editing(active);
         let links = self.sync_reference(active);
         let profiles = &*connections(&self.profiles, &self.explorer);
@@ -1842,7 +1988,7 @@ impl VioletApp {
             .frame(Frame::NONE.fill(palette.window))
             .show_separator_line(false)
             .show(ui, |ui| {
-                chrome::toolbar(ui, tab, profiles, explorer, actions)
+                chrome::toolbar(ui, tab, profiles, explorer, language, actions)
             });
 
         if let Some(reference) = reference {
@@ -1905,8 +2051,24 @@ impl VioletApp {
             .map(|id| explorer.search_path(id))
             .unwrap_or_default();
         let quote = |name: &str| violet_core::Dialect::quote_ident(&dialect, name);
+        // A key-value store's editor completes the keys of its database.
+        let database = match tab.connection.map(|id| explorer.link(id)) {
+            Some(state::Link::Online(server)) if language == Language::Redis => {
+                Some(server.database.clone())
+            }
+            _ => None,
+        };
+        let keys = database.as_ref().map(|database| {
+            let listed = tab
+                .connection
+                .and_then(|id| explorer.keys.get(&(id, database.clone())))
+                .filter(|keys| keys.listed)
+                .map(|keys| &*keys.list);
+            (database.as_str(), listed)
+        });
         let assist = editor::Assist {
             connection: tab.connection,
+            language,
             catalog: &ConnectionCatalog {
                 explorer,
                 id: tab.connection,
@@ -1915,6 +2077,7 @@ impl VioletApp {
                 search: &search,
                 quote: &quote,
             },
+            keys,
         };
         egui::CentralPanel::default()
             .frame(Frame::NONE.fill(palette.window))
@@ -1948,6 +2111,11 @@ impl VioletApp {
         {
             self.cell_editor = None;
         }
+        if let Some(dialog) = &mut self.key_dialog
+            && !key_flow::show(ctx, dialog, &mut self.actions)
+        {
+            self.key_dialog = None;
+        }
         if let Some(chooser) = &mut self.schema_chooser
             && !catalog_flow::show_chooser(ctx, chooser, &mut self.actions)
         {
@@ -1970,9 +2138,17 @@ impl VioletApp {
         }
         if let Some(view) = &mut self.history_view {
             let active = self.workspace.active();
+            let redis = connections(&self.profiles, &self.explorer)
+                .iter()
+                .filter(|profile| {
+                    self.explorer.language(profile.driver.as_str()) == Language::Redis
+                })
+                .map(|profile| profile.id)
+                .collect();
             let target = history::Target {
                 editor: active.is_some_and(|tab| tab.data().is_none()),
                 connection: active.and_then(|tab| tab.connection),
+                redis,
             };
             if !history::show(ctx, view, &self.history, &target, &mut self.actions) {
                 self.history_view = None;
@@ -2003,6 +2179,13 @@ impl eframe::App for VioletApp {
 
     #[hotpath::measure]
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.explorer.languages = self
+            .backend
+            .registry()
+            .infos()
+            .into_iter()
+            .map(|info| (info.id.as_str().to_owned(), info.language))
+            .collect();
         self.handle_events(ctx);
         self.shortcuts(ctx);
         if std::mem::take(&mut self.names_unchecked) {

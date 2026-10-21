@@ -29,6 +29,8 @@ pub enum RunScope {
 #[derive(Debug)]
 pub enum Action {
     NewConnection,
+    /// Opens the connection form filled from a connection string.
+    NewConnectionFromUri(String),
     EditConnection(ConnectionId),
     DuplicateConnection(ConnectionId),
     AskDeleteConnection(ConnectionId),
@@ -65,6 +67,26 @@ pub enum Action {
         connection: ConnectionId,
         schema: String,
         relation: String,
+        /// A key's type, for a key-value store.
+        subtype: Option<String>,
+    },
+    /// Lists a key-value database's keys matching its glob: from the
+    /// first page, or the next one.
+    LoadKeys(ConnectionId, String, bool),
+    /// Asks how to change a key: its TTL, its name, or to delete it.
+    KeyDialog {
+        connection: ConnectionId,
+        schema: String,
+        key: String,
+        op: super::key_flow::KeyOp,
+    },
+    /// Runs commands in a key-value database for the tree, then lists its
+    /// keys again; `done` is the notice shown when they worked.
+    RunInSchema {
+        connection: ConnectionId,
+        schema: String,
+        script: String,
+        done: String,
     },
     Run(TabId, RunScope),
     /// Runs again, the user having accepted statements without `WHERE`.

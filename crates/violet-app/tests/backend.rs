@@ -329,7 +329,9 @@ fn errors_point_at_the_users_text_and_counts_parse() {
     // Position 20 of the wrapped text is 4 into the user's own.
     assert_eq!(error.position, Some(4));
 
-    let request = h.backend.count(h.profile.id, "SELECT n FROM t".into());
+    let request = h
+        .backend
+        .count(h.profile.id, None, "SELECT n FROM t".into());
     let counted =
         h.wait(|event| matches!(event, Event::Counted { request: r, .. } if *r == request));
     assert!(matches!(
@@ -405,4 +407,190 @@ fn a_missing_provider_is_installed_when_a_connection_needs_it() {
         assert!(Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// A key-value store: it pages, counts and lists itself, so Violet must
+/// never send it SQL of its own.
+struct KeyValueDriver(Arc<Server>);
+struct KeyValueSession(Arc<Server>);
+
+#[async_trait]
+impl Driver for KeyValueDriver {
+    fn info(&self) -> DriverInfo {
+        DriverInfo {
+            id: DriverId::new("kv"),
+            language: violet_core::Language::Redis,
+            user: violet_core::Login::Optional,
+            ..FakeDriver(Arc::clone(&self.0)).info()
+        }
+    }
+
+    async fn connect(&self, _: &ConnectionProfile, _: &Credentials) -> Result<Box<dyn Session>> {
+        Ok(Box::new(KeyValueSession(Arc::clone(&self.0))))
+    }
+}
+
+impl KeyValueSession {
+    fn saw(&self, what: String) {
+        self.0.executed.lock().expect("lock").push(what);
+    }
+}
+
+#[async_trait]
+impl Session for KeyValueSession {
+    async fn server_info(&self) -> Result<ServerInfo> {
+        Ok(ServerInfo {
+            version: "KV 1".into(),
+            database: "db0".into(),
+            user: "default".into(),
+        })
+    }
+    async fn databases(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    async fn schemas(&self) -> Result<Vec<String>> {
+        Ok(vec!["db0".into(), "db1".into()])
+    }
+    async fn objects(&self, _: &str) -> Result<Vec<DbObject>> {
+        Ok(Vec::new())
+    }
+    async fn columns(&self, _: &str, _: &str) -> Result<Vec<ColumnInfo>> {
+        Ok(Vec::new())
+    }
+    async fn execute(&self, sql: &str, _: ExecLimits) -> Result<Vec<ResultSet>> {
+        self.saw(format!("execute {sql}"));
+        Ok(Vec::new())
+    }
+    async fn page(
+        &self,
+        schema: &str,
+        statement: &str,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<ResultSet>> {
+        self.saw(format!("page {schema} {statement} {offset} {limit}"));
+        let mut set = ResultSet {
+            columns: vec![column("member")],
+            ..ResultSet::default()
+        };
+        for n in offset..(offset + u64::from(limit) + 1).min(250) {
+            set.rows.push([Some(n.to_string().as_str())]);
+        }
+        Ok(vec![set])
+    }
+    async fn count(&self, schema: &str, statement: &str) -> Result<Option<u64>> {
+        self.saw(format!("count {schema} {statement}"));
+        Ok(Some(250))
+    }
+    async fn run_in(
+        &self,
+        schema: &str,
+        statements: &str,
+        _: ExecLimits,
+    ) -> Result<Vec<ResultSet>> {
+        self.saw(format!("run {schema} {statements}"));
+        Ok(Vec::new())
+    }
+    fn canceller(&self) -> Option<Box<dyn Canceller>> {
+        None
+    }
+    fn dialect(&self) -> &dyn Dialect {
+        &AnsiDialect
+    }
+    fn language(&self) -> violet_core::Language {
+        violet_core::Language::Redis
+    }
+    async fn close(&self) {}
+}
+
+#[test]
+fn drivers_that_are_not_sql_never_get_sql() {
+    let server = Arc::new(Server::default());
+    let registry = DriverRegistry::new().with(KeyValueDriver(Arc::clone(&server)));
+    let backend = Backend::with_registry(
+        registry,
+        Arc::new(OnDemand {
+            server: Arc::clone(&server),
+            installs: AtomicU64::new(0),
+        }),
+        Arc::new(MemorySecretStore::default()),
+        Arc::new(MemoryResultCache::default()),
+        || {},
+    )
+    .expect("runtime");
+    let mut profile = ConnectionProfile::new(DriverId::new("kv"), 1);
+    profile.save_password = false;
+    backend.connect(profile.clone(), None);
+    let h = Harness {
+        backend,
+        server,
+        profile,
+    };
+    h.wait(|event| matches!(event, Event::Connected { .. }));
+    let id = h.profile.id;
+
+    assert_eq!(h.backend.language(id), Some(violet_core::Language::Redis));
+    assert_eq!(h.backend.explain_sql(id, "GET k", false), None);
+    let browse = h
+        .backend
+        .browse_sql(id, "db1", "k", None, None, Some("set"))
+        .expect("browse");
+    assert_eq!(browse, "SMEMBERS k");
+
+    // A data view pages in its database, twice: once from the cache would
+    // be wrong, there is no change token to trust.
+    for _ in 0..2 {
+        let request = h.backend.execute_in(
+            id,
+            Some("db1".into()),
+            browse.clone(),
+            ExecOptions {
+                cache: CachePolicy::Use,
+                page: Some(Page::first()),
+            },
+        );
+        let Event::QueryFinished { result, .. } = h.wait(
+            |event| matches!(event, Event::QueryFinished { request: r, .. } if *r == request),
+        ) else {
+            unreachable!()
+        };
+        let output = result.expect("page");
+        let page = output.page.expect("paged");
+        assert!(page.has_more);
+        assert_eq!(output.sets[0].rows.len(), 200);
+    }
+    let request = h.backend.count(id, Some("db1".into()), browse.clone());
+    let counted =
+        h.wait(|event| matches!(event, Event::Counted { request: r, .. } if *r == request));
+    assert!(matches!(
+        counted,
+        Event::Counted {
+            result: Ok(250),
+            ..
+        }
+    ));
+    // The tree's commands run in their database; the editor's as typed.
+    let request = h.backend.execute_in(
+        id,
+        Some("db1".into()),
+        "UNLINK k".into(),
+        ExecOptions::WRITE,
+    );
+    h.wait(|event| matches!(event, Event::QueryFinished { request: r, .. } if *r == request));
+    let request = h.backend.execute(id, "GET k".into(), ExecOptions::WRITE);
+    h.wait(|event| matches!(event, Event::QueryFinished { request: r, .. } if *r == request));
+    h.backend.load_foreign_keys(id, "db1".into());
+    h.wait(|event| matches!(event, Event::ForeignKeys { result: Ok(keys), .. } if keys.is_empty()));
+
+    let seen = h.server.executed.lock().expect("lock").clone();
+    assert_eq!(
+        seen,
+        [
+            "page db1 SMEMBERS k 0 200",
+            "page db1 SMEMBERS k 0 200",
+            "count db1 SMEMBERS k",
+            "run db1 UNLINK k",
+            "execute GET k",
+        ]
+    );
 }

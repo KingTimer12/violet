@@ -182,7 +182,13 @@ pub trait Session: 'static {
 
     /// Rows `offset .. offset + limit` of a statement's first result, run in
     /// `schema`. Violet pages SQL itself.
-    fn page(&self, schema: &str, statement: &str, offset: u64, limit: usize) -> Result<Vec<ResultSet>> {
+    fn page(
+        &self,
+        schema: &str,
+        statement: &str,
+        offset: u64,
+        limit: usize,
+    ) -> Result<Vec<ResultSet>> {
         let _ = (schema, statement, offset, limit);
         Err(DbError::unsupported("Paging is not supported"))
     }
@@ -330,12 +336,12 @@ pub mod logging {
 /// The glue [`export_provider!`] expands to. Not a stable API.
 #[doc(hidden)]
 pub mod __private {
+    pub use crate::bindings::exports::violet::provider::data::Guest as DataGuest;
+    pub use crate::bindings::exports::violet::provider::provider::SessionBorrow;
     pub use crate::bindings::exports::violet::provider::provider::{
         Guest, GuestSession, Session as SessionHandle,
     };
     pub use crate::bindings::exports::violet::provider::tools::Guest as ToolsGuest;
-    pub use crate::bindings::exports::violet::provider::data::Guest as DataGuest;
-    pub use crate::bindings::exports::violet::provider::provider::SessionBorrow;
 
     use crate::{
         ColumnInfo, ConnectParams, DbError, DbObject, Provider, ProviderInfo, ResultSet,
