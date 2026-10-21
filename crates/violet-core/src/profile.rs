@@ -194,13 +194,16 @@ impl ConnectionProfile {
             self.name.clone()
         } else if self.is_file() {
             self.file_name().to_owned()
+        } else if self.username.trim().is_empty() {
+            format!("{}/{}", self.host, self.database)
         } else {
             format!("{}@{}/{}", self.username, self.host, self.database)
         }
     }
 
-    /// Checks the fields a connection cannot do without.
-    pub fn validate(&self) -> Result<(), String> {
+    /// Checks the fields a connection cannot do without; `user` says
+    /// whether the driver needs a user name.
+    pub fn validate(&self, user: crate::Login) -> Result<(), String> {
         if self.is_file() {
             let path = std::path::Path::new(self.host.trim());
             if self.host.trim().is_empty() {
@@ -217,7 +220,7 @@ impl ConnectionProfile {
         if self.port == 0 {
             return Err("Port must be between 1 and 65535".to_owned());
         }
-        if self.username.trim().is_empty() {
+        if user == crate::Login::Required && self.username.trim().is_empty() {
             return Err("User is required".to_owned());
         }
         Ok(())
@@ -239,17 +242,17 @@ mod tests {
         let mut profile = ConnectionProfile::new(DriverId::new("sqlite"), 0);
         assert!(profile.is_file());
         assert_eq!(
-            profile.validate(),
+            profile.validate(crate::Login::Required),
             Err("Database file is required".to_owned())
         );
         profile.host = "shop.db".to_owned();
         assert_eq!(
-            profile.validate(),
+            profile.validate(crate::Login::Required),
             Err("Database file must be a full path".to_owned())
         );
         let absolute = std::env::temp_dir().join("shop.db");
         profile.host = absolute.to_string_lossy().into_owned();
-        assert_eq!(profile.validate(), Ok(()));
+        assert_eq!(profile.validate(crate::Login::Required), Ok(()));
         assert_eq!(profile.file_name(), "shop.db");
         assert_eq!(profile.display_name(), "shop.db");
         assert_eq!(profile.address(), profile.host);
@@ -258,9 +261,14 @@ mod tests {
     #[test]
     fn validation_names_the_missing_field() {
         let mut profile = ConnectionProfile::new(DriverId::new("postgres"), 5432);
-        assert_eq!(profile.validate(), Err("User is required".to_owned()));
+        assert_eq!(
+            profile.validate(crate::Login::Required),
+            Err("User is required".to_owned())
+        );
+        assert_eq!(profile.validate(crate::Login::Optional), Ok(()));
+        assert_eq!(profile.display_name(), "localhost/");
         profile.username = "app".to_owned();
-        assert_eq!(profile.validate(), Ok(()));
+        assert_eq!(profile.validate(crate::Login::Required), Ok(()));
     }
 
     #[test]

@@ -1,4 +1,5 @@
-//! SQL scripts saved for a connection's database, as plain `.sql` files.
+//! Scripts saved for a connection's database, as plain `.sql` files (or
+//! `.redis` ones, for Redis connections).
 //!
 //! A script lives at `<root>/<connection id>/<database>/<name>.sql`: the
 //! folders say what it runs on, so nothing else has to be kept in step
@@ -15,8 +16,11 @@ use violet_core::{ConnectionId, Result};
 
 use crate::json::{open_private, storage_error};
 
-/// The extension scripts are saved with.
+/// The extension SQL scripts are saved with.
 pub const EXTENSION: &str = "sql";
+
+/// Every extension a saved script may have: SQL, and Redis commands.
+pub const EXTENSIONS: &[&str] = &[EXTENSION, "redis"];
 
 /// A script saved for a connection's database.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,13 +48,20 @@ impl ScriptStore {
         &self.root
     }
 
-    /// Where a script named `name` for `database` of `connection` goes.
+    /// Where a script named `name` for `database` of `connection` goes,
+    /// with `extension` (one of [`EXTENSIONS`]).
     #[must_use]
-    pub fn path_for(&self, connection: ConnectionId, database: &str, name: &str) -> PathBuf {
+    pub fn path_for(
+        &self,
+        connection: ConnectionId,
+        database: &str,
+        name: &str,
+        extension: &str,
+    ) -> PathBuf {
         self.root
             .join(connection.to_string())
             .join(encode(database))
-            .join(format!("{}.{EXTENSION}", encode(name)))
+            .join(format!("{}.{extension}", encode(name)))
     }
 
     /// The connection and database a file in the scripts folder belongs
@@ -62,7 +73,11 @@ impl ScriptStore {
         let connection = parts.next()?.to_str()?;
         let database = parts.next()?.to_str()?;
         let file = Path::new(parts.next()?);
-        if parts.next().is_some() || file.extension()? != EXTENSION {
+        if parts.next().is_some()
+            || !EXTENSIONS
+                .iter()
+                .any(|e| file.extension() == Some(e.as_ref()))
+        {
             return None;
         }
         Some(SavedScript {
@@ -231,15 +246,22 @@ mod tests {
         let dir = tempfile::tempdir().map_err(|error| storage_error(error.to_string()))?;
         let store = ScriptStore::new(dir.path());
         let connection = ConnectionId::new();
-        let path = store.path_for(connection, "app/prod", "Relatório: vendas");
+        let path = store.path_for(connection, "app/prod", "Relatório: vendas", EXTENSION);
         write(&path, "SELECT 1;")?;
-        write(&store.path_for(connection, "postgres", "a"), "SELECT 2;")?;
+        write(
+            &store.path_for(connection, "postgres", "a", EXTENSION),
+            "SELECT 2;",
+        )?;
+        write(
+            &store.path_for(connection, "db0", "keys", "redis"),
+            "KEYS *",
+        )?;
         // Files that are not scripts are left out.
         write(&dir.path().join("notes.txt"), "")?;
         write(&dir.path().join("not-an-id").join("db").join("x.sql"), "")?;
 
         let scripts = store.list()?;
-        assert_eq!(scripts.len(), 2);
+        assert_eq!(scripts.len(), 3);
         let script = scripts
             .iter()
             .find(|script| script.path == path)

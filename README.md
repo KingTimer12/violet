@@ -99,8 +99,49 @@ other programs using it first.
 
 Write a provider with [`violet-sdk`](crates/violet-sdk) (the guide walks
 through it), build it for `wasm32-wasip2`, and add it to the catalogue with
-`violet-provider package`. Violet itself does not change: the connection
-form, tree, editor and grid work as they are.
+`violet-provider package`. For a SQL database Violet itself does not
+change: the connection form, tree, editor and grid work as they are. A
+provider for another language exports the optional `data` interface (its
+language, whether a user and password are needed, and listing, paging and
+counting done by the provider); Violet knows each such language itself, so
+the editor can colour it and the history can hide its passwords. Such
+providers are indexed as API 0.2.0, which older Violets skip.
+
+## Redis
+
+The Redis provider also serves Valkey, KeyDB, Dragonfly and other servers
+that speak its protocol (tested with Redis 8, Valkey 8 and Dragonfly).
+
+- **Connecting**: user and password only when the server asks for them;
+  paste a connection string (`redis://`, `rediss://` for TLS,
+  `redis://:pass@host:6380/2`) in the form, or on the welcome screen. One
+  host, connected directly: Redis Cluster and Sentinel are not supported
+  yet.
+- **Tree**: databases `db0`, `db1`... each list their keys 500 at a time
+  with `SCAN` (never `KEYS`), matched by a glob such as `user:*`, with
+  **Load more keys…** for the rest. Each key shows its type's icon and size;
+  hovering shows type, size and TTL. A key's menu sets its TTL, renames it
+  (never over an existing key) or deletes it (`UNLINK`).
+- **Data**: clicking a key opens a grid shaped by its type: field and value
+  for a hash, member and score for a sorted set, index and value for a list,
+  id and fields for a stream. Hashes, sets and sorted sets are read a page
+  at a time with `HSCAN`/`SSCAN`/`ZSCAN` and filtered by a glob; lists by
+  index. Cells are edited in place and saved as commands inside
+  `MULTI`/`EXEC` (streams are read-only). Browsing runs on a second
+  connection, so the editor's `SELECT` or open `MULTI` never interferes.
+- **Editor**: one command per line, `redis-cli` quoting, coloured, with
+  completion of commands (with their syntax) and key names. Running the line
+  under the cursor runs its whole `MULTI` ... `EXEC` block. `FLUSHALL`,
+  `FLUSHDB`, `KEYS`, `CONFIG SET`, `SHUTDOWN` and the like ask first.
+  Commands that never answer (`SUBSCRIBE`, `MONITOR`, blocking pops with no
+  timeout) are refused. Passwords in `AUTH`, `HELLO`, `ACL SETUSER` and
+  `CONFIG SET requirepass` are hidden in the history. Scripts save as
+  `.redis`.
+- **Backup**: the connection's **Backup…** writes an `.rdb` of the whole
+  server with `valkey-cli --rdb` or `redis-cli --rdb` (password through
+  `REDISCLI_AUTH`). Violet downloads `valkey-cli` on Linux; on macOS install
+  it (`brew install valkey`), on Windows use a Redis or Memurai install, or
+  WSL. Managed services that refuse `SYNC` cannot be backed up this way.
 
 ## Code completion
 

@@ -82,7 +82,7 @@ async fn the_provider_describes_itself() {
     assert_eq!(info.id.as_str(), "mysql");
     assert_eq!(info.name, "MySQL");
     assert_eq!(info.default_port, 3306);
-    assert!(info.capabilities.schemas && !info.capabilities.databases);
+    assert!(info.capabilities.schemas && info.capabilities.databases);
     assert_eq!(
         (info.dialect.quote_open, info.dialect.quote_close),
         ('`', '`')

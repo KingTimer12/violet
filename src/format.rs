@@ -83,8 +83,9 @@ const UPPER: &[&str] = &[
 /// Why a script was not formatted.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Refused {
-    /// A MySQL string escapes a quote with a backslash, which the lexer
-    /// does not follow: what lies inside the string is not known.
+    /// A MySQL string, single or double quoted, holds a backslash, which
+    /// the lexer does not follow: what lies inside the string is not
+    /// known.
     Backslash,
     /// Formatting would change more than whitespace.
     Changed,
@@ -94,10 +95,12 @@ pub enum Refused {
 /// comment, as MySQL does.
 pub fn format(source: &str, mysql: bool) -> Result<String, Refused> {
     let tokens = significant(source, mysql);
+    // MySQL reads `"…"` as a string too, by default.
     if mysql
-        && tokens
-            .iter()
-            .any(|token| token.kind == TokenKind::String && token.text.contains('\\'))
+        && tokens.iter().any(|token| {
+            (token.kind == TokenKind::String || token.text.starts_with('"'))
+                && token.text.contains('\\')
+        })
     {
         return Err(Refused::Backslash);
     }
@@ -154,12 +157,10 @@ fn significant(source: &str, mysql: bool) -> Vec<Token<'_>> {
                 space = text;
                 continue;
             }
-            (TokenKind::Operator, "`") if mysql => {
-                let end = source[token.range.end..]
-                    .find('`')
-                    .map_or(source.len(), |at| token.range.end + at + 1);
-                (TokenKind::QuotedIdentifier, end)
-            }
+            (TokenKind::Operator, "`") if mysql => (
+                TokenKind::QuotedIdentifier,
+                backticked_end(source, token.range.end),
+            ),
             (TokenKind::Operator, "#") if mysql => {
                 let end = source[token.range.start..]
                     .find('\n')
@@ -181,21 +182,39 @@ fn significant(source: &str, mysql: bool) -> Vec<Token<'_>> {
     out
 }
 
+/// Where a backticked name that opens before `from` ends: past its
+/// closing backtick, a doubled one standing for a backtick inside.
+fn backticked_end(source: &str, mut from: usize) -> usize {
+    while let Some(at) = source[from..].find('`') {
+        let end = from + at + 1;
+        if !source[end..].starts_with('`') {
+            return end;
+        }
+        from = end + 1;
+    }
+    source.len()
+}
+
 /// Whether `formatted` reads as `source`: the same tokens, reserved words
-/// in any case.
+/// in any case. Quoted tokens next to each other keep whether they touch:
+/// `'a''b'` is one string, `'a' 'b'` two.
 fn same_tokens(source: &str, formatted: &str, mysql: bool) -> bool {
     let a = significant(source, mysql);
     let b = significant(formatted, mysql);
+    let quoted =
+        |token: &Token<'_>| matches!(token.kind, TokenKind::String | TokenKind::QuotedIdentifier);
     a.len() == b.len()
-        && a.iter().zip(&b).all(|(a, b)| {
-            a.kind == b.kind
-                && match a.kind {
+        && a.iter().zip(&b).enumerate().all(|(index, (x, y))| {
+            let touching = index > 0 && quoted(x) && quoted(&a[index - 1]);
+            x.kind == y.kind
+                && (!touching || x.glued == y.glued)
+                && match x.kind {
                     TokenKind::Keyword | TokenKind::Identifier => {
-                        a.text.eq_ignore_ascii_case(b.text)
+                        x.text.eq_ignore_ascii_case(y.text)
                     }
                     // A line comment loses the spaces that ended its line.
-                    TokenKind::Comment => a.text.trim_end() == b.text.trim_end(),
-                    _ => a.text == b.text,
+                    TokenKind::Comment => x.text.trim_end() == y.text.trim_end(),
+                    _ => x.text == y.text,
                 }
         })
 }
@@ -531,6 +550,15 @@ mod tests {
             Ok("SELECT\n    `order`,\n    @x\nFROM `my table` # note\nWHERE a = 1".to_owned())
         );
         assert_eq!(format("select 'it\\'s'", true), Err(Refused::Backslash));
+        assert_eq!(
+            format("select \"a\\\" , b\"", true),
+            Err(Refused::Backslash)
+        );
+        // A doubled backtick is one inside the name.
+        assert_eq!(
+            format("select `a``b` from t", true),
+            Ok("SELECT\n    `a``b`\nFROM t".to_owned())
+        );
     }
 
     #[test]

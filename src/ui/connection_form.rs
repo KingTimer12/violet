@@ -2,7 +2,8 @@
 
 use egui::{CornerRadius, RichText, Sense, Stroke, Vec2};
 use violet_app::RequestId;
-use violet_core::{ConnectionProfile, DriverInfo, Secret, ServerInfo, SslMode, is_loopback};
+use violet_core::uri::ParsedUri;
+use violet_core::{ConnectionProfile, DriverInfo, Login, Secret, ServerInfo, SslMode, is_loopback};
 use zeroize::Zeroize as _;
 
 use super::action::Action;
@@ -30,11 +31,14 @@ pub struct ConnectionForm {
     port: String,
     pub test: TestState,
     error: Option<String>,
+    /// A connection string being pasted.
+    uri: String,
 }
 
 impl Drop for ConnectionForm {
     fn drop(&mut self) {
         self.password.zeroize();
+        self.uri.zeroize();
     }
 }
 
@@ -96,7 +100,32 @@ impl ConnectionForm {
             show_password: false,
             test: TestState::Idle,
             error: None,
+            uri: String::new(),
         }
+    }
+
+    /// Fills the form from a connection string, for `driver`.
+    pub fn apply_uri(&mut self, parsed: ParsedUri, driver: &DriverInfo) {
+        self.profile.host = parsed.host;
+        self.port = parsed.port.unwrap_or(driver.default_port).to_string();
+        self.profile.database = if parsed.database.is_empty() {
+            driver.default_database.clone()
+        } else {
+            parsed.database
+        };
+        self.profile.username = parsed.username;
+        if let Some(ssl) = parsed.ssl {
+            self.profile.ssl = ssl;
+        }
+        if let Some(mut password) = parsed.password {
+            self.password.zeroize();
+            std::mem::swap(&mut self.password, &mut password);
+        }
+        if self.profile.name.trim().is_empty() {
+            self.profile.name = format!("{} · {}", driver.name, self.profile.host);
+        }
+        self.uri.zeroize();
+        self.error = None;
     }
 
     /// The password typed, if any. Empty means "keep the saved one".
@@ -105,7 +134,7 @@ impl ConnectionForm {
     }
 
     /// Checks the form and returns the profile it describes.
-    fn finish(&mut self) -> Option<ConnectionProfile> {
+    fn finish(&mut self, user: Login) -> Option<ConnectionProfile> {
         let Ok(port) = self.port.trim().parse::<u16>() else {
             self.error = Some("Port must be a number between 1 and 65535".to_owned());
             return None;
@@ -120,7 +149,7 @@ impl ConnectionForm {
             // Nothing to keep in the keychain for a file.
             profile.save_password = false;
         }
-        if let Err(message) = profile.validate() {
+        if let Err(message) = profile.validate(user) {
             self.error = Some(message);
             return None;
         }
@@ -144,6 +173,8 @@ pub fn show(
     let file_based = chosen.map_or(form.profile.is_file(), |driver| {
         driver.info.default_port == 0
     });
+    let user_login = chosen.map_or(Login::Required, |driver| driver.info.user);
+    let password_login = chosen.map_or(Login::Optional, |driver| driver.info.password);
     let palette = Palette::current(ctx);
     let mut open = true;
     let modal = egui::Modal::new(egui::Id::new("connection-form"))
@@ -212,6 +243,57 @@ pub fn show(
                 });
             }
 
+            if !file_based {
+                let mut fill = false;
+                widgets::field(ui, "Connection string", |ui| {
+                    ui.horizontal(|ui| {
+                        let width = ui.available_width() - 70.0;
+                        let masked = form.uri.contains('@');
+                        let response = ui.add_sized(
+                            [width, 30.0],
+                            widgets::text_input(
+                                &mut form.uri,
+                                "Paste one, e.g. rediss://user:pass@host:6380/0",
+                            )
+                            .password(masked),
+                        );
+                        fill |= response.lost_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                        fill |= widgets::button(ui, Tone::Secondary, Some(Icon::Link), "Fill")
+                            .clicked();
+                    })
+                    .response
+                });
+                if fill && !form.uri.trim().is_empty() {
+                    match violet_core::uri::parse(&form.uri) {
+                        Ok(parsed) => {
+                            match drivers.iter().find(|d| d.info.id.as_str() == parsed.driver) {
+                                Some(driver)
+                                    if form.editing && driver.info.id != form.profile.driver =>
+                                {
+                                    form.error = Some(format!(
+                                        "That string is for {}; this connection is {}",
+                                        driver.info.name,
+                                        chosen.map_or("another database", |c| c.info.name.as_str())
+                                    ));
+                                }
+                                Some(driver) => {
+                                    if driver.info.id != form.profile.driver {
+                                        form.switch_driver(chosen.map(|c| &c.info), &driver.info);
+                                    }
+                                    form.apply_uri(parsed, &driver.info);
+                                }
+                                None => {
+                                    form.error =
+                                        Some(format!("No {} provider is on offer", parsed.driver));
+                                }
+                            }
+                        }
+                        Err(message) => form.error = Some(message),
+                    }
+                }
+            }
+
             widgets::field(ui, "Name", |ui| {
                 ui.add(widgets::text_input(
                     &mut form.profile.name,
@@ -226,50 +308,87 @@ pub fn show(
                     widgets::field(&mut columns[0], "Host", |ui| {
                         ui.add(widgets::text_input(&mut form.profile.host, "localhost"))
                     });
+                    let port = chosen.map_or_else(
+                        || "5432".to_owned(),
+                        |driver| driver.info.default_port.to_string(),
+                    );
                     widgets::field(&mut columns[1], "Port", |ui| {
-                        ui.add(widgets::text_input(&mut form.port, "5432"))
+                        ui.add(widgets::text_input(&mut form.port, &port))
                     });
                 });
+                let database = chosen
+                    .map(|driver| driver.info.default_database.clone())
+                    .filter(|d| !d.is_empty())
+                    .unwrap_or_else(|| "postgres".to_owned());
+                let user = chosen
+                    .map(|driver| driver.info.default_user.clone())
+                    .filter(|u| !u.is_empty())
+                    .unwrap_or_else(|| {
+                        if user_login == Login::Required {
+                            "postgres".to_owned()
+                        } else {
+                            "default".to_owned()
+                        }
+                    });
+                let database_label = match chosen.map(|d| d.info.language) {
+                    Some(violet_core::Language::Redis) => "Database (0–15…)",
+                    _ => "Database",
+                };
                 ui.columns(2, |columns| {
-                    widgets::field(&mut columns[0], "Database", |ui| {
-                        ui.add(widgets::text_input(&mut form.profile.database, "postgres"))
+                    widgets::field(&mut columns[0], database_label, |ui| {
+                        ui.add(widgets::text_input(&mut form.profile.database, &database))
                     });
-                    widgets::field(&mut columns[1], "User", |ui| {
-                        ui.add(widgets::text_input(&mut form.profile.username, "postgres"))
-                    });
+                    if user_login != Login::None {
+                        let label = if user_login == Login::Optional {
+                            "User (optional)"
+                        } else {
+                            "User"
+                        };
+                        widgets::field(&mut columns[1], label, |ui| {
+                            ui.add(widgets::text_input(&mut form.profile.username, &user))
+                        });
+                    }
                 });
 
-                widgets::field(ui, "Password", |ui| {
+                let password_label =
+                    if password_login == Login::Optional && user_login != Login::Required {
+                        "Password (only if the server asks for one)"
+                    } else {
+                        "Password"
+                    };
+                if password_login != Login::None {
+                    widgets::field(ui, password_label, |ui| {
+                        ui.horizontal(|ui| {
+                            let hint = if form.has_saved_password {
+                                "Saved in keychain — type to replace"
+                            } else {
+                                "Password"
+                            };
+                            let width = ui.available_width() - 36.0;
+                            ui.add_sized(
+                                [width, 30.0],
+                                widgets::text_input(&mut form.password, hint)
+                                    .password(!form.show_password),
+                            );
+                            let (icon, tip) = if form.show_password {
+                                (Icon::EyeOff, "Hide")
+                            } else {
+                                (Icon::Eye, "Show")
+                            };
+                            if widgets::icon_button(ui, icon, tip).clicked() {
+                                form.show_password = !form.show_password;
+                            }
+                        })
+                        .response
+                    });
                     ui.horizontal(|ui| {
-                        let hint = if form.has_saved_password {
-                            "Saved in keychain — type to replace"
-                        } else {
-                            "Password"
-                        };
-                        let width = ui.available_width() - 36.0;
-                        ui.add_sized(
-                            [width, 30.0],
-                            widgets::text_input(&mut form.password, hint)
-                                .password(!form.show_password),
+                        widgets::checkbox(
+                            ui,
+                            &mut form.profile.save_password,
+                            "Save password in the system keychain",
                         );
-                        let (icon, tip) = if form.show_password {
-                            (Icon::EyeOff, "Hide")
-                        } else {
-                            (Icon::Eye, "Show")
-                        };
-                        if widgets::icon_button(ui, icon, tip).clicked() {
-                            form.show_password = !form.show_password;
-                        }
-                    })
-                    .response
-                });
-                ui.horizontal(|ui| {
-                    widgets::checkbox(
-                        ui,
-                        &mut form.profile.save_password,
-                        "Save password in the system keychain",
-                    );
-                });
+                    });
+                }
             }
             if chosen.is_some_and(|driver| driver.info.capabilities.databases) {
                 ui.horizontal(|ui| {
@@ -383,7 +502,7 @@ pub fn show(
                     })
                     .inner
                     .clicked()
-                    && let Some(profile) = form.finish()
+                    && let Some(profile) = form.finish(user_login)
                 {
                     actions.push(Action::TestProfile {
                         profile,
@@ -393,7 +512,7 @@ pub fn show(
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if widgets::button(ui, Tone::Primary, Some(Icon::Plug), "Save & connect")
                         .clicked()
-                        && let Some(profile) = form.finish()
+                        && let Some(profile) = form.finish(user_login)
                     {
                         actions.push(Action::SaveProfile {
                             profile,
@@ -403,7 +522,7 @@ pub fn show(
                         open = false;
                     }
                     if widgets::button(ui, Tone::Secondary, None, "Save").clicked()
-                        && let Some(profile) = form.finish()
+                        && let Some(profile) = form.finish(user_login)
                     {
                         actions.push(Action::SaveProfile {
                             profile,

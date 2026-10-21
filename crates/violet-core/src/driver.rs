@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::{ColumnInfo, DbObject, ServerInfo};
+use crate::catalog::{ColumnInfo, DbObject, EntryPage, ServerInfo};
 use crate::error::Result;
 use crate::profile::{ConnectionProfile, Credentials, DriverId};
 use crate::query::{ExecLimits, ResultSet};
@@ -35,6 +35,46 @@ pub struct DriverInfo {
     pub capabilities: Capabilities,
     /// The SQL Violet generates for it.
     pub dialect: SqlDialect,
+    /// What its statements are written in.
+    #[serde(default)]
+    pub language: Language,
+    /// Whether the connection form asks for a user and a password.
+    #[serde(default)]
+    pub user: Login,
+    #[serde(default = "Login::optional")]
+    pub password: Login,
+    /// What the tree calls schemas, such as `Databases`; empty for the
+    /// default.
+    #[serde(default)]
+    pub schema_label: String,
+}
+
+/// The language a driver's statements are written in. Violet generates
+/// SQL only for [`Language::Sql`]; other drivers page and count themselves.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Language {
+    #[default]
+    Sql,
+    Redis,
+    Mongodb,
+}
+
+/// Whether the connection form asks for, and demands, a value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Login {
+    #[default]
+    Required,
+    Optional,
+    None,
+}
+
+impl Login {
+    #[must_use]
+    pub const fn optional() -> Self {
+        Self::Optional
+    }
 }
 
 /// Opens sessions to one kind of database.
@@ -107,6 +147,60 @@ pub trait Session: Send + Sync + 'static {
     }
 
     fn dialect(&self) -> &dyn Dialect;
+
+    /// What its statements are written in.
+    fn language(&self) -> Language {
+        Language::Sql
+    }
+
+    /// Objects in `schema` matching the glob `pattern`, a page at a time.
+    /// Only drivers that are not SQL list them this way.
+    async fn entries(
+        &self,
+        schema: &str,
+        pattern: Option<&str>,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<EntryPage> {
+        let _ = (schema, pattern, cursor, limit);
+        Err(crate::DbError::unsupported(
+            "Listing entries is not supported",
+        ))
+    }
+
+    /// Rows `offset .. offset + limit` of a statement's first result, run in
+    /// `schema`. Violet pages SQL itself, with [`Dialect::paged`].
+    async fn page(
+        &self,
+        schema: &str,
+        statement: &str,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<ResultSet>> {
+        let _ = (schema, statement, offset, limit);
+        Err(crate::DbError::unsupported("Paging is not supported"))
+    }
+
+    /// The rows a statement returns, `None` when it cannot tell. Violet
+    /// counts SQL itself, with [`Dialect::count`].
+    async fn count(&self, schema: &str, statement: &str) -> Result<Option<u64>> {
+        let _ = (schema, statement);
+        Err(crate::DbError::unsupported("Counting is not supported"))
+    }
+
+    /// Runs statements in `schema` as [`Session::execute`] does, leaving
+    /// the state the editor set alone. Only drivers that are not SQL do.
+    async fn run_in(
+        &self,
+        schema: &str,
+        statements: &str,
+        limits: ExecLimits,
+    ) -> Result<Vec<ResultSet>> {
+        let _ = (schema, statements, limits);
+        Err(crate::DbError::unsupported(
+            "Running in a schema is not supported",
+        ))
+    }
 
     async fn close(&self);
 }

@@ -69,6 +69,7 @@ jobs:
             providers/postgres -> target
             providers/mysql -> target
             providers/sqlite -> target
+            providers/redis -> target
 
       # SQLite is C: the WASI SDK's clang builds it for wasm32-wasip2.
       # Pinned by digest, like the actions.

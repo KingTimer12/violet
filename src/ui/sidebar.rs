@@ -2,13 +2,16 @@
 //! columns, loaded as they are expanded.
 
 use egui::{Align2, Color32, CornerRadius, Response, Sense, Ui, Vec2};
-use violet_core::{ConnectionId, ConnectionProfile, DbObject, ObjectKind, ObjectRef, TaskKind};
+use violet_core::{
+    ConnectionId, ConnectionProfile, DbObject, Language, ObjectKind, ObjectRef, TaskKind,
+};
 use violet_storage::SavedScript;
 
 use super::action::Action;
 use super::catalog_flow;
 use super::definition_flow::Family;
 use super::icons::Icon;
+use super::key_flow::KeyOp;
 use super::state::{Explorer, Folder, FolderItem, Link, Loadable, NodeKey, TreeFilter};
 use super::theme::{self, Palette};
 use super::widgets;
@@ -242,6 +245,7 @@ fn connection(
     let palette = Palette::current(ui.ctx());
     let id = profile.id;
     let family = Family::of(profile.driver.as_str());
+    let language = explorer.language(profile.driver.as_str());
     let key = NodeKey::Connection(id);
     let link = explorer.link(id).clone();
     let expanded = explorer.is_expanded(&key) && link.is_online();
@@ -293,7 +297,7 @@ fn connection(
     }
     response.context_menu(|ui| {
         if link.is_online() {
-            if menu_item(ui, Icon::Terminal, "New SQL editor") {
+            if menu_item(ui, Icon::Terminal, crate::lang::editor_name(language)) {
                 actions.push(Action::OpenEditor {
                     connection: Some(id),
                     sql: String::new(),
@@ -302,7 +306,7 @@ fn connection(
             if menu_item(ui, Icon::Refresh, "Refresh") {
                 actions.push(Action::Refresh(id));
             }
-            if profile.show_all_databases {
+            if language == Language::Redis || profile.show_all_databases {
                 if menu_item(ui, Icon::Funnel, "Choose databases…") {
                     actions.push(Action::ChooseDatabases(id));
                 }
@@ -333,7 +337,9 @@ fn connection(
                 objects: Vec::new(),
             });
         }
-        if menu_item(ui, Icon::ArchiveRestore, "Restore…") {
+        // Redis restores an RDB file on the server's side, not over a
+        // connection.
+        if language != Language::Redis && menu_item(ui, Icon::ArchiveRestore, "Restore…") {
             actions.push(Action::OpenTask {
                 connection: id,
                 kind: TaskKind::Restore,
@@ -361,6 +367,18 @@ fn connection(
         .collect();
     if !scripts.is_empty() {
         scripts_node(ui, profile, &scripts, explorer, actions);
+    }
+    if language == Language::Redis {
+        match explorer.schemas.get(&id).cloned().unwrap_or_default() {
+            Loadable::Idle | Loadable::Loading => loading_row(ui, 1),
+            Loadable::Failed(error) => error_row(ui, 1, &error),
+            Loadable::Ready(databases) => {
+                for database in picked_databases(explorer, id, &databases) {
+                    keyspace_node(ui, id, database, explorer, actions);
+                }
+            }
+        }
+        return;
     }
     // Every database on the server, when the connection lists them; else
     // its own database's schemas straight away.
@@ -403,6 +421,25 @@ fn connection(
         return;
     }
     folders(ui, id, family, 1, explorer, actions);
+}
+
+/// The databases of a connection the user picked to see, all when none
+/// were. The connection's own is always among them.
+fn picked_databases<'a>(
+    explorer: &Explorer,
+    id: ConnectionId,
+    all: &'a [String],
+) -> Vec<&'a String> {
+    let picked = explorer.database_filters.get(&Explorer::database_scope(id));
+    let own = match explorer.link(id) {
+        Link::Online(server) => Some(server.database.as_str()),
+        _ => None,
+    };
+    all.iter()
+        .filter(|name| {
+            picked.is_none_or(|picked| picked.contains(*name)) || own == Some(name.as_str())
+        })
+        .collect()
 }
 
 /// The scripts saved for a connection, each opening on its database.
@@ -676,6 +713,14 @@ fn database_node(
             ));
         }
         ui.separator();
+        if family == Family::Postgres && menu_item(ui, Icon::Pencil, "Rename…  (F2)") {
+            actions.push(Action::AskRename(
+                super::rename_flow::RenameTarget::Database {
+                    connection: parent,
+                    name: database.to_owned(),
+                },
+            ));
+        }
         if menu_item(ui, Icon::Copy, "Copy name") {
             actions.push(Action::Copy(database.to_owned()));
         }
@@ -864,6 +909,14 @@ fn schema_node(
         if menu_item(ui, Icon::Refresh, "Refresh") {
             actions.push(Action::LoadObjects(id, schema.to_owned()));
         }
+        if menu_item(ui, Icon::Pencil, "Rename…  (F2)") {
+            actions.push(Action::AskRename(
+                super::rename_flow::RenameTarget::Schema {
+                    connection: id,
+                    name: schema.to_owned(),
+                },
+            ));
+        }
         if menu_item(ui, Icon::Copy, "Copy name") {
             actions.push(Action::Copy(schema.to_owned()));
         }
@@ -1024,6 +1077,7 @@ fn object_node(
                 connection: id,
                 schema: object.schema.clone(),
                 relation: object.name.clone(),
+                subtype: None,
             });
         } else if object.kind == ObjectKind::Function {
             actions.push(Action::OpenDefinition {
@@ -1041,6 +1095,7 @@ fn object_node(
                     connection: id,
                     schema: object.schema.clone(),
                     relation: object.name.clone(),
+                    subtype: None,
                 });
             }
             if menu_item(ui, Icon::Terminal, "New SQL editor") {
@@ -1075,6 +1130,15 @@ fn object_node(
                 quote(&object.schema),
                 quote(&object.name)
             )));
+        }
+        if menu_item(ui, Icon::Pencil, "Rename…  (F2)") {
+            actions.push(Action::AskRename(
+                super::rename_flow::RenameTarget::Relation {
+                    connection: id,
+                    schema: object.schema.clone(),
+                    name: object.name.clone(),
+                },
+            ));
         }
         if relation {
             ui.separator();
@@ -1132,6 +1196,213 @@ fn object_node(
             }
         }
     }
+}
+
+/// Keys listed per page in the tree; more come on demand.
+fn keyspace_node(
+    ui: &mut Ui,
+    id: ConnectionId,
+    schema: &str,
+    explorer: &mut Explorer,
+    actions: &mut Vec<Action>,
+) {
+    let palette = Palette::current(ui.ctx());
+    let key = NodeKey::Schema(id, schema.to_owned());
+    let expanded = explorer.is_expanded(&key);
+    let entry = (id, schema.to_owned());
+    let keys = explorer.keys.get(&entry).cloned().unwrap_or_default();
+    let own = matches!(explorer.link(id), Link::Online(server) if server.database == schema);
+    let detail = keys.listed.then(|| {
+        format!(
+            "{}{}",
+            keys.list.len(),
+            if keys.next.is_some() { "+" } else { "" }
+        )
+    });
+    let mut row = Row::new(1, Icon::Database, schema);
+    row.expanded = Some(expanded);
+    row.selected = explorer.selected.as_ref() == Some(&key);
+    row.loading = keys.loading && !keys.listed;
+    row.strong = own;
+    row.detail = detail.as_deref();
+    let response = row.show(ui);
+    let response = if own {
+        response.on_hover_text("The editor's database")
+    } else {
+        response
+    };
+    if response.clicked() {
+        explorer.pick(key.clone());
+        if explorer.toggle(key.clone()) && !keys.listed && !keys.loading {
+            actions.push(Action::LoadKeys(id, schema.to_owned(), false));
+        }
+    }
+    response.context_menu(|ui| {
+        if menu_item(ui, Icon::Terminal, "New Redis editor") {
+            let select = violet_lang::redis::actions::select(schema).unwrap_or_default();
+            actions.push(Action::OpenEditor {
+                connection: Some(id),
+                sql: format!(
+                    "{select}
+
+"
+                ),
+            });
+        }
+        if menu_item(ui, Icon::Refresh, "Refresh") {
+            actions.push(Action::LoadKeys(id, schema.to_owned(), false));
+        }
+        if menu_item(ui, Icon::Copy, "Copy name") {
+            actions.push(Action::Copy(schema.to_owned()));
+        }
+    });
+    if !expanded {
+        return;
+    }
+
+    // The glob the server matches keys with, such as `user:*`.
+    ui.horizontal(|ui| {
+        ui.add_space(6.0 + 2.0 * INDENT + 16.0);
+        let width = ui.available_width() - 14.0;
+        let entry = explorer.keys.entry((id, schema.to_owned())).or_default();
+        let applied = entry.applied.clone();
+        egui::Frame::new()
+            .fill(palette.surface)
+            .stroke(egui::Stroke::new(1.0, palette.outline))
+            .corner_radius(CornerRadius::same(6))
+            .inner_margin(egui::Margin::symmetric(6, 0))
+            .show(ui, |ui| {
+                ui.set_width(width - 12.0);
+                ui.horizontal(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+                    let active = !applied.is_empty() && applied != "*";
+                    widgets::paint_icon(
+                        ui,
+                        Icon::Funnel,
+                        rect,
+                        if active { palette.accent } else { palette.dim },
+                    );
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut entry.pattern)
+                            .id_salt(("key-pattern", id.0, schema))
+                            .hint_text("Match keys, e.g. user:*")
+                            .font(theme::mono(12.0))
+                            .frame(egui::Frame::NONE)
+                            .margin(egui::vec2(2.0, 4.0))
+                            .desired_width(f32::INFINITY),
+                    );
+                    if response.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                    {
+                        actions.push(Action::LoadKeys(id, schema.to_owned(), false));
+                    }
+                    if entry.glob() != applied && !applied.is_empty() {
+                        response.on_hover_text("Press Enter to list the keys matching it");
+                    }
+                });
+            });
+    });
+
+    if let Some(error) = &keys.error {
+        error_row(ui, 2, error);
+    }
+    if !keys.listed {
+        if keys.loading {
+            loading_row(ui, 2);
+        }
+        return;
+    }
+    let filter = explorer.filter.trim().to_lowercase();
+    let mut shown = 0;
+    for object in keys.list.iter() {
+        if !filter.is_empty() && !matches_filter(&object.name, &filter) {
+            continue;
+        }
+        shown += 1;
+        key_node(ui, id, object, explorer, actions);
+    }
+    if shown == 0 && !keys.loading {
+        let mut row = Row::new(2, Icon::Info, "No keys match");
+        row.icon_tint = Some(palette.dim);
+        row.show(ui);
+    }
+    if keys.next.is_some() || keys.loading {
+        let mut row = Row::new(2, Icon::ChevronsDown, "Load more keys…");
+        row.icon_tint = Some(palette.accent);
+        row.loading = keys.loading;
+        if row.show(ui).clicked() && !keys.loading {
+            actions.push(Action::LoadKeys(id, schema.to_owned(), true));
+        }
+    }
+}
+
+/// A key: its type's icon, its size, and on hover its type, size and TTL.
+fn key_node(
+    ui: &mut Ui,
+    id: ConnectionId,
+    object: &DbObject,
+    explorer: &mut Explorer,
+    actions: &mut Vec<Action>,
+) {
+    let key = NodeKey::Object(id, object.schema.clone(), object.name.clone());
+    let detail = object.estimated_rows.map(compact_count);
+    let mut row = Row::new(
+        2,
+        Icon::for_subtype(object.subtype.as_deref()),
+        &object.name,
+    );
+    row.selected = explorer.selected.as_ref() == Some(&key);
+    row.detail = detail.as_deref();
+    let mut response = row.show(ui);
+    if let Some(detail) = &object.detail {
+        response = response.on_hover_text(detail);
+    }
+    let open = || Action::OpenData {
+        connection: id,
+        schema: object.schema.clone(),
+        relation: object.name.clone(),
+        subtype: object.subtype.clone(),
+    };
+    if response.clicked() {
+        explorer.pick(key);
+        actions.push(open());
+    }
+    let dialog = |op| Action::KeyDialog {
+        connection: id,
+        schema: object.schema.clone(),
+        key: object.name.clone(),
+        op,
+    };
+    response.context_menu(|ui| {
+        if menu_item(ui, Icon::Rows, "View data") {
+            actions.push(open());
+        }
+        if menu_item(ui, Icon::Terminal, "New Redis editor") {
+            let select = violet_lang::redis::actions::select(&object.schema).unwrap_or_default();
+            let read = violet_lang::redis::browse(object.subtype.as_deref(), &object.name, None);
+            actions.push(Action::OpenEditor {
+                connection: Some(id),
+                sql: format!(
+                    "{select}
+{read}
+"
+                ),
+            });
+        }
+        if menu_item(ui, Icon::Copy, "Copy name") {
+            actions.push(Action::Copy(object.name.clone()));
+        }
+        ui.separator();
+        if menu_item(ui, Icon::Clock, "Set TTL…") {
+            actions.push(dialog(KeyOp::Ttl));
+        }
+        if menu_item(ui, Icon::Pencil, "Rename…") {
+            actions.push(dialog(KeyOp::Rename));
+        }
+        if menu_item(ui, Icon::Trash, "Delete…") {
+            actions.push(dialog(KeyOp::Delete));
+        }
+    });
 }
 
 fn loading_row(ui: &mut Ui, depth: usize) {

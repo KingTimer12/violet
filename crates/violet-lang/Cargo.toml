@@ -1,0 +1,12 @@
+[package]
+name = "violet-lang"
+description = "The statement languages Violet speaks besides SQL, shared by the app and its providers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

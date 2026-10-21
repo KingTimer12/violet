@@ -64,6 +64,13 @@ fastframe_icons::icons! {
         FolderOpen => "folder-open",
         Save => "save",
         ShieldAlert => "shield-alert",
+        Text => "type",
+        List => "list",
+        ListOrdered => "list-ordered",
+        Shapes => "shapes",
+        Activity => "activity",
+        Code => "code",
+        Link => "link",
         Keyboard => "keyboard",
         PostgreSql => "postgresql",
         MySql => "mysql",
@@ -73,6 +80,20 @@ fastframe_icons::icons! {
 }
 
 impl Icon {
+    /// A key-value store's key, by its type.
+    pub fn for_subtype(subtype: Option<&str>) -> Self {
+        match subtype {
+            Some("string") => Self::Text,
+            Some("hash") => Self::Function,
+            Some("list") => Self::List,
+            Some("set") => Self::Shapes,
+            Some("zset") => Self::ListOrdered,
+            Some("stream") => Self::Activity,
+            Some("json") => Self::Code,
+            _ => Self::Key,
+        }
+    }
+
     /// The logo of the database a driver serves; a plain database for
     /// those without one.
     pub fn for_driver(id: &str) -> Self {
@@ -99,6 +120,7 @@ impl Icon {
             ObjectKind::ForeignTable => Self::ForeignTable,
             ObjectKind::Function => Self::Function,
             ObjectKind::Sequence => Self::Sequence,
+            ObjectKind::Key => Self::Key,
         }
     }
 }

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use egui::text::{CCursor, CCursorRange, LayoutJob};
 use egui::{CornerRadius, Id, Key, Modifiers, Sense, Stroke, TextFormat, Ui, Vec2};
-use violet_core::ConnectionId;
+use violet_core::{ConnectionId, DbObject, Language};
 
 use super::action::Action;
 use super::icons::Icon;
@@ -27,16 +27,27 @@ const GUTTER: f32 = 46.0;
 pub struct Highlighter {
     /// The job holds the text it was made from: comparing against it is a
     /// `memcmp`, far cheaper than hashing the whole buffer every frame.
-    job: Option<(LayoutJob, bool, Option<usize>)>,
+    job: Option<(LayoutJob, bool, Option<usize>, Language)>,
 }
 
 impl Highlighter {
-    fn job(&mut self, text: &str, palette: &Palette, error_at: Option<usize>) -> LayoutJob {
-        let fresh = self.job.as_ref().is_some_and(|(job, dark, at)| {
-            *dark == palette.dark && *at == error_at && job.text == text
+    fn job(
+        &mut self,
+        text: &str,
+        palette: &Palette,
+        error_at: Option<usize>,
+        language: Language,
+    ) -> LayoutJob {
+        let fresh = self.job.as_ref().is_some_and(|(job, dark, at, lang)| {
+            *dark == palette.dark && *at == error_at && *lang == language && job.text == text
         });
         if !fresh {
-            self.job = Some((highlight(text, palette, error_at), palette.dark, error_at));
+            self.job = Some((
+                highlight(text, palette, error_at, language),
+                palette.dark,
+                error_at,
+                language,
+            ));
         }
         self.job
             .as_ref()
@@ -46,8 +57,8 @@ impl Highlighter {
 }
 
 /// `text` coloured as the editor colours it, for previews.
-pub fn highlighted(text: &str, palette: &Palette) -> LayoutJob {
-    highlight(text, palette, None)
+pub fn highlighted(text: &str, palette: &Palette, language: Language) -> LayoutJob {
+    highlight(text, palette, None, language)
 }
 
 /// Moves `tab`'s editor cursor to `char_index`, and focuses it.
@@ -59,6 +70,24 @@ pub fn place_cursor(ctx: &egui::Context, tab: u64, char_index: usize) {
         .set_char_range(Some(CCursorRange::one(CCursor::new(char_index))));
     state.store(ctx, text_id);
     ctx.memory_mut(|memory| memory.request_focus(text_id));
+}
+
+/// Redis tokens as the SQL colours name them.
+fn redis_tokens(text: &str) -> impl Iterator<Item = sql::Token> {
+    use violet_lang::redis::TokenKind as Redis;
+    violet_lang::redis::tokens(text)
+        .into_iter()
+        .map(|token| sql::Token {
+            kind: match token.kind {
+                Redis::Command => TokenKind::Keyword,
+                Redis::Unknown | Redis::Argument => TokenKind::Identifier,
+                Redis::String => TokenKind::String,
+                Redis::Number => TokenKind::Number,
+                Redis::Comment => TokenKind::Comment,
+                Redis::Whitespace => TokenKind::Whitespace,
+            },
+            range: token.range,
+        })
 }
 
 /// Replaces `tab`'s editor text and selects the byte range `selection`
@@ -259,11 +288,20 @@ fn find_bar(ui: &mut Ui, tab: u64, bar: &mut FindBar, count: usize) -> FindStep 
 }
 
 #[hotpath::measure]
-fn highlight(text: &str, palette: &Palette, error_at: Option<usize>) -> LayoutJob {
+fn highlight(
+    text: &str,
+    palette: &Palette,
+    error_at: Option<usize>,
+    language: Language,
+) -> LayoutJob {
     let syntax = palette.syntax;
     let font = theme::mono(FONT_SIZE);
     let mut job = LayoutJob::default();
-    for token in sql::tokens(text) {
+    let tokens: Box<dyn Iterator<Item = sql::Token>> = match language {
+        Language::Redis => Box::new(redis_tokens(text)),
+        Language::Sql | Language::Mongodb => Box::new(sql::tokens(text)),
+    };
+    for token in tokens {
         let color = match token.kind {
             TokenKind::Keyword => syntax.keyword,
             TokenKind::Type => syntax.kind,
@@ -337,8 +375,12 @@ impl Popup {
 /// What completion knows about the editor's connection.
 pub struct Assist<'a> {
     pub connection: Option<ConnectionId>,
+    pub language: Language,
     pub catalog: &'a dyn Catalog,
     pub options: completion::Options<'a>,
+    /// For a key-value store: the database the editor is on, and its keys
+    /// listed so far.
+    pub keys: Option<(&'a str, Option<&'a [DbObject]>)>,
 }
 
 const ROW_HEIGHT: f32 = 24.0;
@@ -510,7 +552,7 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
         .is_some_and(|(area, pointer)| area.contains(pointer));
 
     let mut layouter = |ui: &Ui, buffer: &dyn egui::TextBuffer, wrap: f32| -> Arc<egui::Galley> {
-        let mut job = highlighter.job(buffer.as_str(), &palette, error_at);
+        let mut job = highlighter.job(buffer.as_str(), &palette, error_at, assist.language);
         job.wrap.max_width = wrap;
         ui.painter().layout_job(job)
     };
@@ -550,11 +592,19 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
                         bottom: 12,
                     })
                     .hint_text(
-                        egui::RichText::new(format!(
-                            "-- Write SQL here. {} runs the statement under the cursor, ⌃Space completes.",
-                            ui.ctx()
-                                .format_shortcut(&shortcuts::get(Command::RunStatement))
-                        ))
+                        egui::RichText::new({
+                            let run = ui
+                                .ctx()
+                                .format_shortcut(&shortcuts::get(Command::RunStatement));
+                            match assist.language {
+                                Language::Redis => format!(
+                                    "# Write Redis commands here, one per line. {run} runs the one under the cursor (a MULTI … EXEC block whole), ⌃Space completes."
+                                ),
+                                _ => format!(
+                                    "-- Write SQL here. {run} runs the statement under the cursor, ⌃Space completes."
+                                ),
+                            }
+                        })
                         .font(theme::mono(FONT_SIZE))
                         .color(palette.dim),
                     )
@@ -574,6 +624,7 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
                     output.response.changed(),
                     summoned,
                     output.response.has_focus() || over_list || accept.is_some(),
+                    assist.language,
                 );
                 if popup.open {
                     refresh(popup, sql, selection.start, assist, actions);
@@ -708,6 +759,7 @@ fn follow(
     changed: bool,
     summoned: bool,
     focused: bool,
+    language: Language,
 ) {
     let cursor = selection.start;
     if !focused || !selection.is_empty() {
@@ -717,7 +769,14 @@ fn follow(
     if changed {
         // Typing a name or a dot opens it, anything else closes it.
         let typed = sql[..cursor.min(sql.len())].chars().next_back();
-        if typed.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+        // Redis keys go on through `:` and `-`, as in `user:1`.
+        let word = |c: char| {
+            c.is_alphanumeric()
+                || c == '_'
+                || c == '.'
+                || (language == Language::Redis && matches!(c, ':' | '-'))
+        };
+        if typed.is_some_and(word) {
             popup.open = true;
             popup.completion = None;
         } else {
@@ -750,8 +809,14 @@ fn refresh(
     }
     let fresh = popup.completion.is_none() || popup.cursor != cursor;
     popup.cursor = cursor;
-    let Some(completion) = completion::complete(sql, cursor, assist.catalog, &assist.options)
-    else {
+    let completed = match (assist.language, assist.keys) {
+        (Language::Redis, Some((schema, keys))) => {
+            completion::complete_redis(sql, cursor, Some(schema), keys)
+        }
+        (Language::Redis, None) => completion::complete_redis(sql, cursor, None, None),
+        _ => completion::complete(sql, cursor, assist.catalog, &assist.options),
+    };
+    let Some(completion) = completed else {
         popup.close();
         return;
     };
@@ -806,6 +871,7 @@ fn kind_style(kind: Kind, palette: &Palette) -> (Icon, egui::Color32) {
         Kind::Function => (Icon::Function, syntax.parameter),
         Kind::Keyword => (Icon::Zap, syntax.keyword),
         Kind::Type => (Icon::Sequence, syntax.kind),
+        Kind::Key => (Icon::Key, palette.accent),
     }
 }
 
