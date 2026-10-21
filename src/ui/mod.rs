@@ -4,6 +4,7 @@
 
 mod action;
 mod catalog_flow;
+mod cells;
 mod chrome;
 mod connection_form;
 mod copy_flow;
@@ -116,7 +117,7 @@ pub struct VioletApp {
     run_review: Option<edit_flow::RunReview>,
     /// Grid changes being written.
     applying: HashMap<violet_app::RequestId, edit_flow::Applying>,
-    /// The row the selected foreign key cell points at.
+    /// The rows the foreign keys followed from a tab's grid point at.
     reference: Option<reference::Reference>,
     /// Exports waiting for every row to be read.
     exports: HashMap<violet_app::RequestId, export_flow::PendingExport>,
@@ -684,7 +685,7 @@ impl VioletApp {
                     return;
                 }
                 if self.awaits_reference(request) {
-                    self.reference_finished(result);
+                    self.reference_finished(request, result);
                     return;
                 }
                 let Some(tab) = self.workspace.by_request(request) else {
@@ -1749,12 +1750,12 @@ impl VioletApp {
             }
             Action::AdvancedCopy(tab_id) => self.open_copy_dialog(tab_id),
             Action::RememberCopy(format, headers) => self.copy_choice = (format, headers),
-            Action::CloseReference(tab_id) => {
-                if let Some(tab) = self.workspace.get_mut(tab_id) {
-                    tab.grid_selection.clear();
-                }
-                self.reference = None;
+            Action::FollowKey(tab_id, row, column) => self.follow_key(tab_id, row, column),
+            Action::FollowNestedKey(tab_id, depth, row, column) => {
+                self.follow_nested_key(tab_id, depth, row, column);
             }
+            Action::BackToReference(tab_id, depth) => self.back_to_reference(tab_id, depth),
+            Action::CloseReference => self.reference = None,
             Action::Copy(text) => {
                 ctx.copy_text(text);
                 self.toasts.push(ctx, Toast::success("Copied to clipboard"));
@@ -1916,7 +1917,7 @@ impl VioletApp {
         let profiles = &*connections(&self.profiles, &self.explorer);
         let explorer = &self.explorer;
         let actions = &mut self.actions;
-        let reference = self.reference.as_mut().filter(|r| r.tab == active);
+        let reference = self.reference.as_ref().filter(|r| r.tab == active);
         let Some(tab) = self.workspace.tabs.iter_mut().find(|tab| tab.id == active) else {
             return;
         };
@@ -1937,22 +1938,6 @@ impl VioletApp {
                 chrome::toolbar(ui, tab, profiles, explorer, actions)
             });
 
-        if let Some(reference) = reference {
-            Panel::right("reference")
-                .resizable(true)
-                .default_size(320.0)
-                .size_range(240.0..=600.0)
-                .frame(
-                    Frame::NONE
-                        .fill(palette.panel)
-                        .stroke(Stroke::new(1.0, palette.outline)),
-                )
-                .show(ui, |ui| {
-                    ui.set_min_height(ui.available_height());
-                    reference::show(ui, reference, actions);
-                });
-        }
-
         // A data tab is all grid, under its filter bar.
         if tab.data().is_some() {
             Panel::top(Id::new(("filter", tab.id)))
@@ -1967,7 +1952,7 @@ impl VioletApp {
             egui::CentralPanel::default()
                 .frame(Frame::NONE.fill(palette.window))
                 .show(ui, |ui| {
-                    results::show(ui, tab, &editing, &links.columns, actions)
+                    results::show(ui, tab, &editing, &links.columns, reference, actions)
                 });
             return;
         }
@@ -1988,7 +1973,7 @@ impl VioletApp {
                 // The panel remembers the height its contents take: they
                 // fill it, or it would shrink to a smaller result each run.
                 ui.set_min_height(ui.available_height());
-                results::show(ui, tab, &editing, &links.columns, actions);
+                results::show(ui, tab, &editing, &links.columns, reference, actions);
             });
         self.layout.results = (total > 0.0).then(|| results.response.rect.height() / total);
 

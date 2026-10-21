@@ -11,6 +11,7 @@ mod completion;
 mod editing;
 mod export;
 mod format;
+mod geometry;
 mod settings;
 mod sql;
 mod ui;

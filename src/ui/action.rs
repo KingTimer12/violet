@@ -166,8 +166,16 @@ pub enum Action {
     RememberCopy(crate::export::Format, bool),
     /// Writes the shown rows of a tab to a file in a format.
     Export(TabId, crate::export::Format),
-    /// Closes the referenced row beside a tab's grid.
-    CloseReference(TabId),
+    /// Opens, beside a tab's grid, the row a foreign key cell points at:
+    /// the tab's row and column.
+    FollowKey(TabId, usize, usize),
+    /// Follows a foreign key from the rows shown beside a tab's grid: the
+    /// step the cell is in, its row and its column.
+    FollowNestedKey(TabId, usize, usize, usize),
+    /// Goes back to a step of the references beside a tab's grid.
+    BackToReference(TabId, usize),
+    /// Closes the referenced rows beside the grid.
+    CloseReference,
     OpenHistory,
     ClearHistory,
     /// Puts SQL at the active editor's cursor.

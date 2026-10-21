@@ -15,15 +15,19 @@ pub(crate) struct Column {
     pub name: String,
     pub kind: u8,
     pub charset: u16,
+    /// The display width: `1` for `tinyint(1)`, MySQL's boolean.
+    pub length: u32,
     pub flags: u16,
 }
 
 impl Column {
-    /// The type's name, as `SHOW COLUMNS` spells it (without lengths).
+    /// The type's name, as `SHOW COLUMNS` spells it (without lengths, but
+    /// for `tinyint(1)`, which is how MySQL keeps `BOOLEAN`).
     pub(crate) fn type_name(&self) -> Option<String> {
         let binary = self.charset == BINARY;
         let name = match self.kind {
             0 | 246 => "decimal",
+            1 if self.length == 1 => "tinyint(1)",
             1 => "tinyint",
             2 => "smallint",
             3 => "int",
@@ -106,6 +110,7 @@ mod tests {
             name: "c".into(),
             kind,
             charset,
+            length: 4,
             flags,
         }
     }
@@ -123,6 +128,12 @@ mod tests {
             column(8, BINARY, UNSIGNED).type_name().as_deref(),
             Some("bigint unsigned")
         );
+        let boolean = Column {
+            length: 1,
+            ..column(1, BINARY, 0)
+        };
+        assert_eq!(boolean.type_name().as_deref(), Some("tinyint(1)"));
+        assert_eq!(column(1, BINARY, 0).type_name().as_deref(), Some("tinyint"));
         assert!(column(246, BINARY, 0).numeric());
         assert!(column(254, BINARY, 0).shows_hex());
         assert!(!column(JSON, BINARY, 0).shows_hex());

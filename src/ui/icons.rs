@@ -29,6 +29,7 @@ fastframe_icons::icons! {
         Rows => "rows",
         ArrowUp => "arrow-up",
         ArrowDown => "arrow-down",
+        ArrowUpRight => "arrow-up-right",
         Funnel => "funnel",
         ChevronsDown => "chevrons-down",
         Package => "package",

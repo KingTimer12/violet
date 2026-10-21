@@ -131,13 +131,14 @@ fn column(packet: &[u8]) -> Result<Column> {
     let _original_name = r.lenenc_bytes()?;
     let _fixed = r.lenenc()?;
     let charset = r.u16()?;
-    let _length = r.u32()?;
+    let length = r.u32()?;
     let kind = r.u8()?;
     let flags = r.u16()?;
     Ok(Column {
         name,
         kind,
         charset,
+        length,
         flags,
     })
 }
@@ -388,12 +389,14 @@ mod tests {
                 name: "a".into(),
                 kind: 253,
                 charset: 255,
+                length: 0,
                 flags: 0,
             },
             Column {
                 name: "b".into(),
                 kind: 252,
                 charset: types::BINARY,
+                length: 0,
                 flags: 0,
             },
         ];

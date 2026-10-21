@@ -4,16 +4,15 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
-use egui::text::{LayoutJob, TextWrapping};
-use egui::{
-    Align, Color32, CornerRadius, Layout, Pos2, RichText, Sense, Stroke, TextFormat, Ui, Vec2,
-};
+use egui::{Align, CornerRadius, Layout, RichText, Sense, Stroke, Ui, Vec2};
 use egui_extras::{Column, TableBuilder};
 use violet_core::{DbError, ResultSet};
 
 use super::action::Action;
+use super::cells::{self, Cell, Look};
 use super::edit_flow::{EditTarget, Editing};
 use super::icons::Icon;
+use super::reference::{self, Reference};
 use super::selection::{Mode, Selection};
 use super::theme::{self, Palette};
 use super::widgets::{self, Tone};
@@ -24,55 +23,6 @@ use crate::export::{to_delimited, write_row};
 use crate::sql;
 
 const ROW_HEIGHT: f32 = 26.0;
-/// Characters shown per cell; the full value is a click away.
-const CELL_PREVIEW: usize = 300;
-/// Room between a cell's edge and its text.
-const CELL_PADDING: f32 = 6.0;
-
-/// What a cell shows.
-#[derive(Clone, Copy)]
-enum Cell<'a> {
-    Value(&'a str),
-    Null,
-    /// An added row's column with no value: the table's default.
-    Default,
-    RowNumber(usize),
-}
-
-/// Paints `cell` in the cell `ui` stands for, cut to its width and centred
-/// vertically. Painted directly rather than as a label widget; the layout
-/// comes from egui's own cache, which knows when the font atlas changes.
-fn paint_cell(ui: &Ui, cell: Cell<'_>, right_aligned: bool, color: Color32) {
-    let rect = ui.max_rect();
-    let mut format = TextFormat::simple(theme::mono(12.5), color);
-    let text = match cell {
-        Cell::Value(text) => preview(text).into_owned(),
-        Cell::Null => {
-            format.font_id = theme::mono(11.5);
-            format.italics = true;
-            "NULL".to_owned()
-        }
-        Cell::Default => {
-            format.font_id = theme::mono(11.5);
-            format.italics = true;
-            "DEFAULT".to_owned()
-        }
-        Cell::RowNumber(row) => {
-            format.font_id = theme::mono(11.0);
-            (row + 1).to_string()
-        }
-    };
-    let mut job = LayoutJob::single_section(text, format);
-    job.wrap = TextWrapping::truncate_at_width((rect.width() - 2.0 * CELL_PADDING).max(0.0));
-    let galley = ui.painter().layout_job(job);
-    let x = if right_aligned {
-        rect.right() - CELL_PADDING - galley.size().x
-    } else {
-        rect.left() + CELL_PADDING
-    };
-    let y = rect.center().y - galley.size().y / 2.0;
-    ui.painter().galley(Pos2::new(x, y), galley, color);
-}
 
 #[hotpath::measure]
 pub fn show(
@@ -80,6 +30,7 @@ pub fn show(
     tab: &mut QueryTab,
     editing: &Editing,
     links: &[bool],
+    reference: Option<&Reference>,
     actions: &mut Vec<Action>,
 ) {
     let palette = Palette::current(ui.ctx());
@@ -310,6 +261,7 @@ pub fn show(
                     &mut tab.inline,
                     reveal,
                     links,
+                    reference,
                     actions,
                 );
             } else {
@@ -420,6 +372,7 @@ fn grid(
     inline: &mut Option<InlineCell>,
     reveal: Option<usize>,
     links: &[bool],
+    reference: Option<&Reference>,
     actions: &mut Vec<Action>,
 ) {
     let palette = Palette::current(ui.ctx());
@@ -443,6 +396,7 @@ fn grid(
     // Clicks pick cells as DBeaver does: Ctrl (⌘) adds, Shift extends.
     let mode = Mode::from_modifiers(ui.input(|input| input.modifiers));
     let columns = set.columns.len();
+    let looks: Vec<Look> = set.columns.iter().map(Look::of).collect();
 
     // The platform shortcuts copy the picked cells and pick them all,
     // once the grid is in use and no text field takes the keys.
@@ -481,10 +435,21 @@ fn grid(
         }
     }
 
+    // The rows a followed foreign key points at open in an extra row under
+    // the one it was followed from: grid rows past it move down one.
+    let opened = reference.filter(|reference| reference.row < set.rows.len());
+    let shown = |index: usize| match opened {
+        Some(reference) if index > reference.row => index + 1,
+        _ => index,
+    };
+    let extra = opened.map(|reference| reference.row + 1);
+
     egui::ScrollArea::horizontal()
         .id_salt(("grid-h", tab))
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            // What the grid shows across: the extra row spans it.
+            let viewport = ui.clip_rect();
             let mut table = TableBuilder::new(ui)
                 .id_salt(("grid", tab))
                 .striped(true)
@@ -495,7 +460,7 @@ fn grid(
                 .max_scroll_height(f32::INFINITY)
                 .column(Column::exact(number_width));
             if let Some(row) = reveal {
-                table = table.scroll_to_row(row, Some(Align::BOTTOM));
+                table = table.scroll_to_row(shown(row), Some(Align::BOTTOM));
             }
             for (index, column) in set.columns.iter().enumerate() {
                 table = table.column(
@@ -514,8 +479,8 @@ fn grid(
                         header.col(|ui| {
                             ui.painter().rect_filled(ui.max_rect(), 0.0, palette.panel);
                             ui.add_space(6.0);
-                            // A foreign key: picking a cell shows the row
-                            // it points at.
+                            // A foreign key: its values open the row they
+                            // point at.
                             if links.get(index).copied().unwrap_or(false) {
                                 let (rect, _) =
                                     ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
@@ -596,8 +561,40 @@ fn grid(
                     }
                 })
                 .body(|body| {
-                    body.rows(ROW_HEIGHT, rows, |mut row| {
-                        let index = row.index();
+                    let heights =
+                        (0..rows + usize::from(extra.is_some())).map(|index| match opened {
+                            Some(reference) if Some(index) == extra => reference::height(reference),
+                            _ => ROW_HEIGHT,
+                        });
+                    body.heterogeneous_rows(heights, |mut row| {
+                        if let Some(reference) = opened
+                            && Some(row.index()) == extra
+                        {
+                            // Every column, the last one painting the row
+                            // across them all.
+                            for column in 0..=columns {
+                                row.col(|ui| {
+                                    if column < columns {
+                                        return;
+                                    }
+                                    let cell = ui.max_rect();
+                                    let clip = egui::Rect::from_x_y_ranges(
+                                        viewport.x_range(),
+                                        ui.clip_rect().y_range(),
+                                    );
+                                    let rect = egui::Rect::from_x_y_ranges(
+                                        viewport.x_range(),
+                                        cell.y_range(),
+                                    );
+                                    reference::show(ui, rect, clip, reference, actions);
+                                });
+                            }
+                            return;
+                        }
+                        let index = match extra {
+                            Some(extra) if row.index() > extra => row.index() - 1,
+                            _ => row.index(),
+                        };
                         let added = index >= set.rows.len();
                         let deleted = changes.deleted.contains(&index);
                         // Added rows in green, rows to delete in red.
@@ -615,7 +612,7 @@ fn grid(
                             if let Some(tint) = tint {
                                 ui.painter().rect_filled(ui.max_rect(), 0.0, tint);
                             }
-                            paint_cell(ui, Cell::RowNumber(index), true, palette.dim);
+                            cells::paint_text(ui, Cell::RowNumber(index), true, palette.dim);
                             number = Some(ui.interact(
                                 ui.max_rect(),
                                 ui.id().with("row-number"),
@@ -648,6 +645,8 @@ fn grid(
                             };
                             let editable = can_edit(index, column);
                             let mut cell = None;
+                            // A foreign key value's link.
+                            let mut chip = None;
                             // Set when the field in the cell lets go of
                             // the keyboard: whether by Escape, by Tab, and
                             // with Shift.
@@ -710,7 +709,19 @@ fn grid(
                                     Some(text) if deleted => (Cell::Value(text), palette.dim),
                                     Some(text) => (Cell::Value(text), palette.text),
                                 };
-                                paint_cell(ui, cell_text, meta.numeric, color);
+                                // Rows not saved yet point at nothing.
+                                let link = links.get(column).copied().unwrap_or(false)
+                                    && !added
+                                    && !deleted;
+                                chip = cells::paint(
+                                    ui,
+                                    cell_text,
+                                    looks[column],
+                                    meta.numeric,
+                                    color,
+                                    link,
+                                )
+                                .link;
                                 // The cell is painted, not laid out, and the
                                 // table's own response for it has no area:
                                 // it takes clicks itself.
@@ -751,6 +762,18 @@ fn grid(
                             };
                             if response.clicked() {
                                 selected.click((index, column), mode);
+                                let on_link = response
+                                    .interact_pointer_pos()
+                                    .zip(chip)
+                                    .is_some_and(|(pointer, chip)| chip.contains(pointer));
+                                if on_link && mode == Mode::Replace {
+                                    actions.push(Action::FollowKey(tab, index, column));
+                                }
+                            }
+                            if chip.is_some_and(|chip| {
+                                response.hover_pos().is_some_and(|p| chip.contains(p))
+                            }) {
+                                response.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                             }
                             // Right-clicking outside the selection picks the
                             // cell; inside, the menu acts on all of it.
@@ -763,12 +786,17 @@ fn grid(
                             // Long values get a tooltip; only measured when hovered.
                             if response.hovered()
                                 && let Some(text) = value
-                                && (text.len() > 40 || text.contains('\n'))
                             {
-                                response.clone().on_hover_ui(|ui| {
-                                    ui.set_max_width(480.0);
-                                    ui.label(RichText::new(text).font(theme::mono(12.0)));
-                                });
+                                let text = match looks[column] {
+                                    Look::Geometry => cells::geometry_text(text),
+                                    Look::Text | Look::Boolean => Cow::Borrowed(text),
+                                };
+                                if text.len() > 40 || text.contains('\n') {
+                                    response.clone().on_hover_ui(|ui| {
+                                        ui.set_max_width(480.0);
+                                        ui.label(RichText::new(text).font(theme::mono(12.0)));
+                                    });
+                                }
                             }
                             response.context_menu(|ui| {
                                 if editable {
@@ -812,6 +840,22 @@ fn grid(
                                     actions.push(Action::Copy(copy_selection(
                                         set, edits, selected, true,
                                     )));
+                                }
+                                if looks[column] == Look::Geometry
+                                    && let Some(text) = value
+                                    && let Some(wkt) = crate::geometry::wkt(text)
+                                    && super::sidebar::menu_item(ui, Icon::Copy, "Copy as WKT")
+                                {
+                                    actions.push(Action::Copy(wkt));
+                                }
+                                if chip.is_some()
+                                    && super::sidebar::menu_item(
+                                        ui,
+                                        Icon::ArrowUpRight,
+                                        "Open referenced row",
+                                    )
+                                {
+                                    actions.push(Action::FollowKey(tab, index, column));
                                 }
                                 advanced_copy_item(ui, tab, actions);
                                 ui.separator();
@@ -1131,23 +1175,8 @@ fn edit_bar(
     }
 }
 
-/// The first line, at most [`CELL_PREVIEW`] characters. Borrowed in the
-/// common case, so drawing a cell allocates nothing.
-fn preview(text: &str) -> Cow<'_, str> {
-    let line = text.lines().next().unwrap_or_default();
-    let end = line
-        .char_indices()
-        .nth(CELL_PREVIEW)
-        .map_or(line.len(), |(at, _)| at);
-    if end == text.len() {
-        Cow::Borrowed(text)
-    } else {
-        Cow::Owned(format!("{}…", &line[..end]))
-    }
-}
-
 /// A starting width from the header and the first rows' lengths.
-fn column_width(set: &ResultSet, index: usize, name: &str) -> f32 {
+pub(super) fn column_width(set: &ResultSet, index: usize, name: &str) -> f32 {
     let longest = set
         .rows
         .iter()
@@ -1282,14 +1311,5 @@ mod tests {
             "a0\tb0\tc0\na2\tb2\tc2"
         );
         assert_eq!(copy_rows(&set, &edits, &[1], true), "a\tb\tc\na1\t\tc1");
-    }
-
-    #[test]
-    fn previews_show_the_first_line() {
-        assert_eq!(preview("one\ntwo"), "one…");
-        assert_eq!(preview("short"), "short");
-        assert!(matches!(preview("short"), Cow::Borrowed(_)));
-        let long = "x".repeat(CELL_PREVIEW + 5);
-        assert_eq!(preview(&long).chars().count(), CELL_PREVIEW + 1);
     }
 }
