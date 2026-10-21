@@ -114,7 +114,7 @@ async fn package(out: &Path, files: &[String]) -> Result<(), String> {
         index.upsert(Entry {
             id,
             version: description.version,
-            api: violet_wasm::API_VERSION.to_owned(),
+            api: violet_wasm::api_level(&description.info).to_owned(),
             description: description.description,
             url: name,
             sha256: sha256(&wasm),

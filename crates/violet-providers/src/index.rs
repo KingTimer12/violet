@@ -126,7 +126,8 @@ pub fn compatible(api: &str) -> bool {
         Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
     };
     match (parts(api), parts(violet_wasm::API_VERSION)) {
-        (Some((0, theirs)), Some((0, ours))) => theirs == ours,
+        // 0.2 only added to 0.1, under the same WIT package.
+        (Some((0, theirs)), Some((0, ours))) => (1..=ours).contains(&theirs),
         (Some((theirs, _)), Some((ours, _))) => theirs == ours,
         _ => false,
     }
@@ -179,6 +180,10 @@ mod tests {
                     tls: false,
                 },
                 dialect: SqlDialect::ANSI,
+                language: violet_core::Language::Sql,
+                user: violet_core::Login::Required,
+                password: violet_core::Login::Optional,
+                schema_label: String::new(),
             },
         }
     }
@@ -223,7 +228,9 @@ mod tests {
     fn api_versions_follow_semver() {
         assert!(compatible(violet_wasm::API_VERSION));
         assert!(compatible("0.1.7"));
-        assert!(!compatible("0.2.0"));
+        assert!(compatible("0.2.0"));
+        assert!(!compatible("0.3.0"));
+        assert!(!compatible("0.0.1"));
         assert!(!compatible("1.1.0"));
         assert!(!compatible("garbage"));
     }

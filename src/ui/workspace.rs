@@ -1,6 +1,6 @@
 //! Open tabs: SQL editors and table data views.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -54,6 +54,10 @@ pub struct DataView {
     /// The filter the rows shown were read with.
     pub applied: String,
     pub order: Option<OrderBy>,
+    /// For a key-value store's key, its type (`hash`, `zset`...): what it
+    /// reads with and how its rows are written back. The relation is then
+    /// the key, and the filter a glob on its fields or members.
+    pub subtype: Option<String>,
 }
 
 impl DataView {
@@ -64,6 +68,7 @@ impl DataView {
             filter: String::new(),
             applied: String::new(),
             order: None,
+            subtype: None,
         }
     }
 
@@ -137,12 +142,50 @@ pub struct QueryTab {
     /// The table the shown rows were read from, when they map back to it.
     pub source: Option<crate::sql::TableRef>,
     /// Cells changed in the grid and not written yet, by row and column:
-    /// the new value, `None` for NULL.
+    /// the new value, `None` for NULL. Rows past the result's are the
+    /// added ones.
     pub edits: BTreeMap<(usize, usize), Option<String>>,
+    /// Rows added in the grid and not inserted yet. They follow the
+    /// result's rows, their values in `edits`; a column without one takes
+    /// its default.
+    pub added: usize,
+    /// Rows of the result to delete.
+    pub deleted: BTreeSet<usize>,
+    /// A row the grid scrolls to on its next frame.
+    pub reveal_row: Option<usize>,
+    /// The cell being edited in place in the grid.
+    pub inline: Option<InlineCell>,
+    /// The editor's find bar, when open.
+    pub find: Option<super::editor::FindBar>,
     /// A query's rows sorted by a column (index, descending), and the query
     /// as written, which the sorted one wraps.
     pub sort: Option<(usize, bool)>,
     pub unsorted: Option<String>,
+    /// Reads the rows again on this interval, and when it is next due.
+    pub auto_refresh: Option<(std::time::Duration, std::time::Instant)>,
+}
+
+/// A grid cell edited in place.
+pub struct InlineCell {
+    pub row: usize,
+    pub column: usize,
+    pub text: String,
+    /// What it started with: left as it was, it changes nothing.
+    pub initial: String,
+    /// Whether the field still has to take the keyboard.
+    pub focus: bool,
+}
+
+impl InlineCell {
+    pub fn new(row: usize, column: usize, text: &str) -> Self {
+        Self {
+            row,
+            column,
+            text: text.to_owned(),
+            initial: text.to_owned(),
+            focus: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -157,6 +200,20 @@ impl QueryTab {
             TabKind::Data(view) => Some(view),
             TabKind::Script => None,
         }
+    }
+
+    /// Whether the grid has changes not written yet: cells, added rows or
+    /// rows to delete.
+    pub fn has_changes(&self) -> bool {
+        !self.edits.is_empty() || self.added > 0 || !self.deleted.is_empty()
+    }
+
+    /// Forgets the grid's changes.
+    pub fn clear_changes(&mut self) {
+        self.edits.clear();
+        self.added = 0;
+        self.deleted.clear();
+        self.inline = None;
     }
 
     /// Whether the script has changes its file does not.
@@ -243,8 +300,14 @@ impl Workspace {
             file: None,
             source: None,
             edits: BTreeMap::new(),
+            added: 0,
+            deleted: BTreeSet::new(),
+            reveal_row: None,
+            inline: None,
+            find: None,
             sort: None,
             unsorted: None,
+            auto_refresh: None,
         });
         self.active = Some(id);
         id

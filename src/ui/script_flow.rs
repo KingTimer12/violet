@@ -18,7 +18,7 @@ use super::state::Link;
 use super::theme::{self, Palette};
 use super::toasts::Toast;
 use super::widgets::{self, Tone};
-use super::workspace::{ScriptFile, TabId, TabKind};
+use super::workspace::{QueryTab, ScriptFile, TabId, TabKind};
 
 /// Asks what to call a script saved for the first time.
 pub struct ScriptPrompt {
@@ -29,7 +29,145 @@ pub struct ScriptPrompt {
     pub error: Option<String>,
 }
 
+/// Closing editors whose scripts have changes not saved to their files.
+pub struct CloseConfirm {
+    /// Every tab being closed, saved or not.
+    tabs: Vec<TabId>,
+    /// The titles of the unsaved ones.
+    names: Vec<String>,
+    /// Whether the window closes, rather than the tabs.
+    quit: bool,
+}
+
+/// What to do with the unsaved changes of the tabs being closed.
+#[derive(Clone, Copy)]
+pub enum CloseAnswer {
+    Save,
+    Discard,
+    Cancel,
+}
+
 impl VioletApp {
+    /// Closes `ids`, asking first when a script among them has unsaved
+    /// changes.
+    pub(super) fn close_tabs(&mut self, ids: Vec<TabId>) {
+        let names: Vec<String> = ids
+            .iter()
+            .filter_map(|id| self.workspace.get(*id))
+            .filter(|tab| tab.unsaved())
+            .map(|tab| tab.title.clone())
+            .collect();
+        if names.is_empty() {
+            for id in ids {
+                self.close_tab(id);
+            }
+        } else {
+            self.close_confirm = Some(CloseConfirm {
+                tabs: ids,
+                names,
+                quit: false,
+            });
+        }
+    }
+
+    /// Keeps the window open when it is asked to close with unsaved
+    /// scripts, and asks about them. Closing to install an update asks
+    /// nothing: the session keeps the editors' text.
+    pub(super) fn keeps_window(&mut self, ctx: &egui::Context) -> bool {
+        if self.quitting
+            || self
+                .updates
+                .as_ref()
+                .is_some_and(crate::update::Updates::should_quit)
+        {
+            return false;
+        }
+        let unsaved: Vec<&QueryTab> = self
+            .workspace
+            .tabs
+            .iter()
+            .filter(|tab| tab.unsaved())
+            .collect();
+        if unsaved.is_empty() {
+            return false;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        if self.close_confirm.is_none() {
+            self.close_confirm = Some(CloseConfirm {
+                tabs: unsaved.iter().map(|tab| tab.id).collect(),
+                names: unsaved.iter().map(|tab| tab.title.clone()).collect(),
+                quit: true,
+            });
+        }
+        true
+    }
+
+    /// Closes the window once its scripts are dealt with.
+    pub(super) fn quit(&mut self, ctx: &egui::Context) {
+        self.quitting = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    /// Closes a tab, stopping what it runs.
+    fn close_tab(&mut self, id: TabId) {
+        if let Some(tab) = self.workspace.close(id)
+            && let Some(running) = tab.running
+        {
+            self.backend.cancel(running.request);
+        }
+    }
+
+    pub(super) fn answer_close(
+        &mut self,
+        ctx: &egui::Context,
+        confirm: CloseConfirm,
+        answer: CloseAnswer,
+    ) {
+        if confirm.quit {
+            match answer {
+                CloseAnswer::Cancel => {}
+                // The editors reopen next time as their files are.
+                CloseAnswer::Discard => {
+                    for tab in &mut self.workspace.tabs {
+                        if let Some(file) = &tab.file {
+                            tab.sql.clone_from(&file.saved);
+                        }
+                    }
+                    self.quit(ctx);
+                }
+                CloseAnswer::Save => {
+                    for id in confirm.tabs {
+                        self.save_script(ctx, id);
+                    }
+                    // A script that could not be saved keeps the window.
+                    if !self.workspace.tabs.iter().any(QueryTab::unsaved) {
+                        self.quit(ctx);
+                    }
+                }
+            }
+            return;
+        }
+        match answer {
+            CloseAnswer::Cancel => {}
+            CloseAnswer::Discard => {
+                for id in confirm.tabs {
+                    self.close_tab(id);
+                }
+            }
+            CloseAnswer::Save => {
+                for id in confirm.tabs {
+                    if self.workspace.get(id).is_some_and(QueryTab::unsaved) {
+                        self.save_script(ctx, id);
+                    }
+                    // One that could not be saved stays open.
+                    if !self.workspace.get(id).is_some_and(QueryTab::unsaved) {
+                        self.close_tab(id);
+                    }
+                }
+            }
+        }
+    }
+
     /// Lists the saved scripts again.
     pub(super) fn reload_scripts(&mut self, ctx: &egui::Context) {
         match self.scripts.list() {
@@ -91,7 +229,7 @@ impl VioletApp {
             Action::OpenScriptFile => {
                 let mut picker = rfd::FileDialog::new()
                     .set_title("Open script")
-                    .add_filter("SQL", &[scripts::EXTENSION]);
+                    .add_filter("Scripts", scripts::EXTENSIONS);
                 if let Some(folder) = self.last_script_folder() {
                     picker = picker.set_directory(folder);
                 }
@@ -122,7 +260,15 @@ impl VioletApp {
                     (Some(saved), Some((connection, database)))
                         if (saved.connection, &saved.database) != (connection, &database) =>
                     {
-                        let moved = self.scripts.path_for(connection, &database, &saved.name);
+                        let extension = file
+                            .path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or(scripts::EXTENSION)
+                            .to_owned();
+                        let moved =
+                            self.scripts
+                                .path_for(connection, &database, &saved.name, &extension);
                         if moved.exists() {
                             self.toasts.push(
                                 ctx,
@@ -183,7 +329,10 @@ impl VioletApp {
             refuse(self, "Type a name.");
             return;
         }
-        let path = self.scripts.path_for(connection, &database, name);
+        let extension = crate::lang::extension(self.language(connection));
+        let path = self
+            .scripts
+            .path_for(connection, &database, name, extension);
         if path.exists() && self.workspace.script_tab(&path) != Some(tab_id) {
             refuse(self, "A script with this name is already saved here.");
             return;
@@ -199,10 +348,14 @@ impl VioletApp {
         if !matches!(tab.kind, TabKind::Script) {
             return;
         }
+        let extension = crate::lang::extension(
+            tab.connection
+                .map_or(violet_core::Language::Sql, |id| self.language(id)),
+        );
         let mut picker = rfd::FileDialog::new()
             .set_title("Save script as")
-            .add_filter("SQL", &[scripts::EXTENSION])
-            .set_file_name(format!("{}.{}", tab.title, scripts::EXTENSION));
+            .add_filter("Scripts", &[extension])
+            .set_file_name(format!("{}.{extension}", tab.title));
         let folder = match &tab.file {
             Some(file) => file.path.parent().map(Path::to_path_buf),
             None => self.last_script_folder(),
@@ -214,7 +367,7 @@ impl VioletApp {
             return;
         };
         if path.extension().is_none() {
-            path.set_extension(scripts::EXTENSION);
+            path.set_extension(extension);
         }
         self.write_script(ctx, tab_id, path);
     }
@@ -335,7 +488,7 @@ impl VioletApp {
 }
 
 /// A tab's title for the script at `path`: its name as saved.
-fn script_title(store: &violet_storage::ScriptStore, path: &Path) -> String {
+pub(super) fn script_title(store: &violet_storage::ScriptStore, path: &Path) -> String {
     store.locate(path).map_or_else(
         || {
             path.file_stem()
@@ -393,4 +546,61 @@ pub fn show_prompt(
             });
         });
     open && !modal.should_close()
+}
+
+/// Asks whether to save the scripts of the tabs being closed. `None`
+/// while open.
+pub fn confirm_close(ctx: &egui::Context, confirm: &CloseConfirm) -> Option<CloseAnswer> {
+    let palette = Palette::current(ctx);
+    let mut answer = None;
+    let modal = egui::Modal::new(egui::Id::new("confirm-close"))
+        .frame(
+            egui::Frame::new()
+                .fill(palette.surface)
+                .stroke(Stroke::new(1.0, palette.outline))
+                .corner_radius(CornerRadius::same(14))
+                .inner_margin(egui::Margin::same(22)),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(380.0);
+            ui.spacing_mut().item_spacing.y = 12.0;
+            let title = if confirm.quit {
+                "Save changes before closing?"
+            } else {
+                "Save changes?"
+            };
+            ui.label(
+                RichText::new(title)
+                    .font(theme::semibold(16.0))
+                    .color(palette.text),
+            );
+            let text = match confirm.names.as_slice() {
+                [name] => format!(
+                    "\u{201C}{name}\u{201D} has changes not saved to its file. They are lost if you don\u{2019}t save them."
+                ),
+                names => format!(
+                    "{} scripts have changes not saved to their files: {}. They are lost if you don\u{2019}t save them.",
+                    names.len(),
+                    names.join(", ")
+                ),
+            };
+            ui.add(egui::Label::new(RichText::new(text).color(palette.secondary)).wrap());
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if widgets::button(ui, Tone::Primary, Some(Icon::Save), "Save").clicked() {
+                        answer = Some(CloseAnswer::Save);
+                    }
+                    if widgets::button(ui, Tone::Secondary, None, "Don\u{2019}t save").clicked() {
+                        answer = Some(CloseAnswer::Discard);
+                    }
+                    if widgets::button(ui, Tone::Ghost, None, "Cancel").clicked() {
+                        answer = Some(CloseAnswer::Cancel);
+                    }
+                });
+            });
+        });
+    if modal.should_close() {
+        answer = Some(CloseAnswer::Cancel);
+    }
+    answer
 }

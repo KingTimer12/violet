@@ -1,5 +1,6 @@
-//! Every icon Violet draws. Lucide outlines (ISC), drawn in white and tinted
-//! at paint time; the licence is in `assets/icons/LICENSE.txt`.
+//! Every icon Violet draws. Lucide outlines (ISC) and database logos from
+//! Simple Icons (CC0), drawn in white and tinted at paint time; the
+//! licences are in `assets/icons/LICENSE.txt`.
 
 fastframe_icons::icons! {
     /// The interface's icons.
@@ -28,6 +29,7 @@ fastframe_icons::icons! {
         Rows => "rows",
         ArrowUp => "arrow-up",
         ArrowDown => "arrow-down",
+        ArrowUpRight => "arrow-up-right",
         Funnel => "funnel",
         ChevronsDown => "chevrons-down",
         Package => "package",
@@ -62,10 +64,54 @@ fastframe_icons::icons! {
         FolderOpen => "folder-open",
         Save => "save",
         ShieldAlert => "shield-alert",
+        Text => "type",
+        List => "list",
+        ListOrdered => "list-ordered",
+        Shapes => "shapes",
+        Activity => "activity",
+        Code => "code",
+        Link => "link",
+        Keyboard => "keyboard",
+        Undo => "undo-2",
+        PostgreSql => "postgresql",
+        MySql => "mysql",
+        MariaDb => "mariadb",
+        Sqlite => "sqlite",
     }
 }
 
 impl Icon {
+    /// A key-value store's key, by its type.
+    pub fn for_subtype(subtype: Option<&str>) -> Self {
+        match subtype {
+            Some("string") => Self::Text,
+            Some("hash") => Self::Function,
+            Some("list") => Self::List,
+            Some("set") => Self::Shapes,
+            Some("zset") => Self::ListOrdered,
+            Some("stream") => Self::Activity,
+            Some("json") => Self::Code,
+            _ => Self::Key,
+        }
+    }
+
+    /// The logo of the database a driver serves; a plain database for
+    /// those without one.
+    pub fn for_driver(id: &str) -> Self {
+        let id = id.to_ascii_lowercase();
+        if id.contains("postgres") {
+            Self::PostgreSql
+        } else if id.contains("maria") {
+            Self::MariaDb
+        } else if id.contains("mysql") {
+            Self::MySql
+        } else if id.contains("sqlite") {
+            Self::Sqlite
+        } else {
+            Self::Database
+        }
+    }
+
     pub fn for_kind(kind: violet_core::ObjectKind) -> Self {
         use violet_core::ObjectKind;
         match kind {
@@ -75,6 +121,7 @@ impl Icon {
             ObjectKind::ForeignTable => Self::ForeignTable,
             ObjectKind::Function => Self::Function,
             ObjectKind::Sequence => Self::Sequence,
+            ObjectKind::Key => Self::Key,
         }
     }
 }

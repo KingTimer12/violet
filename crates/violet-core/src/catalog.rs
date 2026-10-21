@@ -9,17 +9,20 @@ pub enum ObjectKind {
     ForeignTable,
     Function,
     Sequence,
+    /// A key of a key-value store, such as Redis.
+    Key,
 }
 
 impl ObjectKind {
     /// Kinds in the order the tree lists their groups.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Table,
         Self::View,
         Self::MaterializedView,
         Self::ForeignTable,
         Self::Function,
         Self::Sequence,
+        Self::Key,
     ];
 
     #[must_use]
@@ -31,6 +34,7 @@ impl ObjectKind {
             Self::ForeignTable => "Foreign tables",
             Self::Function => "Functions",
             Self::Sequence => "Sequences",
+            Self::Key => "Keys",
         }
     }
 
@@ -51,8 +55,21 @@ pub struct DbObject {
     pub name: String,
     pub kind: ObjectKind,
     pub comment: Option<String>,
-    /// Estimated rows for relations, when the server keeps statistics.
+    /// Estimated rows for relations, when the server keeps statistics; for
+    /// a key, its elements.
     pub estimated_rows: Option<i64>,
+    /// A key's type, such as `hash`: its icon, and how a data view reads it.
+    pub subtype: Option<String>,
+    /// Shown on hover, such as `hash · 120 fields · TTL 3600 s`.
+    pub detail: Option<String>,
+}
+
+/// A page of a schema's objects, as drivers that are not SQL list them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EntryPage {
+    pub objects: Vec<DbObject>,
+    /// Passed back to read on; `None` at the end.
+    pub next: Option<String>,
 }
 
 /// A column of a relation.

@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::{ColumnInfo, DbObject, ServerInfo};
+use crate::catalog::{ColumnInfo, DbObject, EntryPage, ServerInfo};
 use crate::error::Result;
 use crate::profile::{ConnectionProfile, Credentials, DriverId};
 use crate::query::{ExecLimits, ResultSet};
@@ -35,6 +35,46 @@ pub struct DriverInfo {
     pub capabilities: Capabilities,
     /// The SQL Violet generates for it.
     pub dialect: SqlDialect,
+    /// What its statements are written in.
+    #[serde(default)]
+    pub language: Language,
+    /// Whether the connection form asks for a user and a password.
+    #[serde(default)]
+    pub user: Login,
+    #[serde(default = "Login::optional")]
+    pub password: Login,
+    /// What the tree calls schemas, such as `Databases`; empty for the
+    /// default.
+    #[serde(default)]
+    pub schema_label: String,
+}
+
+/// The language a driver's statements are written in. Violet generates
+/// SQL only for [`Language::Sql`]; other drivers page and count themselves.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Language {
+    #[default]
+    Sql,
+    Redis,
+    Mongodb,
+}
+
+/// Whether the connection form asks for, and demands, a value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Login {
+    #[default]
+    Required,
+    Optional,
+    None,
+}
+
+impl Login {
+    #[must_use]
+    pub const fn optional() -> Self {
+        Self::Optional
+    }
 }
 
 /// Opens sessions to one kind of database.
@@ -107,6 +147,60 @@ pub trait Session: Send + Sync + 'static {
     }
 
     fn dialect(&self) -> &dyn Dialect;
+
+    /// What its statements are written in.
+    fn language(&self) -> Language {
+        Language::Sql
+    }
+
+    /// Objects in `schema` matching the glob `pattern`, a page at a time.
+    /// Only drivers that are not SQL list them this way.
+    async fn entries(
+        &self,
+        schema: &str,
+        pattern: Option<&str>,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<EntryPage> {
+        let _ = (schema, pattern, cursor, limit);
+        Err(crate::DbError::unsupported(
+            "Listing entries is not supported",
+        ))
+    }
+
+    /// Rows `offset .. offset + limit` of a statement's first result, run in
+    /// `schema`. Violet pages SQL itself, with [`Dialect::paged`].
+    async fn page(
+        &self,
+        schema: &str,
+        statement: &str,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<ResultSet>> {
+        let _ = (schema, statement, offset, limit);
+        Err(crate::DbError::unsupported("Paging is not supported"))
+    }
+
+    /// The rows a statement returns, `None` when it cannot tell. Violet
+    /// counts SQL itself, with [`Dialect::count`].
+    async fn count(&self, schema: &str, statement: &str) -> Result<Option<u64>> {
+        let _ = (schema, statement);
+        Err(crate::DbError::unsupported("Counting is not supported"))
+    }
+
+    /// Runs statements in `schema` as [`Session::execute`] does, leaving
+    /// the state the editor set alone. Only drivers that are not SQL do.
+    async fn run_in(
+        &self,
+        schema: &str,
+        statements: &str,
+        limits: ExecLimits,
+    ) -> Result<Vec<ResultSet>> {
+        let _ = (schema, statements, limits);
+        Err(crate::DbError::unsupported(
+            "Running in a schema is not supported",
+        ))
+    }
 
     async fn close(&self);
 }
@@ -199,9 +293,33 @@ pub trait Dialect: Send + Sync {
     /// database has no way, or `schema` cannot be written safely as a
     /// literal.
     fn foreign_keys(&self, schema: &str) -> Option<String> {
-        let schema = string_literal(schema)?;
-        Some(format!(
-            "SELECT kcu.constraint_schema, kcu.constraint_name, \
+        standard_foreign_keys(schema)
+    }
+
+    /// How the session stops committing each statement on its own. By
+    /// default a `BEGIN` opens each transaction.
+    fn manual_commit(&self) -> ManualCommit {
+        ManualCommit::Begin("BEGIN")
+    }
+}
+
+/// How a database leaves auto-commit, for [`Dialect::manual_commit`].
+/// Transactions end with `COMMIT` or `ROLLBACK` either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManualCommit {
+    /// This statement opens each transaction, before its first write:
+    /// PostgreSQL's and SQLite's `BEGIN`.
+    Begin(&'static str),
+    /// A session setting, turned off for manual commit and on again after:
+    /// MySQL's `autocommit`. The server opens each transaction itself.
+    Setting { off: &'static str, on: &'static str },
+}
+
+/// The standard `information_schema` query of [`Dialect::foreign_keys`].
+fn standard_foreign_keys(schema: &str) -> Option<String> {
+    let schema = string_literal(schema)?;
+    Some(format!(
+        "SELECT kcu.constraint_schema, kcu.constraint_name, \
              kcu.table_schema, kcu.table_name, kcu.column_name, \
              ref.table_schema, ref.table_name, ref.column_name \
              FROM information_schema.referential_constraints rc \
@@ -214,8 +332,24 @@ pub trait Dialect: Send + Sync {
              AND ref.ordinal_position = kcu.position_in_unique_constraint \
              WHERE kcu.table_schema = {schema} OR ref.table_schema = {schema} \
              ORDER BY 1, 2, 3, 4, kcu.ordinal_position"
-        ))
-    }
+    ))
+}
+
+/// [`Dialect::foreign_keys`] for MySQL and MariaDB. Their
+/// `referential_constraints` name the referenced key by its index, which
+/// is `PRIMARY` in every table, so the standard query matches every
+/// table's key; their `key_column_usage` names the referenced column
+/// itself.
+fn mysql_foreign_keys(schema: &str) -> Option<String> {
+    let schema = string_literal(schema)?;
+    Some(format!(
+        "SELECT CONSTRAINT_SCHEMA, CONSTRAINT_NAME, TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, \
+         REFERENCED_TABLE_SCHEMA, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME \
+         FROM information_schema.KEY_COLUMN_USAGE \
+         WHERE REFERENCED_TABLE_NAME IS NOT NULL \
+         AND (TABLE_SCHEMA = {schema} OR REFERENCED_TABLE_SCHEMA = {schema}) \
+         ORDER BY 1, 2, 3, 4, ORDINAL_POSITION"
+    ))
 }
 
 /// `text` as a standard SQL string literal, or `None` when it holds a
@@ -290,6 +424,28 @@ impl Dialect for SqlDialect {
             shift: PREFIX.chars().count() as u32,
         }
     }
+
+    fn foreign_keys(&self, schema: &str) -> Option<String> {
+        // Backticks quote names in MySQL and MariaDB alone.
+        if self.quote_open == '`' {
+            mysql_foreign_keys(schema)
+        } else {
+            standard_foreign_keys(schema)
+        }
+    }
+
+    fn manual_commit(&self) -> ManualCommit {
+        // A `BEGIN` inside a MySQL transaction commits it: the setting
+        // keeps one open between commits instead.
+        if self.quote_open == '`' {
+            ManualCommit::Setting {
+                off: "SET autocommit = 0",
+                on: "SET autocommit = 1",
+            }
+        } else {
+            ManualCommit::Begin("BEGIN")
+        }
+    }
 }
 
 /// Standard SQL quoting with double quotes.
@@ -326,6 +482,22 @@ mod tests {
         assert_eq!(string_literal("a\0b"), None);
         let sql = AnsiDialect.foreign_keys("o'k").expect("query");
         assert!(sql.contains("kcu.table_schema = 'o''k' OR ref.table_schema = 'o''k'"));
+        let mysql = SqlDialect {
+            quote_open: '`',
+            quote_close: '`',
+            paging: Paging::LimitOffset,
+        };
+        assert!(matches!(
+            mysql.manual_commit(),
+            ManualCommit::Setting { .. }
+        ));
+        assert_eq!(
+            SqlDialect::ANSI.manual_commit(),
+            ManualCommit::Begin("BEGIN")
+        );
+        let sql = mysql.foreign_keys("o'k").expect("query");
+        assert!(sql.contains("FROM information_schema.KEY_COLUMN_USAGE"));
+        assert!(sql.contains("TABLE_SCHEMA = 'o''k' OR REFERENCED_TABLE_SCHEMA = 'o''k'"));
         assert_eq!(AnsiDialect.explain("SELECT 1", false), "EXPLAIN SELECT 1");
         assert_eq!(
             AnsiDialect.explain("SELECT 1", true),

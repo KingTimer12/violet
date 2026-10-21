@@ -38,8 +38,8 @@ impl Mode {
 pub struct Selection {
     /// Ordered by row, then column, so a row's cells are one range.
     cells: BTreeSet<CellPos>,
-    /// The cell clicked last, which editing and the foreign key panel
-    /// follow. `None` after picking whole rows.
+    /// The cell clicked last, which editing follows. `None` after picking
+    /// whole rows.
     pub focus: Option<CellPos>,
     /// Where Shift extends from.
     anchor: Option<CellPos>,

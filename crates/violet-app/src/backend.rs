@@ -14,9 +14,9 @@ use violet_core::ports::{
 };
 use violet_core::{
     Canceller, ColumnInfo, ConnectionId, ConnectionProfile, Credentials, DbError, DbObject, Driver,
-    DriverId, DriverInfo, ErrorKind, ExecLimits, ForeignKey, OrderBy, Page, PageInfo, QueryOutput,
-    Result, ResultSet, Secret, ServerInfo, Session, Task, TaskKind, TaskRequest, TaskSettings,
-    ToolCommand,
+    DriverId, DriverInfo, EntryPage, ErrorKind, ExecLimits, ForeignKey, Language, ManualCommit,
+    OrderBy, Page, PageInfo, QueryOutput, Result, ResultSet, Secret, ServerInfo, Session, Task,
+    TaskKind, TaskRequest, TaskSettings, ToolCommand,
 };
 
 use crate::registry::DriverRegistry;
@@ -63,6 +63,39 @@ impl ExecOptions {
         cache: CachePolicy::Off,
         page: None,
     };
+}
+
+/// A connection's transaction, as the backend keeps track of it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Transaction {
+    /// Writes wait for a commit; off by default, when each statement
+    /// commits on its own.
+    pub manual: bool,
+    /// A transaction is open: what it wrote waits for a commit or rollback.
+    pub open: bool,
+    /// Runs that may have written since it opened.
+    pub writes: u32,
+}
+
+/// What a script's own transaction statements do, as the interface reads
+/// them: Violet then neither opens one for it nor loses track.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TxControl {
+    /// A statement opens a transaction: `BEGIN`, `START TRANSACTION`.
+    pub begins: bool,
+    /// Whether one is open after the last statement that opens or ends one
+    /// (`COMMIT`, `ROLLBACK`, `END`); `None` without such statements.
+    pub open_after: Option<bool>,
+}
+
+/// What the user asks of a connection's transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxCommand {
+    Commit,
+    Rollback,
+    /// Turns auto-commit on (`true`) or off. Turning it on commits an open
+    /// transaction first, as JDBC does.
+    AutoCommit(bool),
 }
 
 /// Identifies one query or connection test, to match its result and to
@@ -115,6 +148,16 @@ pub enum Event {
         schema: String,
         relation: String,
         result: Result<Vec<ColumnInfo>>,
+    },
+    /// A page of a schema's keys, for drivers that list them so.
+    Entries {
+        id: ConnectionId,
+        schema: String,
+        /// The glob they match.
+        pattern: String,
+        /// They follow the ones listed before, rather than replace them.
+        more: bool,
+        result: Result<EntryPage>,
     },
     /// Foreign keys from or to a schema's tables.
     ForeignKeys {
@@ -191,9 +234,24 @@ pub enum Event {
         task: TaskId,
         result: Result<TaskSummary>,
     },
+    /// A connection's transaction changed: its mode, whether one is open,
+    /// or what it wrote.
+    Transaction {
+        id: ConnectionId,
+        state: Transaction,
+    },
+    /// A commit, rollback or change of mode finished.
+    TransactionDone {
+        id: ConnectionId,
+        command: TxCommand,
+        result: Result<()>,
+    },
 }
 
 type Sessions = HashMap<ConnectionId, Arc<dyn Session>>;
+/// Held while a run or a commit uses the transaction, so a `BEGIN` and the
+/// statement it opens for go together.
+type Transactions = HashMap<ConnectionId, Arc<tokio::sync::Mutex<Transaction>>>;
 type Running = HashMap<RequestId, Arc<dyn Canceller>>;
 type RunningTasks = HashMap<TaskId, watch::Sender<bool>>;
 
@@ -204,6 +262,7 @@ struct Shared {
     secrets: Arc<dyn SecretStore>,
     cache: Arc<dyn ResultCache>,
     sessions: Mutex<Sessions>,
+    transactions: Mutex<Transactions>,
     running: Mutex<Running>,
     tasks: Mutex<RunningTasks>,
     events: Mutex<Sender<Event>>,
@@ -213,6 +272,117 @@ struct Shared {
 impl Shared {
     fn sessions(&self) -> MutexGuard<'_, Sessions> {
         self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// `id`'s transaction, auto-commit until told otherwise.
+    fn transaction(&self, id: ConnectionId) -> Arc<tokio::sync::Mutex<Transaction>> {
+        let mut transactions = self
+            .transactions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(transactions.entry(id).or_default())
+    }
+
+    /// Reports `id`'s transaction when it changed from `before`.
+    fn report(&self, id: ConnectionId, before: Transaction, state: Transaction) {
+        if state != before {
+            self.emit(Event::Transaction { id, state });
+        }
+    }
+
+    /// Forgets the transaction a session that is gone had open; a new
+    /// session in manual commit leaves auto-commit as the old one did.
+    async fn reset_transaction(&self, id: ConnectionId, session: Option<&Arc<dyn Session>>) {
+        let transaction = self.transaction(id);
+        let mut tx = transaction.lock().await;
+        let before = *tx;
+        tx.open = false;
+        tx.writes = 0;
+        if tx.manual
+            && let Some(session) = session.filter(|session| session.language() == Language::Sql)
+            && let ManualCommit::Setting { off, .. } = session.dialect().manual_commit()
+            && let Err(error) = session.execute(off, ExecLimits::default()).await
+        {
+            log::warn!("manual commit not set on the new session: {error}");
+            tx.manual = false;
+        }
+        self.report(id, before, *tx);
+    }
+
+    /// Runs `command` on `id`'s transaction.
+    async fn transact(
+        &self,
+        id: ConnectionId,
+        command: TxCommand,
+        limits: ExecLimits,
+    ) -> Result<()> {
+        let transaction = self.transaction(id);
+        let mut tx = transaction.lock().await;
+        let before = *tx;
+        let session = self.session(id).ok();
+        if session
+            .as_ref()
+            .is_some_and(|session| session.language() != Language::Sql)
+        {
+            return Err(DbError::unsupported("This database has no transactions"));
+        }
+        let result = async {
+            let ending = match command {
+                TxCommand::Commit => Some(true),
+                TxCommand::Rollback => Some(false),
+                TxCommand::AutoCommit(on) => (on && tx.open).then_some(true),
+            };
+            if let Some(commit) = ending
+                && let Some(session) = &session
+            {
+                let sql = if commit { "COMMIT" } else { "ROLLBACK" };
+                let result = session.execute(sql, limits).await.and_then(|sets| {
+                    // PostgreSQL ends a failed transaction this way.
+                    let rolled_back = sets
+                        .iter()
+                        .any(|set| set.command.as_deref() == Some("ROLLBACK"));
+                    if commit && rolled_back {
+                        tx.open = false;
+                        tx.writes = 0;
+                        self.cache.invalidate(id);
+                        return Err(DbError::new(
+                            ErrorKind::Query,
+                            "A statement in the transaction had failed, so the server rolled \
+                             it back instead of committing",
+                        ));
+                    }
+                    Ok(())
+                });
+                // A failed commit may leave the transaction open (a busy
+                // SQLite file); a failed rollback leaves nothing to undo.
+                if result.is_ok() || !commit {
+                    tx.open = false;
+                    tx.writes = 0;
+                    // What was read inside it may be gone, or now shared.
+                    self.cache.invalidate(id);
+                }
+                result?;
+            } else if ending.is_some() {
+                tx.open = false;
+                tx.writes = 0;
+            }
+            if let TxCommand::AutoCommit(on) = command
+                && tx.manual == on
+            {
+                // Without a session the mode waits for the next one.
+                if let Some(session) = &session
+                    && let ManualCommit::Setting { off, on: back } =
+                        session.dialect().manual_commit()
+                {
+                    session.execute(if on { back } else { off }, limits).await?;
+                }
+                tx.manual = !on;
+            }
+            Ok(())
+        }
+        .await;
+        self.report(id, before, *tx);
+        result
     }
 
     fn running(&self) -> MutexGuard<'_, Running> {
@@ -371,8 +541,11 @@ impl Shared {
         Ok((session, server))
     }
 
-    /// Runs `sql` on `id`'s session as `options` say, through the cache.
+    /// Runs `sql` on `id`'s session as `options` say, through the cache
+    /// and inside the connection's transaction. `schema`, for drivers that
+    /// are not SQL, is where it runs; SQL names its schemas itself.
     #[hotpath::measure]
+    #[allow(clippy::too_many_arguments)]
     async fn query(
         &self,
         request: RequestId,
@@ -380,8 +553,63 @@ impl Shared {
         sql: String,
         options: ExecOptions,
         limits: ExecLimits,
+        schema: Option<String>,
+        control: TxControl,
     ) -> Result<QueryOutput> {
         let session = self.session(id)?;
+        // Transactions are SQL's: other drivers run as they are.
+        if session.language() != Language::Sql {
+            return Self::query_other(&*session, sql, options, limits, schema).await;
+        }
+        let transaction = self.transaction(id);
+        let mut tx = transaction.lock().await;
+        let before = *tx;
+        let writes = options.cache == CachePolicy::Off;
+        // Manual commit opens a transaction before the first write; a
+        // script that opens or ends its own is left to it.
+        if writes && tx.manual && !tx.open && control.open_after.is_none() {
+            if let ManualCommit::Begin(begin) = session.dialect().manual_commit() {
+                session.execute(begin, limits).await?;
+            }
+            tx.open = true;
+        }
+        let result = self
+            .query_in(request, id, &session, sql, options, limits, tx.open)
+            .await;
+        match (&result, control.open_after) {
+            (Ok(_), Some(open)) => {
+                if tx.open && !open {
+                    self.cache.invalidate(id);
+                }
+                tx.open = open;
+                tx.writes = 0;
+            }
+            // Where a failing script stopped is unknown: had it opened a
+            // transaction, one may well be open.
+            (Err(_), _) if control.begins => tx.open = true,
+            _ => {}
+        }
+        if result.is_ok() && writes && tx.open && control.open_after.is_none() {
+            tx.writes = tx.writes.saturating_add(1);
+        }
+        self.report(id, before, *tx);
+        result
+    }
+
+    /// [`Shared::query`] once the transaction is settled. Inside an open
+    /// one the cache is left alone: its rows may be rolled back, and a
+    /// change token may not move until it ends.
+    #[allow(clippy::too_many_arguments)]
+    async fn query_in(
+        &self,
+        request: RequestId,
+        id: ConnectionId,
+        session: &Arc<dyn Session>,
+        sql: String,
+        options: ExecOptions,
+        limits: ExecLimits,
+        in_transaction: bool,
+    ) -> Result<QueryOutput> {
         // A page may ask for more than the usual cap ("fetch all"); its own
         // limit bounds it.
         let limits = options.page.map_or(limits, |page| ExecLimits {
@@ -400,7 +628,8 @@ impl Shared {
             }
             None => (sql, 0),
         };
-        let cacheable = options.cache != CachePolicy::Off;
+        let writes = options.cache == CachePolicy::Off;
+        let cacheable = !writes && !in_transaction;
         let key = CacheKey {
             connection: id,
             sql: sent,
@@ -431,7 +660,7 @@ impl Shared {
         let started = Instant::now();
         let result = session.execute(&key.sql, limits).await;
         self.running().remove(&request);
-        if !cacheable {
+        if writes {
             self.cache.invalidate(id);
         }
         let mut sets = result.map_err(|mut error| {
@@ -473,6 +702,44 @@ impl Shared {
             );
         }
         Ok(output)
+    }
+
+    /// [`Shared::query`] for a driver that is not SQL: it pages itself,
+    /// and nothing is cached (it has no change token to check against).
+    async fn query_other(
+        session: &dyn Session,
+        sql: String,
+        options: ExecOptions,
+        limits: ExecLimits,
+        schema: Option<String>,
+    ) -> Result<QueryOutput> {
+        let started = Instant::now();
+        let (sets, page) = match (options.page, schema) {
+            (Some(page), Some(schema)) => {
+                let limit = u32::try_from(page.limit).unwrap_or(u32::MAX);
+                let mut sets = session.page(&schema, &sql, page.offset, limit).await?;
+                let limit = usize::try_from(page.limit).unwrap_or(usize::MAX);
+                let has_more = sets.first().is_some_and(|set| set.rows.len() > limit);
+                if let Some(set) = sets.first_mut() {
+                    set.rows.truncate(limit);
+                    set.truncated = false;
+                }
+                let info = PageInfo {
+                    offset: page.offset,
+                    limit: page.limit,
+                    has_more,
+                };
+                (sets, Some(info))
+            }
+            (None, Some(schema)) => (session.run_in(&schema, &sql, limits).await?, None),
+            (_, None) => (session.execute(&sql, limits).await?, None),
+        };
+        Ok(QueryOutput {
+            sets,
+            elapsed: started.elapsed(),
+            page,
+            cached: None,
+        })
     }
 }
 
@@ -528,6 +795,7 @@ impl Backend {
                 secrets,
                 cache,
                 sessions: Mutex::default(),
+                transactions: Mutex::default(),
                 running: Mutex::default(),
                 tasks: Mutex::default(),
                 events: Mutex::new(sender),
@@ -554,7 +822,8 @@ impl Backend {
         self.shared.sessions().contains_key(&id)
     }
 
-    /// How a data view reads a relation, in the session's dialect.
+    /// How a data view reads a relation, in the session's dialect, or a
+    /// key of type `subtype` for a key-value store.
     #[must_use]
     pub fn browse_sql(
         &self,
@@ -563,16 +832,27 @@ impl Backend {
         relation: &str,
         filter: Option<&str>,
         order: Option<&OrderBy>,
+        subtype: Option<&str>,
     ) -> Option<String> {
         let session = self.shared.session(id).ok()?;
-        Some(session.dialect().browse(schema, relation, filter, order))
+        Some(match session.language() {
+            Language::Redis => violet_lang::redis::browse(subtype, relation, filter),
+            _ => session.dialect().browse(schema, relation, filter, order),
+        })
     }
 
-    /// How the session's dialect explains `sql`.
+    /// How the session's dialect explains `sql`; `None` for languages
+    /// Violet has no plan for.
     #[must_use]
     pub fn explain_sql(&self, id: ConnectionId, sql: &str, analyze: bool) -> Option<String> {
         let session = self.shared.session(id).ok()?;
-        Some(session.dialect().explain(sql, analyze))
+        (session.language() == Language::Sql).then(|| session.dialect().explain(sql, analyze))
+    }
+
+    /// What the open session's statements are written in.
+    #[must_use]
+    pub fn language(&self, id: ConnectionId) -> Option<Language> {
+        Some(self.shared.session(id).ok()?.language())
     }
 
     /// The most rows one result may hold.
@@ -767,10 +1047,12 @@ impl Backend {
                     // A new session may see other data (another database,
                     // another user): nothing cached carries over.
                     shared.cache.invalidate(id);
-                    let previous = shared.sessions().insert(id, Arc::from(session));
+                    let session: Arc<dyn Session> = Arc::from(session);
+                    let previous = shared.sessions().insert(id, Arc::clone(&session));
                     if let Some(previous) = previous {
                         previous.close().await;
                     }
+                    shared.reset_transaction(id, Some(&session)).await;
                     shared.emit(Event::Connected { id, server });
                 }
                 Err(error) => shared.emit(Event::ConnectFailed { id, error }),
@@ -801,8 +1083,10 @@ impl Backend {
         let shared = Arc::clone(&self.shared);
         self.runtime.spawn(async move {
             if let Some(session) = session {
+                // Closing rolls back what an open transaction wrote.
                 session.close().await;
             }
+            shared.reset_transaction(id, None).await;
             shared.emit(Event::Disconnected { id });
         });
     }
@@ -856,6 +1140,37 @@ impl Backend {
         });
     }
 
+    /// A page of `schema`'s keys matching the glob `pattern`, after the
+    /// ones `cursor` follows.
+    pub fn load_entries(
+        &self,
+        id: ConnectionId,
+        schema: String,
+        pattern: String,
+        cursor: Option<String>,
+    ) {
+        /// Keys listed at a time.
+        const PAGE: u32 = 500;
+        let shared = Arc::clone(&self.shared);
+        self.runtime.spawn(async move {
+            let result = match shared.session(id) {
+                Ok(session) => {
+                    session
+                        .entries(&schema, Some(&pattern), cursor.as_deref(), PAGE)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            shared.emit(Event::Entries {
+                id,
+                schema,
+                pattern,
+                more: cursor.is_some(),
+                result,
+            });
+        });
+    }
+
     /// Reads the foreign keys from or to `schema`'s tables, for completing
     /// joins. Databases the dialect has no query for answer with none.
     pub fn load_foreign_keys(&self, id: ConnectionId, schema: String) {
@@ -864,6 +1179,9 @@ impl Backend {
         self.runtime.spawn(async move {
             let result = async {
                 let session = shared.session(id)?;
+                if session.language() != Language::Sql {
+                    return Ok(Vec::new());
+                }
                 let Some(sql) = session.dialect().foreign_keys(&schema) else {
                     return Ok(Vec::new());
                 };
@@ -876,29 +1194,92 @@ impl Backend {
 
     /// Runs `sql` on the open session for `id`.
     pub fn execute(&self, id: ConnectionId, sql: String, options: ExecOptions) -> RequestId {
+        self.execute_script(id, None, sql, options, TxControl::default())
+    }
+
+    /// Runs `sql` on the open session for `id`; for a driver that is not
+    /// SQL, in `schema` when given (a data view's, the tree's), leaving
+    /// the editor's state alone.
+    pub fn execute_in(
+        &self,
+        id: ConnectionId,
+        schema: Option<String>,
+        sql: String,
+        options: ExecOptions,
+    ) -> RequestId {
+        self.execute_script(id, schema, sql, options, TxControl::default())
+    }
+
+    /// Runs SQL the user wrote, whose own transaction statements `control`
+    /// describes, on the open session for `id`; `schema` as for
+    /// [`Backend::execute_in`].
+    pub fn execute_script(
+        &self,
+        id: ConnectionId,
+        schema: Option<String>,
+        sql: String,
+        options: ExecOptions,
+        control: TxControl,
+    ) -> RequestId {
         let request = self.request();
         let shared = Arc::clone(&self.shared);
         let limits = self.limits;
         self.runtime.spawn(async move {
-            let result = shared.query(request, id, sql, options, limits).await;
+            let result = shared
+                .query(request, id, sql, options, limits, schema, control)
+                .await;
             shared.emit(Event::QueryFinished { request, result });
         });
         request
     }
 
-    /// Counts the rows a single read-only statement returns.
-    pub fn count(&self, id: ConnectionId, sql: String) -> RequestId {
+    /// Commits or rolls back `id`'s transaction, or changes its mode; a
+    /// `TransactionDone` answers. The mode outlives the session: the next
+    /// one starts in it.
+    pub fn transaction(&self, id: ConnectionId, command: TxCommand) {
+        let shared = Arc::clone(&self.shared);
+        let limits = self.limits;
+        self.runtime.spawn(async move {
+            let result = shared.transact(id, command, limits).await;
+            shared.emit(Event::TransactionDone {
+                id,
+                command,
+                result,
+            });
+        });
+    }
+
+    /// Counts the rows a single read-only statement returns; for a driver
+    /// that is not SQL, run in `schema`.
+    pub fn count(&self, id: ConnectionId, schema: Option<String>, sql: String) -> RequestId {
         let request = self.request();
         let shared = Arc::clone(&self.shared);
         let limits = self.limits;
         self.runtime.spawn(async move {
             let result = async {
-                let count = shared.session(id)?.dialect().count(&sql);
+                let session = shared.session(id)?;
+                if session.language() != Language::Sql {
+                    let schema = schema.unwrap_or_default();
+                    return session.count(&schema, &sql).await?.ok_or_else(|| {
+                        DbError::unsupported("This command's rows cannot be counted")
+                    });
+                }
+                let count = session.dialect().count(&sql);
                 let options = ExecOptions {
                     cache: CachePolicy::Use,
                     page: None,
                 };
-                let output = shared.query(request, id, count, options, limits).await?;
+                let output = shared
+                    .query(
+                        request,
+                        id,
+                        count,
+                        options,
+                        limits,
+                        None,
+                        TxControl::default(),
+                    )
+                    .await?;
                 output
                     .sets
                     .first()
