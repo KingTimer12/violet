@@ -134,9 +134,15 @@ pub enum Action {
     LoadFolder(ConnectionId, super::state::Folder),
     /// Opens the dialog picking which schemas a session's database shows.
     ChooseSchemas(ConnectionId),
-    /// Keeps the schemas picked for a `connection/database`; `None` shows
-    /// them all.
-    SetSchemaFilter(String, Option<std::collections::BTreeSet<String>>),
+    /// Opens the dialog picking which databases a connection shows.
+    ChooseDatabases(ConnectionId),
+    /// Keeps the schemas picked for a `connection/database`, or the
+    /// databases for a connection; `None` shows them all.
+    SetTreeFilter(
+        super::state::TreeFilter,
+        String,
+        Option<std::collections::BTreeSet<String>>,
+    ),
     /// Opens advanced copy for a tab's picked cells.
     AdvancedCopy(TabId),
     /// The format and header choice advanced copy starts with next time.

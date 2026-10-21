@@ -9,7 +9,7 @@ use super::action::Action;
 use super::catalog_flow;
 use super::definition_flow::Family;
 use super::icons::Icon;
-use super::state::{Explorer, Folder, FolderItem, Link, Loadable, NodeKey};
+use super::state::{Explorer, Folder, FolderItem, Link, Loadable, NodeKey, TreeFilter};
 use super::theme::{self, Palette};
 use super::widgets;
 
@@ -302,6 +302,22 @@ fn connection(
             if menu_item(ui, Icon::Refresh, "Refresh") {
                 actions.push(Action::Refresh(id));
             }
+            if profile.show_all_databases {
+                if menu_item(ui, Icon::Funnel, "Choose databases…") {
+                    actions.push(Action::ChooseDatabases(id));
+                }
+                if explorer
+                    .database_filters
+                    .contains_key(&Explorer::database_scope(id))
+                    && menu_item(ui, Icon::Close, "Show all databases")
+                {
+                    actions.push(Action::SetTreeFilter(
+                        TreeFilter::Databases,
+                        Explorer::database_scope(id),
+                        None,
+                    ));
+                }
+            }
             if menu_item(ui, Icon::Power, "Disconnect") {
                 actions.push(Action::Disconnect(id));
             }
@@ -355,8 +371,32 @@ fn connection(
             Loadable::Idle | Loadable::Loading => loading_row(ui, 1),
             Loadable::Failed(error) => error_row(ui, 1, &error),
             Loadable::Ready(databases) => {
-                for database in databases.iter() {
+                let picked = explorer
+                    .database_filters
+                    .get(&Explorer::database_scope(id))
+                    .cloned();
+                let shown =
+                    |database: &&String| picked.as_ref().is_none_or(|p| p.contains(*database));
+                for database in databases.iter().filter(shown) {
                     database_node(ui, id, family, database, explorer, actions);
+                }
+                // Hidden ones are a click away.
+                let hidden = databases.len() - databases.iter().filter(shown).count();
+                if hidden > 0 {
+                    let palette = Palette::current(ui.ctx());
+                    let label = format!(
+                        "{hidden} hidden {}",
+                        if hidden == 1 { "database" } else { "databases" }
+                    );
+                    let mut row = Row::new(1, Icon::Funnel, &label);
+                    row.icon_tint = Some(palette.dim);
+                    if row
+                        .show(ui)
+                        .on_hover_text("Choose the databases to show")
+                        .clicked()
+                    {
+                        actions.push(Action::ChooseDatabases(id));
+                    }
                 }
             }
         }
@@ -438,11 +478,44 @@ fn folders(
     actions: &mut Vec<Action>,
 ) {
     for folder in catalog_flow::folders(family) {
-        if *folder == Folder::Schemas {
+        if *folder == Folder::Schemas && family == Family::MySql {
+            databases_inline(ui, id, depth, explorer, actions);
+        } else if *folder == Folder::Schemas {
             schemas_folder(ui, id, depth, explorer, actions);
         } else {
             folder_node(ui, id, *folder, depth, explorer, actions);
         }
+    }
+}
+
+/// MySQL's schemas are its databases: the session's own one shows its
+/// objects straight away; without one, every database shows.
+fn databases_inline(
+    ui: &mut Ui,
+    id: ConnectionId,
+    depth: usize,
+    explorer: &mut Explorer,
+    actions: &mut Vec<Action>,
+) {
+    match explorer.schemas.get(&id).cloned().unwrap_or_default() {
+        Loadable::Idle | Loadable::Loading => loading_row(ui, depth),
+        Loadable::Failed(error) => error_row(ui, depth, &error),
+        Loadable::Ready(schemas) => match &schemas[..] {
+            [database] => {
+                if matches!(
+                    explorer.objects.get(&(id, database.clone())),
+                    None | Some(Loadable::Idle)
+                ) {
+                    actions.push(Action::LoadObjects(id, database.clone()));
+                }
+                schema_contents(ui, id, database, depth, explorer, actions);
+            }
+            schemas => {
+                for schema in schemas {
+                    schema_node(ui, id, schema, Icon::Database, depth, explorer, actions);
+                }
+            }
+        },
     }
 }
 
@@ -492,7 +565,7 @@ fn schemas_folder(
             && let Some(scope) = explorer.schema_scope(id)
             && menu_item(ui, Icon::Close, "Show all schemas")
         {
-            actions.push(Action::SetSchemaFilter(scope, None));
+            actions.push(Action::SetTreeFilter(TreeFilter::Schemas, scope, None));
         }
         if menu_item(ui, Icon::Refresh, "Refresh") {
             actions.push(Action::Refresh(id));
@@ -511,7 +584,7 @@ fn schemas_folder(
                     .is_none_or(|picked| picked.contains(*schema))
             });
             for schema in shown {
-                schema_node(ui, id, schema, depth + 1, explorer, actions);
+                schema_node(ui, id, schema, Icon::Schema, depth + 1, explorer, actions);
             }
         }
     }
@@ -741,10 +814,12 @@ fn folder_item(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn schema_node(
     ui: &mut Ui,
     id: violet_core::ConnectionId,
     schema: &str,
+    icon: Icon,
     depth: usize,
     explorer: &mut Explorer,
     actions: &mut Vec<Action>,
@@ -768,7 +843,7 @@ fn schema_node(
         return;
     }
 
-    let mut row = Row::new(depth, Icon::Schema, schema);
+    let mut row = Row::new(depth, icon, schema);
     row.expanded = Some(expanded);
     row.selected = explorer.selected.as_ref() == Some(&key);
     row.loading = objects.is_loading();
@@ -811,12 +886,29 @@ fn schema_node(
             });
         }
     });
-    if !expanded {
-        return;
+    if expanded {
+        schema_contents(ui, id, schema, depth + 1, explorer, actions);
     }
+}
+
+/// A schema's objects in their groups, at `depth`.
+fn schema_contents(
+    ui: &mut Ui,
+    id: violet_core::ConnectionId,
+    schema: &str,
+    depth: usize,
+    explorer: &mut Explorer,
+    actions: &mut Vec<Action>,
+) {
+    let filter = explorer.filter.trim().to_lowercase();
+    let objects = explorer
+        .objects
+        .get(&(id, schema.to_owned()))
+        .cloned()
+        .unwrap_or_default();
     match objects {
-        Loadable::Idle | Loadable::Loading => loading_row(ui, depth + 1),
-        Loadable::Failed(error) => error_row(ui, depth + 1, &error),
+        Loadable::Idle | Loadable::Loading => loading_row(ui, depth),
+        Loadable::Failed(error) => error_row(ui, depth, &error),
         Loadable::Ready(objects) => {
             // One pass sorts the objects into their groups.
             let mut groups: [Vec<&DbObject>; ObjectKind::ALL.len()] = Default::default();
@@ -837,7 +929,7 @@ fn schema_node(
                     ui,
                     id,
                     schema,
-                    depth + 1,
+                    depth,
                     kind,
                     members,
                     explorer,

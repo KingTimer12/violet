@@ -117,7 +117,7 @@ pub struct VioletApp {
     definitions: HashMap<violet_app::RequestId, definition_flow::PendingDefinition>,
     /// Folder listings being read.
     folder_requests: HashMap<violet_app::RequestId, (ConnectionId, state::Folder)>,
-    schema_chooser: Option<catalog_flow::SchemaChooser>,
+    chooser: Option<catalog_flow::Chooser>,
     /// Actions to run once their connection opens.
     waiting: Vec<(ConnectionId, Action)>,
     /// The format and header choice advanced copy starts with.
@@ -213,6 +213,7 @@ impl VioletApp {
         startup_errors: Vec<Toast>,
     ) -> Self {
         let schema_filters = settings.schema_filters.clone();
+        let database_filters = settings.database_filters.clone();
         let mut app = Self {
             backend: services.backend,
             profiles: services.profiles,
@@ -220,6 +221,7 @@ impl VioletApp {
             settings,
             explorer: Explorer {
                 schema_filters,
+                database_filters,
                 ..Explorer::default()
             },
             workspace: Workspace::default(),
@@ -241,7 +243,7 @@ impl VioletApp {
             definitions: HashMap::new(),
             waiting: Vec::new(),
             folder_requests: HashMap::new(),
-            schema_chooser: None,
+            chooser: None,
             copy_choice: (crate::export::Format::Tsv, true),
             confirm_delete: None,
             queued: Vec::new(),
@@ -1656,7 +1658,10 @@ impl VioletApp {
             } => self.open_trigger(ctx, connection, schema, table, name),
             Action::LoadFolder(connection, folder) => self.load_folder(connection, folder),
             Action::ChooseSchemas(session) => self.choose_schemas(ctx, session),
-            Action::SetSchemaFilter(scope, picked) => self.set_schema_filter(ctx, scope, picked),
+            Action::ChooseDatabases(parent) => self.choose_databases(ctx, parent),
+            Action::SetTreeFilter(kind, scope, picked) => {
+                self.set_tree_filter(ctx, kind, scope, picked);
+            }
             Action::AdvancedCopy(tab_id) => self.open_copy_dialog(tab_id),
             Action::RememberCopy(format, headers) => self.copy_choice = (format, headers),
             Action::CloseReference(tab_id) => {
@@ -1948,10 +1953,10 @@ impl VioletApp {
         {
             self.cell_editor = None;
         }
-        if let Some(chooser) = &mut self.schema_chooser
+        if let Some(chooser) = &mut self.chooser
             && !catalog_flow::show_chooser(ctx, chooser, &mut self.actions)
         {
-            self.schema_chooser = None;
+            self.chooser = None;
         }
         if let Some(dialog) = &mut self.copy_dialog
             && !copy_flow::show(ctx, dialog, &mut self.actions)
