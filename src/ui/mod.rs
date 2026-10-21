@@ -53,7 +53,8 @@ use state::{ConnectionCatalog, Explorer, Link, Loadable, NodeKey};
 use theme::Palette;
 use toasts::{Toast, Toasts};
 use workspace::{
-    Count, DataView, Executed, Outcome, Paging, Running, SavedSession, TabId, TabKind, Workspace,
+    Count, DataView, Executed, Outcome, Paging, QueryTab, Running, SavedSession, TabId, TabKind,
+    Workspace,
 };
 
 /// The most queries the history keeps.
@@ -458,7 +459,7 @@ impl VioletApp {
         };
         let follows = matches!(tab.kind, TabKind::Script)
             && tab.running.is_none()
-            && tab.edits.is_empty()
+            && !tab.has_changes()
             && tab.connection != Some(session)
             && tab
                 .connection
@@ -1133,18 +1134,18 @@ impl VioletApp {
         self.start(tab_id, connection, executed, options, false);
     }
 
-    /// Whether `tab_id` has changed cells a new read would drop: the user
+    /// Whether `tab_id` has grid changes a new read would drop: the user
     /// saves or discards them first.
     fn keeps_edits(&mut self, ctx: &egui::Context, tab_id: TabId) -> bool {
         let pending = self
             .workspace
             .get(tab_id)
-            .is_some_and(|tab| !tab.edits.is_empty());
+            .is_some_and(QueryTab::has_changes);
         if pending {
             self.toasts.push(
                 ctx,
                 Toast::error(
-                    "Changed cells are not saved",
+                    "The grid's changes are not saved",
                     "Save or discard them before reading the rows again.",
                 ),
             );
@@ -1217,7 +1218,7 @@ impl VioletApp {
             .execute(connection, executed.sql.clone(), options);
         if !append {
             // New rows: changes to the old ones are gone with them.
-            tab.edits.clear();
+            tab.clear_changes();
             tab.source = match &tab.kind {
                 TabKind::Data(view) => Some(sql::TableRef {
                     schema: Some(sql::Name {
@@ -1310,11 +1311,22 @@ impl VioletApp {
 
     /// Reads the next page of a paged result, or all that remains up to the
     /// row cap.
-    fn fetch_more(&mut self, tab_id: TabId, all: bool) {
+    fn fetch_more(&mut self, ctx: &egui::Context, tab_id: TabId, all: bool) {
         let max_rows = self.backend.max_rows() as u64;
         let Some(tab) = self.workspace.get_mut(tab_id) else {
             return;
         };
+        // Added rows follow the result's: more rows would land among them.
+        if tab.added > 0 {
+            self.toasts.push(
+                ctx,
+                Toast::error(
+                    "The added rows are not saved",
+                    "Save or discard them before reading more rows.",
+                ),
+            );
+            return;
+        }
         let (Some(connection), Some(paging)) = (tab.connection, &tab.paging) else {
             return;
         };
@@ -1591,6 +1603,9 @@ impl VioletApp {
             | Action::SetCell(..)
             | Action::RevertCell(..)
             | Action::DiscardEdits(_)
+            | Action::AddRow(_)
+            | Action::DeleteRows(..)
+            | Action::RestoreRows(..)
             | Action::ReviewEdits(_)
             | Action::ApplyEdits(_)) => self.edit_action(ctx, action),
             action @ (Action::SaveScript(_)
@@ -1607,8 +1622,8 @@ impl VioletApp {
                 self.run_data(ctx, tab, CachePolicy::Use);
             }
             Action::SortBy(tab, column, descending) => self.sort(ctx, tab, column, descending),
-            Action::FetchMore(tab) => self.fetch_more(tab, false),
-            Action::FetchAll(tab) => self.fetch_more(tab, true),
+            Action::FetchMore(tab) => self.fetch_more(ctx, tab, false),
+            Action::FetchAll(tab) => self.fetch_more(ctx, tab, true),
             Action::CountRows(tab) => self.count_rows(tab),
             Action::Cancel(tab_id) => {
                 if let Some(tab) = self.workspace.get_mut(tab_id)

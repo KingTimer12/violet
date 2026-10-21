@@ -75,6 +75,13 @@ pub enum Action {
     SetCell(TabId, usize, usize, Option<String>),
     RevertCell(TabId, usize, usize),
     DiscardEdits(TabId),
+    /// Adds an empty row to a tab's grid, inserted when its changes are
+    /// saved.
+    AddRow(TabId),
+    /// Marks rows of a tab's grid to delete; an added row just goes.
+    DeleteRows(TabId, Vec<usize>),
+    /// Keeps rows marked to delete after all.
+    RestoreRows(TabId, Vec<usize>),
     /// Shows the statements that save a tab's changed cells.
     ReviewEdits(TabId),
     /// Writes them, the user having reviewed them.
