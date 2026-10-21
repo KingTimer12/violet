@@ -295,6 +295,24 @@ pub trait Dialect: Send + Sync {
     fn foreign_keys(&self, schema: &str) -> Option<String> {
         standard_foreign_keys(schema)
     }
+
+    /// How the session stops committing each statement on its own. By
+    /// default a `BEGIN` opens each transaction.
+    fn manual_commit(&self) -> ManualCommit {
+        ManualCommit::Begin("BEGIN")
+    }
+}
+
+/// How a database leaves auto-commit, for [`Dialect::manual_commit`].
+/// Transactions end with `COMMIT` or `ROLLBACK` either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManualCommit {
+    /// This statement opens each transaction, before its first write:
+    /// PostgreSQL's and SQLite's `BEGIN`.
+    Begin(&'static str),
+    /// A session setting, turned off for manual commit and on again after:
+    /// MySQL's `autocommit`. The server opens each transaction itself.
+    Setting { off: &'static str, on: &'static str },
 }
 
 /// The standard `information_schema` query of [`Dialect::foreign_keys`].
@@ -415,6 +433,19 @@ impl Dialect for SqlDialect {
             standard_foreign_keys(schema)
         }
     }
+
+    fn manual_commit(&self) -> ManualCommit {
+        // A `BEGIN` inside a MySQL transaction commits it: the setting
+        // keeps one open between commits instead.
+        if self.quote_open == '`' {
+            ManualCommit::Setting {
+                off: "SET autocommit = 0",
+                on: "SET autocommit = 1",
+            }
+        } else {
+            ManualCommit::Begin("BEGIN")
+        }
+    }
 }
 
 /// Standard SQL quoting with double quotes.
@@ -456,6 +487,14 @@ mod tests {
             quote_close: '`',
             paging: Paging::LimitOffset,
         };
+        assert!(matches!(
+            mysql.manual_commit(),
+            ManualCommit::Setting { .. }
+        ));
+        assert_eq!(
+            SqlDialect::ANSI.manual_commit(),
+            ManualCommit::Begin("BEGIN")
+        );
         let sql = mysql.foreign_keys("o'k").expect("query");
         assert!(sql.contains("FROM information_schema.KEY_COLUMN_USAGE"));
         assert!(sql.contains("TABLE_SCHEMA = 'o''k' OR REFERENCED_TABLE_SCHEMA = 'o''k'"));

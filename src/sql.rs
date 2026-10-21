@@ -625,6 +625,42 @@ pub fn plan(source: &str) -> Plan {
     }
 }
 
+/// What `source`'s own transaction statements do: `BEGIN` and
+/// `START TRANSACTION` open one; `COMMIT`, `END`, `ROLLBACK` and `ABORT`
+/// end it, except a rollback to a savepoint, a prepared transaction's, or a
+/// MySQL `COMMIT AND CHAIN`, which opens the next. The `END` closing a
+/// trigger's or routine's `BEGIN` body is no commit.
+#[must_use]
+pub fn transaction_control(source: &str) -> violet_app::TxControl {
+    let mut control = violet_app::TxControl::default();
+    let mut in_body = false;
+    for range in statements(source) {
+        let words: Vec<String> = words(&source[range])
+            .into_iter()
+            .map(|(word, _)| word)
+            .collect();
+        let word = |index: usize| words.get(index).map_or("", String::as_str);
+        let has = |wanted: &str| words.iter().any(|w| w == wanted);
+        match word(0) {
+            "CREATE" if has("BEGIN") => in_body = true,
+            "END" if in_body => in_body = false,
+            "BEGIN" | "START" if word(0) == "BEGIN" || word(1) == "TRANSACTION" => {
+                control.begins = true;
+                control.open_after = Some(true);
+            }
+            "END" if words.len() == 1 || matches!(word(1), "TRANSACTION" | "WORK") => {
+                control.open_after = Some(false);
+            }
+            "COMMIT" | "ROLLBACK" | "ABORT" if !has("PREPARED") && !has("TO") => {
+                let chained = has("CHAIN") && !has("NO");
+                control.open_after = Some(chained);
+            }
+            _ => {}
+        }
+    }
+    control
+}
+
 /// Words that mark a statement as setting a password or a secret:
 /// `ALTER ROLE ... PASSWORD '...'`, MySQL's `IDENTIFIED BY '...'`,
 /// `CREATE SUBSCRIPTION ... CONNECTION '...'`.
@@ -966,6 +1002,40 @@ pub fn single_table_select(source: &str) -> Option<TableRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transaction_statements_are_told_apart() {
+        let control = |sql: &str| {
+            let control = transaction_control(sql);
+            (control.begins, control.open_after)
+        };
+        assert_eq!(control("UPDATE t SET a = 1"), (false, None));
+        assert_eq!(control("begin; update t set a = 1"), (true, Some(true)));
+        assert_eq!(control("START TRANSACTION READ ONLY"), (true, Some(true)));
+        assert_eq!(
+            control("BEGIN; UPDATE t SET a = 1; COMMIT"),
+            (true, Some(false))
+        );
+        assert_eq!(control("rollback"), (false, Some(false)));
+        assert_eq!(control("END"), (false, Some(false)));
+        assert_eq!(control("ABORT"), (false, Some(false)));
+        assert_eq!(control("COMMIT AND CHAIN"), (false, Some(true)));
+        assert_eq!(control("COMMIT AND NO CHAIN"), (false, Some(false)));
+        // Savepoints and prepared transactions leave it as it is.
+        assert_eq!(control("ROLLBACK TO SAVEPOINT a"), (false, None));
+        assert_eq!(control("SAVEPOINT a; RELEASE a"), (false, None));
+        assert_eq!(control("COMMIT PREPARED 'x'"), (false, None));
+        // Text in strings and comments is not a statement.
+        assert_eq!(control("SELECT 'COMMIT' -- ROLLBACK"), (false, None));
+        // A trigger's body ends with END, which commits nothing.
+        assert_eq!(
+            control(
+                "CREATE TRIGGER t AFTER INSERT ON a BEGIN UPDATE b SET n = n + 1; END; \
+                 SELECT 1"
+            ),
+            (false, None)
+        );
+    }
 
     #[test]
     fn writes_without_where_are_found() {

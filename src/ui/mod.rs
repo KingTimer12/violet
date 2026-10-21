@@ -32,6 +32,7 @@ mod task_flow;
 mod tasks;
 pub mod theme;
 mod toasts;
+mod transaction_flow;
 mod widgets;
 mod workspace;
 
@@ -113,6 +114,12 @@ pub struct VioletApp {
     close_confirm: Option<script_flow::CloseConfirm>,
     /// The window closes once unsaved scripts were saved or discarded.
     quitting: bool,
+    /// Asks what becomes of open transactions.
+    tx_confirm: Option<transaction_flow::TxConfirm>,
+    /// What waits for each connection's commit or rollback to finish.
+    ending: HashMap<ConnectionId, transaction_flow::Then>,
+    /// Open transactions were dealt with: the window may close.
+    tx_settled: bool,
     keys_dialog: Option<keys_flow::KeysDialog>,
     cell_editor: Option<edit_flow::CellEditor>,
     edit_review: Option<edit_flow::EditReview>,
@@ -258,6 +265,9 @@ impl VioletApp {
             script_prompt: None,
             close_confirm: None,
             quitting: false,
+            tx_confirm: None,
+            ending: HashMap::new(),
+            tx_settled: false,
             keys_dialog: None,
             cell_editor: None,
             edit_review: None,
@@ -549,6 +559,13 @@ impl VioletApp {
     }
 
     /// Closes the sessions on other databases of `parent`.
+    /// Disconnects `id` and the databases opened under it.
+    fn disconnect(&mut self, id: ConnectionId) {
+        self.disconnect_opened(id);
+        self.explorer.links.insert(id, Link::Offline);
+        self.backend.disconnect(id);
+    }
+
     fn disconnect_opened(&mut self, parent: ConnectionId) {
         for id in self.explorer.opened_under(parent) {
             if self.backend.is_connected(id) {
@@ -640,6 +657,14 @@ impl VioletApp {
                 self.explorer.links.insert(id, Link::Offline);
                 self.explorer.forget(id);
             }
+            Event::Transaction { id, state } => {
+                self.explorer.transactions.insert(id, state);
+            }
+            Event::TransactionDone {
+                id,
+                command,
+                result,
+            } => self.transaction_done(ctx, id, command, result),
             Event::Databases { id, result } => {
                 self.explorer
                     .databases
@@ -1317,9 +1342,11 @@ impl VioletApp {
         // A key-value store's data view reads its own database, whatever
         // the editor selected.
         let schema = tab.data().map(|view| view.schema.clone());
-        let request = self
-            .backend
-            .execute_in(connection, schema, executed.sql.clone(), options);
+        // Transaction statements the user wrote are followed, not doubled.
+        let control = sql::transaction_control(&executed.sql);
+        let request =
+            self.backend
+                .execute_script(connection, schema, executed.sql.clone(), options, control);
         if !append {
             // New rows: changes to the old ones are gone with them.
             tab.clear_changes();
@@ -1707,11 +1734,8 @@ impl VioletApp {
             }
             Action::Connect(id) => self.connect(id, None),
             Action::ConnectWithPassword(id, password) => self.connect(id, Some(password)),
-            Action::Disconnect(id) => {
-                self.disconnect_opened(id);
-                self.explorer.links.insert(id, Link::Offline);
-                self.backend.disconnect(id);
-            }
+            Action::Disconnect(id) => self.disconnect_asking(id),
+            Action::Transact(id, command) => self.transact(id, command),
             Action::OpenDatabase(parent, database) => self.open_database(parent, database),
             Action::DatabaseTask(parent, database, kind) => {
                 if let Some(id) = self.database_session(parent, &database) {
@@ -2135,6 +2159,7 @@ impl VioletApp {
             || self.run_review.is_some()
             || self.confirm_delete.is_some()
             || self.close_confirm.is_some()
+            || self.tx_confirm.is_some()
             || self.history_view.is_some()
             || self.task_dialog.is_some()
             || self.keys_dialog.is_some()
@@ -2445,6 +2470,14 @@ impl VioletApp {
         {
             self.answer_close(ctx, confirm, answer);
         }
+        if let Some(answer) = self
+            .tx_confirm
+            .as_ref()
+            .and_then(|confirm| transaction_flow::confirm_transactions(ctx, confirm))
+            && let Some(confirm) = self.tx_confirm.take()
+        {
+            self.answer_transactions(ctx, confirm, answer);
+        }
         if let Some(id) = self.confirm_delete {
             let name = self.profile_name(id);
             match connection_form::confirm_delete(ctx, &name) {
@@ -2490,7 +2523,7 @@ impl eframe::App for VioletApp {
         }
         self.fonts.poll(ctx);
         let closing = ctx.input(|input| input.viewport().close_requested());
-        let closing = closing && !self.keeps_window(ctx);
+        let closing = closing && !self.keeps_window(ctx) && !self.keeps_transactions(ctx);
         self.save_session(closing);
     }
 

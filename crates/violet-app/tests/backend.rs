@@ -1,12 +1,14 @@
-//! The backend against a scripted driver: the result cache, paging, and
-//! providers installed on demand.
+//! The backend against a scripted driver: the result cache, paging,
+//! transactions, and providers installed on demand.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use violet_app::{Backend, CachePolicy, DriverRegistry, Event, ExecOptions};
+use violet_app::{
+    Backend, CachePolicy, DriverRegistry, Event, ExecOptions, Transaction, TxCommand, TxControl,
+};
 use violet_core::driver::AnsiDialect;
 use violet_core::ports::{ProviderListing, ProviderStore};
 use violet_core::{
@@ -22,6 +24,9 @@ struct Server {
     executed: Mutex<Vec<String>>,
     /// The change token; bump it to simulate someone else writing.
     token: AtomicU64,
+    /// A statement failed inside the transaction: `COMMIT` rolls back, as
+    /// PostgreSQL's does.
+    aborted: std::sync::atomic::AtomicBool,
 }
 
 struct FakeDriver(Arc<Server>);
@@ -122,6 +127,12 @@ impl Session for FakeSession {
                 ..DbError::new(ErrorKind::Query, "syntax error")
             });
         }
+        if sql == "COMMIT" && self.0.aborted.swap(false, Ordering::SeqCst) {
+            return Ok(vec![ResultSet {
+                command: Some("ROLLBACK".into()),
+                ..ResultSet::default()
+            }]);
+        }
         if sql.contains("count(*)") {
             let mut set = ResultSet {
                 columns: vec![column("count")],
@@ -175,6 +186,8 @@ struct Harness {
     backend: Backend,
     server: Arc<Server>,
     profile: ConnectionProfile,
+    /// The transaction as last reported.
+    transaction: std::cell::Cell<Transaction>,
 }
 
 impl Harness {
@@ -199,6 +212,7 @@ impl Harness {
             backend,
             server,
             profile,
+            transaction: std::cell::Cell::default(),
         };
         harness.wait(|event| matches!(event, Event::Connected { .. }));
         harness
@@ -208,6 +222,9 @@ impl Harness {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             for event in self.backend.drain() {
+                if let Event::Transaction { state, .. } = &event {
+                    self.transaction.set(*state);
+                }
                 if wanted(&event) {
                     return event;
                 }
@@ -231,6 +248,41 @@ impl Harness {
 
     fn executions(&self) -> usize {
         self.server.executed.lock().expect("lock").len()
+    }
+
+    /// What was sent since the last call.
+    fn sent(&self) -> Vec<String> {
+        std::mem::take(&mut *self.server.executed.lock().expect("lock"))
+    }
+
+    fn script(&self, sql: &str, control: TxControl) -> Result<QueryOutput> {
+        let request = self.backend.execute_script(
+            self.profile.id,
+            None,
+            sql.to_owned(),
+            ExecOptions::WRITE,
+            control,
+        );
+        match self
+            .wait(|event| matches!(event, Event::QueryFinished { request: r, .. } if *r == request))
+        {
+            Event::QueryFinished { result, .. } => result,
+            _ => unreachable!(),
+        }
+    }
+
+    fn transact(&self, command: TxCommand) -> Result<()> {
+        self.backend.transaction(self.profile.id, command);
+        match self.wait(|event| matches!(event, Event::TransactionDone { .. })) {
+            Event::TransactionDone { result, .. } => result,
+            _ => unreachable!(),
+        }
+    }
+
+    /// The transaction as reported by the time the last run or command
+    /// finished.
+    fn state(&self) -> Transaction {
+        self.transaction.get()
     }
 }
 
@@ -409,6 +461,123 @@ fn a_missing_provider_is_installed_when_a_connection_needs_it() {
     }
 }
 
+#[test]
+fn manual_commit_opens_a_transaction_before_the_first_write() {
+    let h = Harness::connected();
+    h.transact(TxCommand::AutoCommit(false)).expect("manual");
+    assert!(h.state().manual);
+
+    // Reads open nothing.
+    h.run("SELECT n FROM t", READ).expect("read");
+    assert_eq!(h.sent(), ["SELECT n FROM t"]);
+
+    h.run("UPDATE t SET n = 1", ExecOptions::WRITE)
+        .expect("write");
+    assert_eq!(h.sent(), ["BEGIN", "UPDATE t SET n = 1"]);
+    let state = h.state();
+    assert!(state.open);
+    assert_eq!(state.writes, 1);
+    h.run("DELETE FROM t", ExecOptions::WRITE).expect("write");
+    assert_eq!(h.sent(), ["DELETE FROM t"]);
+    assert_eq!(h.state().writes, 2);
+
+    // Inside it nothing comes from the cache, or goes into it.
+    h.run("SELECT n FROM t", READ).expect("read");
+    let again = h.run("SELECT n FROM t", READ).expect("read");
+    assert_eq!(again.cached, None);
+    assert_eq!(h.sent(), ["SELECT n FROM t", "SELECT n FROM t"]);
+
+    h.transact(TxCommand::Commit).expect("commit");
+    assert_eq!(h.sent(), ["COMMIT"]);
+    assert_eq!(
+        h.state(),
+        Transaction {
+            manual: true,
+            open: false,
+            writes: 0
+        }
+    );
+
+    // The next write opens the next transaction; turning auto-commit back
+    // on commits it.
+    h.run("UPDATE t SET n = 2", ExecOptions::WRITE)
+        .expect("write");
+    assert_eq!(h.sent(), ["BEGIN", "UPDATE t SET n = 2"]);
+    h.transact(TxCommand::AutoCommit(true))
+        .expect("auto-commit");
+    assert_eq!(h.sent(), ["COMMIT"]);
+    h.run("UPDATE t SET n = 3", ExecOptions::WRITE)
+        .expect("write");
+    assert_eq!(h.sent(), ["UPDATE t SET n = 3"]);
+}
+
+#[test]
+fn rollbacks_and_reconnects_close_the_transaction() {
+    let h = Harness::connected();
+    h.transact(TxCommand::AutoCommit(false)).expect("manual");
+    h.run("UPDATE t SET n = 1", ExecOptions::WRITE)
+        .expect("write");
+    h.transact(TxCommand::Rollback).expect("rollback");
+    assert_eq!(h.sent(), ["BEGIN", "UPDATE t SET n = 1", "ROLLBACK"]);
+
+    h.run("UPDATE t SET n = 1", ExecOptions::WRITE)
+        .expect("write");
+    h.backend.connect(h.profile.clone(), None);
+    h.wait(|event| matches!(event, Event::Connected { .. }));
+    h.sent();
+    // The new session is still in manual commit, with nothing open.
+    h.run("UPDATE t SET n = 2", ExecOptions::WRITE)
+        .expect("write");
+    assert_eq!(h.sent(), ["BEGIN", "UPDATE t SET n = 2"]);
+}
+
+#[test]
+fn scripts_that_open_or_end_their_own_transaction_are_followed() {
+    let h = Harness::connected();
+    let begin = TxControl {
+        begins: true,
+        open_after: Some(true),
+    };
+    let end = TxControl {
+        begins: false,
+        open_after: Some(false),
+    };
+    // In auto-commit, a typed BEGIN still shows as an open transaction.
+    h.script("BEGIN", begin).expect("begin");
+    assert!(h.state().open);
+    h.script("COMMIT", end).expect("commit");
+    assert!(!h.state().open);
+
+    // In manual commit Violet adds no BEGIN of its own to one.
+    h.transact(TxCommand::AutoCommit(false)).expect("manual");
+    h.sent();
+    h.script("BEGIN; UPDATE t SET n = 1", begin).expect("begin");
+    assert_eq!(h.sent(), ["BEGIN; UPDATE t SET n = 1"]);
+    h.script("COMMIT", end).expect("commit");
+
+    // A script that opened one and failed may have left it open.
+    let control = TxControl {
+        begins: true,
+        open_after: Some(false),
+    };
+    h.script("BEGIN; fail; COMMIT", control).expect_err("fails");
+    assert!(h.state().open);
+}
+
+#[test]
+fn a_commit_the_server_turns_into_a_rollback_is_an_error() {
+    let h = Harness::connected();
+    h.transact(TxCommand::AutoCommit(false)).expect("manual");
+    h.run("UPDATE t SET n = 1", ExecOptions::WRITE)
+        .expect("write");
+    h.server
+        .aborted
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let error = h.transact(TxCommand::Commit).expect_err("rolled back");
+    assert!(error.message.contains("rolled it back"));
+    assert!(!h.state().open);
+}
+
 /// A key-value store: it pages, counts and lists itself, so Violet must
 /// never send it SQL of its own.
 struct KeyValueDriver(Arc<Server>);
@@ -525,6 +694,7 @@ fn drivers_that_are_not_sql_never_get_sql() {
         backend,
         server,
         profile,
+        transaction: std::cell::Cell::default(),
     };
     h.wait(|event| matches!(event, Event::Connected { .. }));
     let id = h.profile.id;
@@ -593,4 +763,9 @@ fn drivers_that_are_not_sql_never_get_sql() {
             "execute GET k",
         ]
     );
+
+    // Nor transactions: manual commit is refused, with nothing sent.
+    let refused = h.transact(TxCommand::AutoCommit(false));
+    assert!(refused.is_err());
+    assert_eq!(h.executions(), seen.len());
 }

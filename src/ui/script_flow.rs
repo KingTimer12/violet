@@ -103,7 +103,7 @@ impl VioletApp {
     }
 
     /// Closes the window once its scripts are dealt with.
-    fn quit(&mut self, ctx: &egui::Context) {
+    pub(super) fn quit(&mut self, ctx: &egui::Context) {
         self.quitting = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }

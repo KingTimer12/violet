@@ -19,8 +19,8 @@ pub mod uri;
 
 pub use catalog::{ColumnInfo, DbObject, EntryPage, ForeignKey, ObjectKind, ServerInfo};
 pub use driver::{
-    Canceller, Capabilities, Dialect, Driver, DriverInfo, Language, Login, OrderBy, PagedSql,
-    Paging, Session, SqlDialect, string_literal,
+    Canceller, Capabilities, Dialect, Driver, DriverInfo, Language, Login, ManualCommit, OrderBy,
+    PagedSql, Paging, Session, SqlDialect, string_literal,
 };
 pub use error::{DbError, ErrorKind, Result};
 pub use profile::{ConnectionId, ConnectionProfile, Credentials, DriverId, SslMode, is_loopback};
