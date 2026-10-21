@@ -1,5 +1,6 @@
-//! Every icon Violet draws. Lucide outlines (ISC), drawn in white and tinted
-//! at paint time; the licence is in `assets/icons/LICENSE.txt`.
+//! Every icon Violet draws. Lucide outlines (ISC) and database logos from
+//! Simple Icons (CC0), drawn in white and tinted at paint time; the
+//! licences are in `assets/icons/LICENSE.txt`.
 
 fastframe_icons::icons! {
     /// The interface's icons.
@@ -62,10 +63,31 @@ fastframe_icons::icons! {
         FolderOpen => "folder-open",
         Save => "save",
         ShieldAlert => "shield-alert",
+        PostgreSql => "postgresql",
+        MySql => "mysql",
+        MariaDb => "mariadb",
+        Sqlite => "sqlite",
     }
 }
 
 impl Icon {
+    /// The logo of the database a driver serves; a plain database for
+    /// those without one.
+    pub fn for_driver(id: &str) -> Self {
+        let id = id.to_ascii_lowercase();
+        if id.contains("postgres") {
+            Self::PostgreSql
+        } else if id.contains("maria") {
+            Self::MariaDb
+        } else if id.contains("mysql") {
+            Self::MySql
+        } else if id.contains("sqlite") {
+            Self::Sqlite
+        } else {
+            Self::Database
+        }
+    }
+
     pub fn for_kind(kind: violet_core::ObjectKind) -> Self {
         use violet_core::ObjectKind;
         match kind {
