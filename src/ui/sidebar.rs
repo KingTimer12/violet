@@ -330,6 +330,18 @@ fn connection(
                 objects: Vec::new(),
             });
         }
+        if link.is_online() && (language == Language::Redis || profile.show_all_databases) {
+            ui.separator();
+            if menu_item(ui, Icon::Funnel, "Choose databases…") {
+                actions.push(Action::ChooseDatabases(id));
+            }
+            let scope = Explorer::database_scope(id);
+            if explorer.schema_filters.contains_key(&scope)
+                && menu_item(ui, Icon::Close, "Show all databases")
+            {
+                actions.push(Action::SetSchemaFilter(scope, None));
+            }
+        }
         ui.separator();
         if menu_item(ui, Icon::Pencil, "Edit connection…") {
             actions.push(Action::EditConnection(id));
@@ -357,7 +369,7 @@ fn connection(
             Loadable::Idle | Loadable::Loading => loading_row(ui, 1),
             Loadable::Failed(error) => error_row(ui, 1, &error),
             Loadable::Ready(databases) => {
-                for database in databases.iter() {
+                for database in picked_databases(explorer, id, &databases) {
                     keyspace_node(ui, id, database, explorer, actions);
                 }
             }
@@ -373,7 +385,7 @@ fn connection(
             Loadable::Idle | Loadable::Loading => loading_row(ui, 1),
             Loadable::Failed(error) => error_row(ui, 1, &error),
             Loadable::Ready(databases) => {
-                for database in databases.iter() {
+                for database in picked_databases(explorer, id, &databases) {
                     database_node(ui, id, family, database, explorer, actions);
                 }
             }
@@ -381,6 +393,25 @@ fn connection(
         return;
     }
     folders(ui, id, family, 1, explorer, actions);
+}
+
+/// The databases of a connection the user picked to see, all when none
+/// were. The connection's own is always among them.
+fn picked_databases<'a>(
+    explorer: &Explorer,
+    id: ConnectionId,
+    all: &'a [String],
+) -> Vec<&'a String> {
+    let picked = explorer.schema_filters.get(&Explorer::database_scope(id));
+    let own = match explorer.link(id) {
+        Link::Online(server) => Some(server.database.as_str()),
+        _ => None,
+    };
+    all.iter()
+        .filter(|name| {
+            picked.is_none_or(|picked| picked.contains(*name)) || own == Some(name.as_str())
+        })
+        .collect()
 }
 
 /// The scripts saved for a connection, each opening on its database.
@@ -621,6 +652,14 @@ fn database_node(
             ));
         }
         ui.separator();
+        if family == Family::Postgres && menu_item(ui, Icon::Pencil, "Rename…  (F2)") {
+            actions.push(Action::AskRename(
+                super::rename_flow::RenameTarget::Database {
+                    connection: parent,
+                    name: database.to_owned(),
+                },
+            ));
+        }
         if menu_item(ui, Icon::Copy, "Copy name") {
             actions.push(Action::Copy(database.to_owned()));
         }
@@ -806,6 +845,14 @@ fn schema_node(
         }
         if menu_item(ui, Icon::Refresh, "Refresh") {
             actions.push(Action::LoadObjects(id, schema.to_owned()));
+        }
+        if menu_item(ui, Icon::Pencil, "Rename…  (F2)") {
+            actions.push(Action::AskRename(
+                super::rename_flow::RenameTarget::Schema {
+                    connection: id,
+                    name: schema.to_owned(),
+                },
+            ));
         }
         if menu_item(ui, Icon::Copy, "Copy name") {
             actions.push(Action::Copy(schema.to_owned()));
@@ -1003,6 +1050,15 @@ fn object_node(
                 quote(&object.schema),
                 quote(&object.name)
             )));
+        }
+        if menu_item(ui, Icon::Pencil, "Rename…  (F2)") {
+            actions.push(Action::AskRename(
+                super::rename_flow::RenameTarget::Relation {
+                    connection: id,
+                    schema: object.schema.clone(),
+                    name: object.name.clone(),
+                },
+            ));
         }
         if relation {
             ui.separator();

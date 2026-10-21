@@ -350,7 +350,7 @@ impl VioletApp {
 }
 
 /// A tab's title for the script at `path`: its name as saved.
-fn script_title(store: &violet_storage::ScriptStore, path: &Path) -> String {
+pub(super) fn script_title(store: &violet_storage::ScriptStore, path: &Path) -> String {
     store.locate(path).map_or_else(
         || {
             path.file_stem()

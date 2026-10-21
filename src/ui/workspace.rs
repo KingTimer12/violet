@@ -148,6 +148,8 @@ pub struct QueryTab {
     /// as written, which the sorted one wraps.
     pub sort: Option<(usize, bool)>,
     pub unsorted: Option<String>,
+    /// Reads the rows again on this interval, and when it is next due.
+    pub auto_refresh: Option<(std::time::Duration, std::time::Instant)>,
 }
 
 #[derive(Clone, Debug)]
@@ -250,6 +252,7 @@ impl Workspace {
             edits: BTreeMap::new(),
             sort: None,
             unsorted: None,
+            auto_refresh: None,
         });
         self.active = Some(id);
         id

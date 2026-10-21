@@ -23,3 +23,6 @@ pub const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key
 pub const SAVE_AS: KeyboardShortcut = KeyboardShortcut::new(COMMAND_SHIFT, Key::S);
 pub const OPEN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::O);
 pub const HISTORY: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Y);
+pub const REFRESH: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::F5);
+pub const RENAME: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::F2);
+pub const EDIT_CONNECTION: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::F4);

@@ -126,6 +126,12 @@ pub enum Action {
     CountRows(TabId),
     Cancel(TabId),
     CloseTab(TabId),
+    /// Reads a tab's rows again on an interval; `None` stops it.
+    SetAutoRefresh(TabId, Option<std::time::Duration>),
+    /// Asks for a new name for a tab or a relation.
+    AskRename(super::rename_flow::RenameTarget),
+    /// The name typed in the rename prompt.
+    RenameTo(String),
     SelectTab(TabId),
     SetTabConnection(TabId, Option<ConnectionId>),
     SetTheme(egui::ThemePreference),
@@ -156,6 +162,8 @@ pub enum Action {
     LoadFolder(ConnectionId, super::state::Folder),
     /// Opens the dialog picking which schemas a session's database shows.
     ChooseSchemas(ConnectionId),
+    /// Picks which databases the tree shows for a saved connection.
+    ChooseDatabases(ConnectionId),
     /// Keeps the schemas picked for a `connection/database`; `None` shows
     /// them all.
     SetSchemaFilter(String, Option<std::collections::BTreeSet<String>>),

@@ -161,6 +161,8 @@ pub struct Explorer {
     pub schema_filters: BTreeMap<String, BTreeSet<String>>,
     /// A node was clicked since this was last cleared.
     pub picked: bool,
+    /// The tree was clicked last, so F-key shortcuts act on its selection.
+    pub focused: bool,
     pub filter: String,
 }
 
@@ -178,6 +180,7 @@ impl Explorer {
     pub fn pick(&mut self, key: NodeKey) {
         self.selected = Some(key);
         self.picked = true;
+        self.focused = true;
     }
 
     pub fn toggle(&mut self, key: NodeKey) -> bool {
@@ -209,6 +212,12 @@ impl Explorer {
     /// The saved connection and database a session is on, as
     /// `connection/database`: the key its schema choice is kept under.
     /// `None` until the session says which database it is on.
+    /// The key a saved connection's choice of databases is kept under,
+    /// beside its databases' schema choices.
+    pub fn database_scope(id: ConnectionId) -> String {
+        format!("{}/*", id.0)
+    }
+
     pub fn schema_scope(&self, id: ConnectionId) -> Option<String> {
         if let Some((parent, database)) = self.opened.get(&id) {
             return Some(format!("{}/{database}", parent.0));

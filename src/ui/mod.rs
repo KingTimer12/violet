@@ -19,6 +19,7 @@ pub mod icons;
 mod key_flow;
 mod providers;
 mod reference;
+mod rename_flow;
 mod results;
 mod script_flow;
 mod selection;
@@ -54,7 +55,8 @@ use state::{ConnectionCatalog, Explorer, Link, Loadable, NodeKey};
 use theme::Palette;
 use toasts::{Toast, Toasts};
 use workspace::{
-    Count, DataView, Executed, Outcome, Paging, Running, SavedSession, TabId, TabKind, Workspace,
+    Count, DataView, Executed, Outcome, Paging, QueryTab, Running, SavedSession, TabId, TabKind,
+    Workspace,
 };
 
 /// The most queries the history keeps.
@@ -120,6 +122,8 @@ pub struct VioletApp {
     folder_requests: HashMap<violet_app::RequestId, (ConnectionId, state::Folder)>,
     schema_chooser: Option<catalog_flow::SchemaChooser>,
     key_dialog: Option<key_flow::KeyDialog>,
+    rename_prompt: Option<rename_flow::RenamePrompt>,
+    rename_requests: HashMap<violet_app::RequestId, rename_flow::Pending>,
     /// Commands the tree ran on keys, waiting for their answer.
     key_requests: HashMap<violet_app::RequestId, key_flow::Pending>,
     /// Actions to run once their connection opens.
@@ -249,6 +253,8 @@ impl VioletApp {
             folder_requests: HashMap::new(),
             schema_chooser: None,
             key_dialog: None,
+            rename_prompt: None,
+            rename_requests: HashMap::new(),
             key_requests: HashMap::new(),
             copy_choice: (crate::export::Format::Tsv, true),
             confirm_delete: None,
@@ -685,6 +691,10 @@ impl VioletApp {
                     .insert((id, schema), Loadable::from_result(result));
             }
             Event::QueryFinished { request, result } => {
+                if let Some(pending) = self.rename_requests.remove(&request) {
+                    self.renamed(ctx, pending, &result);
+                    return;
+                }
                 if let Some(pending) = self.key_requests.remove(&request) {
                     self.key_command_done(ctx, pending, &result);
                     return;
@@ -1752,6 +1762,13 @@ impl VioletApp {
                     self.backend.cancel(running.request);
                 }
             }
+            Action::AskRename(target) => self.ask_rename(ctx, target),
+            Action::RenameTo(name) => self.rename(ctx, name),
+            Action::SetAutoRefresh(id, every) => {
+                if let Some(tab) = self.workspace.get_mut(id) {
+                    tab.auto_refresh = every.map(|every| (every, Instant::now() + every));
+                }
+            }
             Action::SelectTab(id) => self.workspace.active = Some(id),
             Action::SetTabConnection(id, connection) => {
                 if let Some(tab) = self.workspace.get_mut(id) {
@@ -1790,6 +1807,7 @@ impl VioletApp {
             } => self.open_trigger(ctx, connection, schema, table, name),
             Action::LoadFolder(connection, folder) => self.load_folder(connection, folder),
             Action::ChooseSchemas(session) => self.choose_schemas(ctx, session),
+            Action::ChooseDatabases(id) => self.choose_databases(ctx, id),
             Action::SetSchemaFilter(scope, picked) => self.set_schema_filter(ctx, scope, picked),
             Action::AdvancedCopy(tab_id) => self.open_copy_dialog(tab_id),
             Action::RememberCopy(format, headers) => self.copy_choice = (format, headers),
@@ -1860,6 +1878,165 @@ impl VioletApp {
         editor::place_cursor(ctx, tab.id, caret);
     }
 
+    /// The saved connection behind `id`, which may be a session opened on
+    /// another of its databases.
+    fn profile_of(&self, id: ConnectionId) -> ConnectionId {
+        self.explorer
+            .opened
+            .get(&id)
+            .map_or(id, |(parent, _)| *parent)
+    }
+
+    /// F5, F2 and F4 on the tree's selected node, while the tree has the
+    /// focus. Returns whether it has it.
+    fn tree_shortcuts(&mut self, ctx: &egui::Context) -> bool {
+        // With no tab open the tree is all there is.
+        let focused = self.explorer.focused || self.workspace.tabs.is_empty();
+        if !focused || ctx.memory(|memory| memory.focused().is_some()) {
+            return false;
+        }
+        let Some(node) = self.explorer.selected.clone() else {
+            return false;
+        };
+        let (refresh, rename, edit) = ctx.input_mut(|input| {
+            (
+                input.consume_shortcut(&shortcuts::REFRESH),
+                input.consume_shortcut(&shortcuts::RENAME),
+                input.consume_shortcut(&shortcuts::EDIT_CONNECTION),
+            )
+        });
+        let id = match &node {
+            NodeKey::Connection(id)
+            | NodeKey::Database(id, _)
+            | NodeKey::Scripts(id)
+            | NodeKey::Schema(id, _)
+            | NodeKey::Group(id, ..)
+            | NodeKey::Object(id, ..)
+            | NodeKey::Folder(id, _) => *id,
+        };
+        let redis = self.language(id) == Language::Redis;
+        if refresh {
+            let action = match &node {
+                NodeKey::Connection(id) => {
+                    self.explorer.link(*id).is_online().then_some(Action::Refresh(*id))
+                }
+                NodeKey::Database(parent, database) => self
+                    .explorer
+                    .opened(*parent, database)
+                    .or_else(|| {
+                        matches!(self.explorer.link(*parent), Link::Online(server) if server.database == *database)
+                            .then_some(*parent)
+                    })
+                    .map(Action::Refresh),
+                NodeKey::Schema(id, schema) | NodeKey::Object(id, schema, _) if redis => {
+                    Some(Action::LoadKeys(*id, schema.clone(), false))
+                }
+                NodeKey::Schema(id, schema)
+                | NodeKey::Group(id, schema, _)
+                | NodeKey::Object(id, schema, _) => Some(Action::LoadObjects(*id, schema.clone())),
+                NodeKey::Folder(id, state::Folder::Schemas) => Some(Action::Refresh(*id)),
+                NodeKey::Folder(id, folder) => Some(Action::LoadFolder(*id, *folder)),
+                NodeKey::Scripts(_) => None,
+            };
+            self.actions.extend(action);
+        }
+        if rename {
+            match &node {
+                NodeKey::Object(id, schema, key) if redis => self.actions.push(Action::KeyDialog {
+                    connection: *id,
+                    schema: schema.clone(),
+                    key: key.clone(),
+                    op: key_flow::KeyOp::Rename,
+                }),
+                NodeKey::Object(id, schema, name) => {
+                    self.actions
+                        .push(Action::AskRename(rename_flow::RenameTarget::Relation {
+                            connection: *id,
+                            schema: schema.clone(),
+                            name: name.clone(),
+                        }));
+                }
+                NodeKey::Schema(id, name) if !redis => {
+                    self.actions
+                        .push(Action::AskRename(rename_flow::RenameTarget::Schema {
+                            connection: *id,
+                            name: name.clone(),
+                        }));
+                }
+                NodeKey::Database(parent, name) => {
+                    self.actions
+                        .push(Action::AskRename(rename_flow::RenameTarget::Database {
+                            connection: *parent,
+                            name: name.clone(),
+                        }));
+                }
+                NodeKey::Connection(id) => self.actions.push(Action::EditConnection(*id)),
+                _ => {}
+            }
+        }
+        if edit {
+            let profile = match &node {
+                NodeKey::Database(parent, _) => *parent,
+                _ => self.profile_of(id),
+            };
+            self.actions.push(Action::EditConnection(profile));
+        }
+        true
+    }
+
+    /// What F5 reads again outside the tree: the active tab's rows, and
+    /// the tree under the database it is on.
+    fn refresh_here(&self) -> Vec<Action> {
+        let Some(tab) = self.workspace.active() else {
+            return Vec::new();
+        };
+        let mut actions = Vec::new();
+        if tab.data().is_some() || tab.last_run.is_some() {
+            actions.push(Action::RefreshTab(tab.id));
+        }
+        if let Some(connection) = tab.connection
+            && self.explorer.link(connection).is_online()
+        {
+            actions.push(match tab.data() {
+                Some(view) if self.language(connection) == Language::Redis => {
+                    Action::LoadKeys(connection, view.schema.clone(), false)
+                }
+                Some(view) => Action::LoadObjects(connection, view.schema.clone()),
+                None => Action::Refresh(connection),
+            });
+        }
+        actions
+    }
+
+    /// Reads again the tabs whose auto-refresh is due, and wakes up for
+    /// the next one.
+    fn auto_refresh(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        let mut next: Option<Instant> = None;
+        let mut due = Vec::new();
+        for tab in &mut self.workspace.tabs {
+            let Some((every, at)) = &mut tab.auto_refresh else {
+                continue;
+            };
+            if *at <= now {
+                *at = now + *every;
+                let ready = tab.running.is_none()
+                    && tab.edits.is_empty()
+                    && tab
+                        .connection
+                        .is_some_and(|id| self.backend.is_connected(id));
+                if ready {
+                    due.push(tab.id);
+                }
+            }
+            next = Some(next.map_or(*at, |next| next.min(*at)));
+        }
+        self.actions.extend(due.into_iter().map(Action::RefreshTab));
+        if let Some(next) = next {
+            ctx.request_repaint_after(next.saturating_duration_since(now));
+        }
+    }
+
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let modal_open = self.form.is_some()
             || self.prompt.is_some()
@@ -1870,11 +2047,13 @@ impl VioletApp {
             || self.confirm_delete.is_some()
             || self.history_view.is_some()
             || self.key_dialog.is_some()
+            || self.rename_prompt.is_some()
             || self.task_dialog.is_some();
         if modal_open {
             return;
         }
         let active = self.workspace.active;
+        let tree = self.tree_shortcuts(ctx);
         ctx.input_mut(|input| {
             // The script shortcut first: it is the statement one plus Shift.
             if input.consume_shortcut(&shortcuts::RUN_SCRIPT)
@@ -1925,6 +2104,22 @@ impl VioletApp {
                     connection: None,
                     sql: String::new(),
                 });
+            }
+            if !tree && input.consume_shortcut(&shortcuts::REFRESH) {
+                self.actions.extend(self.refresh_here());
+            }
+            if !tree
+                && input.consume_shortcut(&shortcuts::RENAME)
+                && let Some(tab) = self.workspace.active()
+            {
+                self.actions.push(Action::AskRename(rename_target(tab)));
+            }
+            if !tree
+                && input.consume_shortcut(&shortcuts::EDIT_CONNECTION)
+                && let Some(id) = self.workspace.active().and_then(|tab| tab.connection)
+            {
+                self.actions
+                    .push(Action::EditConnection(self.profile_of(id)));
             }
             if input.consume_shortcut(&shortcuts::CLOSE_TAB)
                 && let Some(tab) = active
@@ -2116,6 +2311,11 @@ impl VioletApp {
         {
             self.key_dialog = None;
         }
+        if let Some(prompt) = &mut self.rename_prompt
+            && !rename_flow::show(ctx, prompt, &mut self.actions)
+        {
+            self.rename_prompt = None;
+        }
         if let Some(chooser) = &mut self.schema_chooser
             && !catalog_flow::show_chooser(ctx, chooser, &mut self.actions)
         {
@@ -2188,6 +2388,7 @@ impl eframe::App for VioletApp {
             .collect();
         self.handle_events(ctx);
         self.shortcuts(ctx);
+        self.auto_refresh(ctx);
         if std::mem::take(&mut self.names_unchecked) {
             for profile in self.profiles.all() {
                 self.fonts.cover(ctx, &profile.name);
@@ -2281,6 +2482,18 @@ impl eframe::App for VioletApp {
                     &mut self.actions,
                 );
             });
+        // A click anywhere else takes the F-key shortcuts from the tree.
+        if let Some(sidebar) = &sidebar
+            && ctx.input(|input| {
+                input.pointer.any_pressed()
+                    && input
+                        .pointer
+                        .interact_pos()
+                        .is_some_and(|pos| !sidebar.response.rect.contains(pos))
+            })
+        {
+            self.explorer.focused = false;
+        }
         if std::mem::take(&mut self.explorer.picked) {
             self.follow_tree(&ctx);
         }
@@ -2316,4 +2529,16 @@ fn fingerprint(session: &SavedSession) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     session.hash(&mut hasher);
     hasher.finish()
+}
+
+/// What F2 renames for a tab: a data tab's relation, else the tab.
+fn rename_target(tab: &QueryTab) -> rename_flow::RenameTarget {
+    match (tab.connection, tab.data()) {
+        (Some(connection), Some(view)) => rename_flow::RenameTarget::Relation {
+            connection,
+            schema: view.schema.clone(),
+            name: view.relation.clone(),
+        },
+        _ => rename_flow::RenameTarget::Tab(tab.id),
+    }
 }

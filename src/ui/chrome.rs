@@ -7,6 +7,7 @@ use violet_core::{ConnectionId, ConnectionProfile};
 use super::action::{Action, RunScope};
 use super::icons::Icon;
 use super::shortcuts;
+use super::sidebar::menu_item;
 use super::state::{Explorer, Link};
 use super::theme::{self, Palette};
 use super::widgets::{self, Tone};
@@ -196,6 +197,9 @@ pub fn tab_strip(
         bar.bottom() - 0.5,
         Stroke::new(1.0, palette.outline),
     );
+    // The bar behind the tabs: tabs added after it take the clicks on them.
+    ui.interact(bar, ui.id().with("tab-strip-bar"), Sense::click())
+        .context_menu(|ui| strip_menu(ui, workspace, actions));
 
     egui::ScrollArea::horizontal()
         .id_salt("tab-strip")
@@ -203,14 +207,15 @@ pub fn tab_strip(
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
-                for tab in &workspace.tabs {
+                for (index, tab) in workspace.tabs.iter().enumerate() {
                     let active = workspace.active == Some(tab.id);
                     let color = tab
                         .connection
                         .and_then(|id| profiles.iter().find(|p| p.id == id))
                         .and_then(|p| p.color)
                         .map(theme::tag);
-                    tab_button(ui, tab, active, color, actions);
+                    let response = tab_button(ui, tab, active, color, actions);
+                    response.context_menu(|ui| tab_menu(ui, workspace, index, actions));
                 }
                 ui.add_space(4.0);
                 if widgets::icon_button_sized(ui, Icon::Plus, "New SQL editor", 26.0, 15.0)
@@ -232,7 +237,7 @@ fn tab_button(
     active: bool,
     color: Option<egui::Color32>,
     actions: &mut Vec<Action>,
-) {
+) -> egui::Response {
     let palette = Palette::current(ui.ctx());
     let height = ui.available_height().max(36.0);
     // A dot after the title: changes the script's file does not have.
@@ -311,6 +316,120 @@ fn tab_button(
         actions.push(Action::CloseTab(tab.id));
     } else if response.clicked() {
         actions.push(Action::SelectTab(tab.id));
+    }
+    response
+}
+
+/// Intervals offered for reading a tab's rows again on their own.
+const AUTO_REFRESH: [(u64, &str); 7] = [
+    (5, "5 seconds"),
+    (10, "10 seconds"),
+    (30, "30 seconds"),
+    (60, "1 minute"),
+    (300, "5 minutes"),
+    (900, "15 minutes"),
+    (3600, "1 hour"),
+];
+
+/// Picks the interval a tab's rows are read again on.
+pub fn auto_refresh(ui: &mut Ui, tab: &QueryTab, actions: &mut Vec<Action>) {
+    let every = tab.auto_refresh.map(|(every, _)| every.as_secs());
+    let selected = every
+        .and_then(|secs| AUTO_REFRESH.iter().find(|(s, _)| *s == secs))
+        .map_or("Auto-refresh off", |(_, label)| label);
+    egui::ComboBox::from_id_salt(("auto-refresh", tab.id))
+        .selected_text(RichText::new(selected).font(theme::medium(12.5)))
+        .width(130.0)
+        .show_ui(ui, |ui| {
+            if ui.selectable_label(every.is_none(), "Off").clicked() {
+                actions.push(Action::SetAutoRefresh(tab.id, None));
+            }
+            for (secs, label) in AUTO_REFRESH {
+                if ui.selectable_label(every == Some(secs), label).clicked() {
+                    actions.push(Action::SetAutoRefresh(
+                        tab.id,
+                        Some(std::time::Duration::from_secs(secs)),
+                    ));
+                }
+            }
+        })
+        .response
+        .on_hover_text("Read the rows again on their own, as long as no cell is changed");
+}
+
+/// Right-click menu of the empty part of the tab strip.
+fn strip_menu(ui: &mut Ui, workspace: &Workspace, actions: &mut Vec<Action>) {
+    let tabs = &workspace.tabs;
+    let mut chosen = None;
+    if menu_item(ui, Icon::Close, "Close saved") {
+        chosen = Some(
+            tabs.iter()
+                .filter(|t| !t.unsaved())
+                .map(|t| t.id)
+                .collect::<Vec<_>>(),
+        );
+    }
+    if menu_item(ui, Icon::Close, "Close all") {
+        chosen = Some(tabs.iter().map(|t| t.id).collect());
+    }
+    if let Some(ids) = chosen {
+        actions.extend(ids.into_iter().map(Action::CloseTab));
+        ui.close();
+    }
+}
+
+/// Right-click menu of the tab at `index`.
+fn tab_menu(ui: &mut Ui, workspace: &Workspace, index: usize, actions: &mut Vec<Action>) {
+    let tabs = &workspace.tabs;
+    let tab = &tabs[index];
+    let ids = |range: &[QueryTab]| range.iter().map(|t| t.id).collect::<Vec<_>>();
+    let mut chosen = None;
+    if (tab.data().is_some() || tab.last_run.is_some())
+        && menu_item(ui, Icon::Refresh, "Refresh  (F5)")
+    {
+        actions.push(Action::RefreshTab(tab.id));
+        ui.close();
+    }
+    if menu_item(ui, Icon::Pencil, "Rename…  (F2)") {
+        actions.push(Action::AskRename(super::rename_flow::RenameTarget::Tab(
+            tab.id,
+        )));
+        ui.close();
+    }
+    ui.separator();
+    if menu_item(ui, Icon::Close, "Close") {
+        chosen = Some(vec![tab.id]);
+    }
+    ui.add_enabled_ui(tabs.len() > 1, |ui| {
+        if menu_item(ui, Icon::Close, "Close others") {
+            chosen = Some(
+                tabs.iter()
+                    .filter(|t| t.id != tab.id)
+                    .map(|t| t.id)
+                    .collect(),
+            );
+        }
+    });
+    ui.add_enabled_ui(index > 0, |ui| {
+        if menu_item(ui, Icon::Close, "Close to the left") {
+            chosen = Some(ids(&tabs[..index]));
+        }
+    });
+    ui.add_enabled_ui(index + 1 < tabs.len(), |ui| {
+        if menu_item(ui, Icon::Close, "Close to the right") {
+            chosen = Some(ids(&tabs[index + 1..]));
+        }
+    });
+    ui.separator();
+    if menu_item(ui, Icon::Close, "Close saved") {
+        chosen = Some(tabs.iter().filter(|t| !t.unsaved()).map(|t| t.id).collect());
+    }
+    if menu_item(ui, Icon::Close, "Close all") {
+        chosen = Some(ids(tabs));
+    }
+    if let Some(ids) = chosen {
+        actions.extend(ids.into_iter().map(Action::CloseTab));
+        ui.close();
     }
 }
 
@@ -475,6 +594,7 @@ fn data_toolbar(
         {
             actions.push(Action::RefreshTab(tab.id));
         }
+        auto_refresh(ui, tab, actions);
         let cancel_tip = format!("Cancel ({})", ui.ctx().format_shortcut(&shortcuts::CANCEL));
         if ui
             .add_enabled_ui(running, |ui| {

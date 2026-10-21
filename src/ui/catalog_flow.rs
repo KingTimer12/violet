@@ -171,6 +171,35 @@ impl VioletApp {
             all,
             picked,
             filter: String::new(),
+            noun: "schemas",
+        });
+    }
+
+    /// Opens the dialog that picks which databases the tree shows for a
+    /// connection: a key-value store's numbered ones, or a server's.
+    pub(super) fn choose_databases(&mut self, ctx: &egui::Context, id: ConnectionId) {
+        let list = if self.language(id) == violet_core::Language::Redis {
+            self.explorer.schemas.get(&id)
+        } else {
+            self.explorer.databases.get(&id)
+        };
+        let Some(Loadable::Ready(all)) = list else {
+            self.toasts
+                .push(ctx, Toast::info("The databases are still loading."));
+            return;
+        };
+        let all: Vec<String> = all.to_vec();
+        let scope = super::state::Explorer::database_scope(id);
+        let picked = match self.settings.schema_filters.get(&scope) {
+            Some(picked) => picked.clone(),
+            None => all.iter().cloned().collect(),
+        };
+        self.schema_chooser = Some(SchemaChooser {
+            scope,
+            all,
+            picked,
+            filter: String::new(),
+            noun: "databases",
         });
     }
 
@@ -199,6 +228,8 @@ pub struct SchemaChooser {
     all: Vec<String>,
     picked: BTreeSet<String>,
     filter: String,
+    /// What is picked: `schemas` or `databases`.
+    noun: &'static str,
 }
 
 /// Schemas every PostgreSQL or MySQL server has, which few people browse.
@@ -206,7 +237,12 @@ fn is_system_schema(name: &str) -> bool {
     name.starts_with("pg_")
         || matches!(
             name,
-            "information_schema" | "mysql" | "sys" | "performance_schema"
+            "information_schema"
+                | "mysql"
+                | "sys"
+                | "performance_schema"
+                | "template0"
+                | "template1"
         )
 }
 
@@ -224,19 +260,22 @@ pub fn show_chooser(
             ui.set_width(420.0);
             ui.spacing_mut().item_spacing.y = 10.0;
             ui.label(
-                RichText::new("Schemas to show")
+                RichText::new(format!("{} to show", capitalized(chooser.noun)))
                     .font(theme::semibold(16.0))
                     .color(palette.text),
             );
             ui.label(
                 RichText::new(format!(
-                    "{} of {} picked. The tree, completion and the editor still reach the others.",
+                    "{} of {} picked. The editor still reaches the others.",
                     chooser.picked.len(),
                     chooser.all.len()
                 ))
                 .color(palette.dim),
             );
-            ui.add(widgets::text_input(&mut chooser.filter, "Filter schemas"));
+            ui.add(widgets::text_input(
+                &mut chooser.filter,
+                &format!("Filter {}", chooser.noun),
+            ));
             ui.horizontal(|ui| {
                 if widgets::button(ui, Tone::Ghost, None, "All").clicked() {
                     chooser.picked = chooser.all.iter().cloned().collect();
@@ -244,7 +283,8 @@ pub fn show_chooser(
                 if widgets::button(ui, Tone::Ghost, None, "None").clicked() {
                     chooser.picked.clear();
                 }
-                if widgets::button(ui, Tone::Ghost, None, "Hide system schemas").clicked() {
+                let hide = format!("Hide system {}", chooser.noun);
+                if widgets::button(ui, Tone::Ghost, None, &hide).clicked() {
                     chooser.picked.retain(|name| !is_system_schema(name));
                 }
             });
@@ -276,7 +316,7 @@ pub fn show_chooser(
                             widgets::button(ui, Tone::Primary, Some(Icon::Check), "Save")
                         })
                         .inner
-                        .on_disabled_hover_text("Pick at least one schema");
+                        .on_disabled_hover_text("Pick at least one");
                     if save.clicked() {
                         let all = chooser.picked.len() == chooser.all.len();
                         let picked = (!all).then(|| chooser.picked.clone());
@@ -290,6 +330,14 @@ pub fn show_chooser(
             });
         });
     open && !modal.should_close()
+}
+
+fn capitalized(word: &str) -> String {
+    let mut chars = word.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
