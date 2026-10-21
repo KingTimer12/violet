@@ -1,0 +1,32 @@
+# Builds everything, publishes nothing.
+#
+# - A push to master that changes the dependencies builds, to refresh the
+#   build cache the tag builds start from (see release.yml).
+# - Run it by hand (Actions > CI > Run workflow): everything is built and
+#   kept as workflow artifacts only.
+name: CI
+
+on:
+  push:
+    # Caches saved on the default branch are the only ones a tag can read:
+    # each tag is a new ref, and caches are scoped to the ref saving them.
+    branches: [master]
+    paths:
+      - Cargo.lock
+      - providers/*/Cargo.lock
+      - .github/workflows/build.yml
+      - .github/workflows/ci.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      version: dev-${{ github.sha }}

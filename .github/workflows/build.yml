@@ -1,0 +1,208 @@
+# Builds Violet for Windows, macOS and Linux, and the database providers
+# (WebAssembly components). Called by ci.yml (nothing published) and by
+# release.yml (on a tag, with `bump` set); it publishes nothing itself.
+#
+# The packages are built by scripts/package-*.sh, which run the same way
+# on a developer's machine.
+#
+# Actions are pinned to commit SHAs (Dependabot keeps them current), so a
+# moved tag upstream cannot change what builds the release.
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: The tag being built (v0.1.10), else dev-<commit>
+        type: string
+        required: true
+      bump:
+        description: Set the workspace and provider versions from `version` first
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  VERSION: ${{ inputs.version }}
+
+jobs:
+  providers:
+    name: WebAssembly providers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          targets: wasm32-wasip2
+
+      # The packaging tool links Violet's storage crate, whose keychain
+      # support needs D-Bus on Linux.
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
+
+      # Tag builds only read the cache, never save it, and can read only
+      # what master saved: pull requests save under their own ref, so what
+      # they build cannot reach a release.
+      # A release builds what the tag names: the version in Cargo.toml and in
+      # every Cargo.lock follows the tag, whatever the commit says.
+      - name: Set the version from the tag
+        if: inputs.bump
+        shell: bash
+        run: scripts/bump-version.sh "${VERSION#v}"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref_type != 'tag' }}
+          workspaces: |
+            . -> target
+            providers/postgres -> target
+            providers/mysql -> target
+            providers/sqlite -> target
+            providers/redis -> target
+
+      # SQLite is C: the WASI SDK's clang builds it for wasm32-wasip2.
+      # Pinned by digest, like the actions.
+      - name: WASI SDK
+        env:
+          WASI_SDK: wasi-sdk-34.0-x86_64-linux
+          WASI_SDK_SHA256: b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/wasi-sdk.tar.gz" \
+            "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/$WASI_SDK.tar.gz"
+          echo "$WASI_SDK_SHA256  $RUNNER_TEMP/wasi-sdk.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/wasi-sdk.tar.gz" -C "$RUNNER_TEMP"
+          echo "WASI_SDK_PATH=$RUNNER_TEMP/$WASI_SDK" >> "$GITHUB_ENV"
+
+      - name: Build and package
+        run: scripts/package-providers.sh dist
+
+      - name: Check the catalogue
+        run: |
+          test -s dist/providers.json
+          ls -l dist
+          cat dist/providers.json
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: providers
+          path: dist/
+          if-no-files-found: error
+
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+
+      # A release builds what the tag names: the version in Cargo.toml and in
+      # every Cargo.lock follows the tag, whatever the commit says.
+      - name: Set the version from the tag
+        if: inputs.bump
+        shell: bash
+        run: scripts/bump-version.sh "${VERSION#v}"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref_type != 'tag' }}
+
+      # The Windows Installer package is built with the WiX Toolset,
+      # pinned like the actions.
+      - name: WiX Toolset
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          $tools = Join-Path $env:USERPROFILE .dotnet/tools
+          $env:PATH = "$tools;$env:PATH"
+          $tools | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          wix extension add --global WixToolset.Util.wixext/5.0.2
+
+      # The portable zip and the .msi, named as the updater
+      # (fastframe-update) looks for them.
+      - name: Build and package
+        shell: pwsh
+        run: scripts/package-windows.ps1 -Version $env:VERSION -OutDir package
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows
+          path: package/
+          if-no-files-found: error
+
+  macos:
+    name: macOS (universal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      # A release builds what the tag names: the version in Cargo.toml and in
+      # every Cargo.lock follows the tag, whatever the commit says.
+      - name: Set the version from the tag
+        if: inputs.bump
+        shell: bash
+        run: scripts/bump-version.sh "${VERSION#v}"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref_type != 'tag' }}
+
+      - name: Build and package
+        run: scripts/package-macos.sh "$VERSION" package
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos
+          path: package/
+          if-no-files-found: error
+
+  linux:
+    name: Linux ${{ matrix.arch }}
+    strategy:
+      matrix:
+        include:
+          # The oldest supported Ubuntu, so the binary needs no newer glibc
+          # than most desktops have.
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+
+      # D-Bus for the keychain (Secret Service); the window libraries are
+      # loaded at run time.
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
+
+      # A release builds what the tag names: the version in Cargo.toml and in
+      # every Cargo.lock follows the tag, whatever the commit says.
+      - name: Set the version from the tag
+        if: inputs.bump
+        shell: bash
+        run: scripts/bump-version.sh "${VERSION#v}"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref_type != 'tag' }}
+
+      - name: Build and package
+        run: scripts/package-linux.sh "$VERSION" package
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-${{ matrix.arch }}
+          path: package/
+          if-no-files-found: error
