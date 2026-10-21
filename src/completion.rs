@@ -2280,6 +2280,11 @@ mod tests {
         ];
         let got = labels(complete_redis("GET us", 6, Some("db0"), Some(&keys)));
         assert_eq!(got, ["user:1"]);
+        let text = "AUTH secret
+MULTI
+HGETALL us";
+        let got = labels(complete_redis(text, text.len(), Some("db0"), Some(&keys)));
+        assert_eq!(got, ["user:1"]);
         let waiting = complete_redis("GET us", 6, Some("db0"), None).expect("completion");
         assert_eq!(waiting.needs, [Need::Keys("db0".into())]);
         assert!(complete_redis("SET k \"open", 11, None, None).is_none());
