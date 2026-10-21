@@ -7,10 +7,11 @@ use violet_core::{ConnectionId, ConnectionProfile};
 use super::action::{Action, RunScope};
 use super::icons::Icon;
 use super::shortcuts;
+use super::sidebar::menu_item;
 use super::state::{Explorer, Link};
 use super::theme::{self, Palette};
 use super::widgets::{self, Tone};
-use super::workspace::{DataView, QueryTab, Workspace, format_duration, thousands};
+use super::workspace::{DataView, QueryTab, TabId, Workspace, format_duration, thousands};
 
 pub const TITLE_BAR_HEIGHT: f32 = 44.0;
 
@@ -203,14 +204,15 @@ pub fn tab_strip(
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
-                for tab in &workspace.tabs {
+                for (index, tab) in workspace.tabs.iter().enumerate() {
                     let active = workspace.active == Some(tab.id);
                     let color = tab
                         .connection
                         .and_then(|id| profiles.iter().find(|p| p.id == id))
                         .and_then(|p| p.color)
                         .map(theme::tag);
-                    tab_button(ui, tab, active, color, actions);
+                    tab_button(ui, tab, active, color, actions)
+                        .context_menu(|ui| tab_menu(ui, workspace, index, actions));
                 }
                 ui.add_space(4.0);
                 if widgets::icon_button_sized(ui, Icon::Plus, "New SQL editor", 26.0, 15.0)
@@ -226,13 +228,43 @@ pub fn tab_strip(
         });
 }
 
+/// A tab's context menu: closing it or several at once, as editors do,
+/// and its script's file.
+fn tab_menu(ui: &mut Ui, workspace: &Workspace, index: usize, actions: &mut Vec<Action>) {
+    let ids: Vec<TabId> = workspace.tabs.iter().map(|tab| tab.id).collect();
+    let tab = &workspace.tabs[index];
+    let mut close = |ui: &mut Ui, label: &str, icon: Icon, ids: &[TabId]| {
+        let clicked = ui
+            .add_enabled_ui(!ids.is_empty(), |ui| menu_item(ui, icon, label))
+            .inner;
+        if clicked {
+            actions.push(Action::CloseTabs(ids.to_vec()));
+        }
+    };
+    close(ui, "Close", Icon::Close, &[tab.id]);
+    let others: Vec<TabId> = ids.iter().copied().filter(|id| *id != tab.id).collect();
+    close(ui, "Close others", Icon::Close, &others);
+    close(ui, "Close to the left", Icon::Close, &ids[..index]);
+    close(ui, "Close to the right", Icon::Close, &ids[index + 1..]);
+    close(ui, "Close all", Icon::Close, &ids);
+    if let Some(file) = &tab.file {
+        ui.separator();
+        if menu_item(ui, Icon::Copy, "Copy path") {
+            actions.push(Action::Copy(file.path.display().to_string()));
+        }
+        if menu_item(ui, Icon::FolderOpen, "Show in folder") {
+            actions.push(Action::Reveal(file.path.clone()));
+        }
+    }
+}
+
 fn tab_button(
     ui: &mut Ui,
     tab: &QueryTab,
     active: bool,
     color: Option<egui::Color32>,
     actions: &mut Vec<Action>,
-) {
+) -> egui::Response {
     let palette = Palette::current(ui.ctx());
     let height = ui.available_height().max(36.0);
     // A dot after the title: changes the script's file does not have.
@@ -312,6 +344,7 @@ fn tab_button(
     } else if response.clicked() {
         actions.push(Action::SelectTab(tab.id));
     }
+    response
 }
 
 /// The bar above an editor: connection, run buttons.

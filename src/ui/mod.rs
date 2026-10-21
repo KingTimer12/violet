@@ -103,6 +103,10 @@ pub struct VioletApp {
     /// The scripts saved for connections, as last listed.
     script_list: Vec<SavedScript>,
     script_prompt: Option<script_flow::ScriptPrompt>,
+    /// Asks about unsaved scripts before their tabs close.
+    close_confirm: Option<script_flow::CloseConfirm>,
+    /// The window closes once unsaved scripts were saved or discarded.
+    quitting: bool,
     cell_editor: Option<edit_flow::CellEditor>,
     edit_review: Option<edit_flow::EditReview>,
     run_review: Option<edit_flow::RunReview>,
@@ -233,6 +237,8 @@ impl VioletApp {
             scripts: services.scripts,
             script_list: Vec::new(),
             script_prompt: None,
+            close_confirm: None,
+            quitting: false,
             cell_editor: None,
             edit_review: None,
             run_review: None,
@@ -1613,13 +1619,8 @@ impl VioletApp {
                 }
                 self.queued.retain(|(tab, _)| *tab != tab_id);
             }
-            Action::CloseTab(id) => {
-                if let Some(tab) = self.workspace.close(id)
-                    && let Some(running) = tab.running
-                {
-                    self.backend.cancel(running.request);
-                }
-            }
+            Action::CloseTab(id) => self.close_tabs(vec![id]),
+            Action::CloseTabs(ids) => self.close_tabs(ids),
             Action::SelectTab(id) => self.workspace.active = Some(id),
             Action::SetTabConnection(id, connection) => {
                 if let Some(tab) = self.workspace.get_mut(id) {
@@ -1735,6 +1736,7 @@ impl VioletApp {
             || self.edit_review.is_some()
             || self.run_review.is_some()
             || self.confirm_delete.is_some()
+            || self.close_confirm.is_some()
             || self.history_view.is_some()
             || self.task_dialog.is_some();
         if modal_open {
@@ -1984,6 +1986,14 @@ impl VioletApp {
             }
         }
         self.task_modal(ctx);
+        if let Some(answer) = self
+            .close_confirm
+            .as_ref()
+            .and_then(|confirm| script_flow::confirm_close(ctx, confirm))
+            && let Some(confirm) = self.close_confirm.take()
+        {
+            self.answer_close(ctx, confirm, answer);
+        }
         if let Some(id) = self.confirm_delete {
             let name = self.profile_name(id);
             match connection_form::confirm_delete(ctx, &name) {
@@ -2020,6 +2030,7 @@ impl eframe::App for VioletApp {
         }
         self.fonts.poll(ctx);
         let closing = ctx.input(|input| input.viewport().close_requested());
+        let closing = closing && !self.keeps_window(ctx);
         self.save_session(closing);
     }
 

@@ -104,6 +104,8 @@ pub enum Action {
     CountRows(TabId),
     Cancel(TabId),
     CloseTab(TabId),
+    /// Closes several tabs at once, asking once about unsaved scripts.
+    CloseTabs(Vec<TabId>),
     SelectTab(TabId),
     SetTabConnection(TabId, Option<ConnectionId>),
     SetTheme(egui::ThemePreference),
