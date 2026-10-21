@@ -75,10 +75,25 @@ pub enum Action {
     SetCell(TabId, usize, usize, Option<String>),
     RevertCell(TabId, usize, usize),
     DiscardEdits(TabId),
+    /// Adds an empty row to a tab's grid, inserted when its changes are
+    /// saved.
+    AddRow(TabId),
+    /// Marks rows of a tab's grid to delete; an added row just goes.
+    DeleteRows(TabId, Vec<usize>),
+    /// Keeps rows marked to delete after all.
+    RestoreRows(TabId, Vec<usize>),
     /// Shows the statements that save a tab's changed cells.
     ReviewEdits(TabId),
     /// Writes them, the user having reviewed them.
     ApplyEdits(TabId),
+    /// Opens the keyboard shortcuts dialog.
+    OpenShortcuts,
+    /// Changes a command's shortcut; `None` puts its default back.
+    SetShortcut(super::shortcuts::Command, Option<egui::KeyboardShortcut>),
+    /// Formats an editor's selection, or its whole script.
+    FormatSql(TabId),
+    /// Opens an editor's find bar; `true` with its replace field.
+    Find(TabId, bool),
     /// Saves an editor: to its file, else as a script of its connection's
     /// database, else wherever the user picks.
     SaveScript(TabId),
@@ -104,6 +119,8 @@ pub enum Action {
     CountRows(TabId),
     Cancel(TabId),
     CloseTab(TabId),
+    /// Closes several tabs at once, asking once about unsaved scripts.
+    CloseTabs(Vec<TabId>),
     SelectTab(TabId),
     SetTabConnection(TabId, Option<ConnectionId>),
     SetTheme(egui::ThemePreference),
@@ -134,9 +151,15 @@ pub enum Action {
     LoadFolder(ConnectionId, super::state::Folder),
     /// Opens the dialog picking which schemas a session's database shows.
     ChooseSchemas(ConnectionId),
-    /// Keeps the schemas picked for a `connection/database`; `None` shows
-    /// them all.
-    SetSchemaFilter(String, Option<std::collections::BTreeSet<String>>),
+    /// Opens the dialog picking which databases a connection shows.
+    ChooseDatabases(ConnectionId),
+    /// Keeps the schemas picked for a `connection/database`, or the
+    /// databases for a connection; `None` shows them all.
+    SetTreeFilter(
+        super::state::TreeFilter,
+        String,
+        Option<std::collections::BTreeSet<String>>,
+    ),
     /// Opens advanced copy for a tab's picked cells.
     AdvancedCopy(TabId),
     /// The format and header choice advanced copy starts with next time.

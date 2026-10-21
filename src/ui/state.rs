@@ -80,6 +80,14 @@ impl Folder {
     }
 }
 
+/// What a tree filter picks: a database's schemas, or a server's
+/// databases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TreeFilter {
+    Schemas,
+    Databases,
+}
+
 /// An entry of the triggers, roles or extensions folder.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FolderItem {
@@ -120,6 +128,9 @@ pub struct Explorer {
     /// The schemas shown per `connection/database` (see
     /// [`Explorer::schema_scope`]), as the settings keep them.
     pub schema_filters: BTreeMap<String, BTreeSet<String>>,
+    /// The databases shown per saved connection (its id), as the settings
+    /// keep them.
+    pub database_filters: BTreeMap<String, BTreeSet<String>>,
     /// A node was clicked since this was last cleared.
     pub picked: bool,
     pub filter: String,
@@ -159,6 +170,11 @@ impl Explorer {
         self.columns.retain(|(owner, _, _), _| *owner != id);
         self.foreign_keys.retain(|(owner, _), _| *owner != id);
         self.folders.retain(|(owner, _), _| *owner != id);
+    }
+
+    /// The key a saved connection's database choice is kept under.
+    pub fn database_scope(id: ConnectionId) -> String {
+        id.0.to_string()
     }
 
     /// The saved connection and database a session is on, as

@@ -8,7 +8,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod completion;
+mod editing;
 mod export;
+mod format;
 mod settings;
 mod sql;
 mod ui;

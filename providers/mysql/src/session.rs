@@ -23,6 +23,8 @@ pub struct MySession {
     wire: RefCell<Wire>,
     /// From the greeting, in case `VERSION()` is not answered.
     version: String,
+    /// The database the profile names; empty for none.
+    database: String,
 }
 
 /// What one statement produced.
@@ -47,6 +49,7 @@ impl MySession {
         Ok(Self {
             wire: RefCell::new(wire),
             version: greeting.version,
+            database: params.database.trim().to_owned(),
         })
     }
 
@@ -258,7 +261,20 @@ impl Session for MySession {
         })
     }
 
+    fn databases(&self) -> Result<Vec<String>> {
+        Ok(self
+            .query(catalog::SCHEMAS)?
+            .into_iter()
+            .filter_map(|row| cell(&row, 0))
+            .collect())
+    }
+
+    /// The session's own database alone: the others show as databases.
+    /// Without one, every database.
     fn schemas(&self) -> Result<Vec<String>> {
+        if !self.database.is_empty() {
+            return Ok(vec![self.database.clone()]);
+        }
         Ok(self
             .query(catalog::SCHEMAS)?
             .into_iter()

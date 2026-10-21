@@ -16,6 +16,7 @@ mod export_flow;
 mod fonts;
 mod history;
 pub mod icons;
+mod keys_flow;
 mod providers;
 mod reference;
 mod results;
@@ -49,11 +50,13 @@ use crate::settings::Settings;
 use crate::sql;
 use action::{Action, RunScope};
 use connection_form::{ConnectionForm, PasswordPrompt, TestState};
+use shortcuts::Command;
 use state::{ConnectionCatalog, Explorer, Link, Loadable, NodeKey};
 use theme::Palette;
 use toasts::{Toast, Toasts};
 use workspace::{
-    Count, DataView, Executed, Outcome, Paging, Running, SavedSession, TabId, TabKind, Workspace,
+    Count, DataView, Executed, Outcome, Paging, QueryTab, Running, SavedSession, TabId, TabKind,
+    Workspace,
 };
 
 /// The most queries the history keeps.
@@ -103,6 +106,11 @@ pub struct VioletApp {
     /// The scripts saved for connections, as last listed.
     script_list: Vec<SavedScript>,
     script_prompt: Option<script_flow::ScriptPrompt>,
+    /// Asks about unsaved scripts before their tabs close.
+    close_confirm: Option<script_flow::CloseConfirm>,
+    /// The window closes once unsaved scripts were saved or discarded.
+    quitting: bool,
+    keys_dialog: Option<keys_flow::KeysDialog>,
     cell_editor: Option<edit_flow::CellEditor>,
     edit_review: Option<edit_flow::EditReview>,
     run_review: Option<edit_flow::RunReview>,
@@ -117,7 +125,7 @@ pub struct VioletApp {
     definitions: HashMap<violet_app::RequestId, definition_flow::PendingDefinition>,
     /// Folder listings being read.
     folder_requests: HashMap<violet_app::RequestId, (ConnectionId, state::Folder)>,
-    schema_chooser: Option<catalog_flow::SchemaChooser>,
+    chooser: Option<catalog_flow::Chooser>,
     /// Actions to run once their connection opens.
     waiting: Vec<(ConnectionId, Action)>,
     /// The format and header choice advanced copy starts with.
@@ -209,10 +217,16 @@ impl VioletApp {
     pub fn new(
         ctx: &egui::Context,
         services: Services,
-        settings: Settings,
+        mut settings: Settings,
         startup_errors: Vec<Toast>,
     ) -> Self {
+        // Shortcuts no longer understood are dropped.
+        settings
+            .shortcuts
+            .retain(|_, text| shortcuts::parse(text).is_some());
+        shortcuts::apply(&settings.shortcuts);
         let schema_filters = settings.schema_filters.clone();
+        let database_filters = settings.database_filters.clone();
         let mut app = Self {
             backend: services.backend,
             profiles: services.profiles,
@@ -220,6 +234,7 @@ impl VioletApp {
             settings,
             explorer: Explorer {
                 schema_filters,
+                database_filters,
                 ..Explorer::default()
             },
             workspace: Workspace::default(),
@@ -231,6 +246,9 @@ impl VioletApp {
             scripts: services.scripts,
             script_list: Vec::new(),
             script_prompt: None,
+            close_confirm: None,
+            quitting: false,
+            keys_dialog: None,
             cell_editor: None,
             edit_review: None,
             run_review: None,
@@ -241,7 +259,7 @@ impl VioletApp {
             definitions: HashMap::new(),
             waiting: Vec::new(),
             folder_requests: HashMap::new(),
-            schema_chooser: None,
+            chooser: None,
             copy_choice: (crate::export::Format::Tsv, true),
             confirm_delete: None,
             queued: Vec::new(),
@@ -450,7 +468,7 @@ impl VioletApp {
         };
         let follows = matches!(tab.kind, TabKind::Script)
             && tab.running.is_none()
-            && tab.edits.is_empty()
+            && !tab.has_changes()
             && tab.connection != Some(session)
             && tab
                 .connection
@@ -1125,18 +1143,18 @@ impl VioletApp {
         self.start(tab_id, connection, executed, options, false);
     }
 
-    /// Whether `tab_id` has changed cells a new read would drop: the user
+    /// Whether `tab_id` has grid changes a new read would drop: the user
     /// saves or discards them first.
     fn keeps_edits(&mut self, ctx: &egui::Context, tab_id: TabId) -> bool {
         let pending = self
             .workspace
             .get(tab_id)
-            .is_some_and(|tab| !tab.edits.is_empty());
+            .is_some_and(QueryTab::has_changes);
         if pending {
             self.toasts.push(
                 ctx,
                 Toast::error(
-                    "Changed cells are not saved",
+                    "The grid's changes are not saved",
                     "Save or discard them before reading the rows again.",
                 ),
             );
@@ -1209,7 +1227,7 @@ impl VioletApp {
             .execute(connection, executed.sql.clone(), options);
         if !append {
             // New rows: changes to the old ones are gone with them.
-            tab.edits.clear();
+            tab.clear_changes();
             tab.source = match &tab.kind {
                 TabKind::Data(view) => Some(sql::TableRef {
                     schema: Some(sql::Name {
@@ -1302,11 +1320,22 @@ impl VioletApp {
 
     /// Reads the next page of a paged result, or all that remains up to the
     /// row cap.
-    fn fetch_more(&mut self, tab_id: TabId, all: bool) {
+    fn fetch_more(&mut self, ctx: &egui::Context, tab_id: TabId, all: bool) {
         let max_rows = self.backend.max_rows() as u64;
         let Some(tab) = self.workspace.get_mut(tab_id) else {
             return;
         };
+        // Added rows follow the result's: more rows would land among them.
+        if tab.added > 0 {
+            self.toasts.push(
+                ctx,
+                Toast::error(
+                    "The added rows are not saved",
+                    "Save or discard them before reading more rows.",
+                ),
+            );
+            return;
+        }
         let (Some(connection), Some(paging)) = (tab.connection, &tab.paging) else {
             return;
         };
@@ -1337,6 +1366,58 @@ impl VioletApp {
             |(executed, _)| executed.clone(),
         );
         self.start(tab_id, connection, executed, options, true);
+    }
+
+    /// Formats an editor's selection, or its whole script, keeping the
+    /// formatted text selected.
+    fn format_sql(&mut self, ctx: &egui::Context, tab_id: TabId) {
+        let mysql = self
+            .workspace
+            .get(tab_id)
+            .and_then(|tab| tab.connection)
+            .is_some_and(|id| self.dialect(id).quote_open == '`');
+        let Some(tab) = self.workspace.get_mut(tab_id) else {
+            return;
+        };
+        let range = if tab.selection.is_empty() {
+            0..tab.sql.len()
+        } else {
+            tab.selection.clone()
+        };
+        let Some(source) = tab.sql.get(range.clone()) else {
+            return;
+        };
+        let formatted = match crate::format::format(source, mysql) {
+            Ok(formatted) => formatted,
+            Err(refused) => {
+                let why = match refused {
+                    crate::format::Refused::Backslash => {
+                        "A string escapes a quote with a backslash, which the formatter does \
+                         not read."
+                    }
+                    crate::format::Refused::Changed => {
+                        "Formatting would change more than spacing here."
+                    }
+                };
+                self.toasts
+                    .push(ctx, Toast::error("The SQL was not formatted", why));
+                return;
+            }
+        };
+        if formatted == source {
+            return;
+        }
+        let text = format!(
+            "{}{formatted}{}",
+            &tab.sql[..range.start],
+            &tab.sql[range.end..]
+        );
+        let selection = if tab.selection.is_empty() {
+            0..0
+        } else {
+            range.start..range.start + formatted.len()
+        };
+        editor::replace_text(ctx, tab, crate::editing::Edited { text, selection });
     }
 
     /// Runs the shown result again, past the cache.
@@ -1583,6 +1664,9 @@ impl VioletApp {
             | Action::SetCell(..)
             | Action::RevertCell(..)
             | Action::DiscardEdits(_)
+            | Action::AddRow(_)
+            | Action::DeleteRows(..)
+            | Action::RestoreRows(..)
             | Action::ReviewEdits(_)
             | Action::ApplyEdits(_)) => self.edit_action(ctx, action),
             action @ (Action::SaveScript(_)
@@ -1599,8 +1683,8 @@ impl VioletApp {
                 self.run_data(ctx, tab, CachePolicy::Use);
             }
             Action::SortBy(tab, column, descending) => self.sort(ctx, tab, column, descending),
-            Action::FetchMore(tab) => self.fetch_more(tab, false),
-            Action::FetchAll(tab) => self.fetch_more(tab, true),
+            Action::FetchMore(tab) => self.fetch_more(ctx, tab, false),
+            Action::FetchAll(tab) => self.fetch_more(ctx, tab, true),
             Action::CountRows(tab) => self.count_rows(tab),
             Action::Cancel(tab_id) => {
                 if let Some(tab) = self.workspace.get_mut(tab_id)
@@ -1611,14 +1695,17 @@ impl VioletApp {
                 }
                 self.queued.retain(|(tab, _)| *tab != tab_id);
             }
-            Action::CloseTab(id) => {
-                if let Some(tab) = self.workspace.close(id)
-                    && let Some(running) = tab.running
-                {
-                    self.backend.cancel(running.request);
+            Action::CloseTab(id) => self.close_tabs(vec![id]),
+            Action::CloseTabs(ids) => self.close_tabs(ids),
+            Action::SelectTab(id) => self.workspace.active = Some(id),
+            Action::FormatSql(id) => self.format_sql(ctx, id),
+            Action::OpenShortcuts => self.keys_dialog = Some(keys_flow::KeysDialog::default()),
+            Action::SetShortcut(command, shortcut) => self.set_shortcut(ctx, command, shortcut),
+            Action::Find(id, replacing) => {
+                if let Some(tab) = self.workspace.get_mut(id) {
+                    editor::open_find(tab, replacing);
                 }
             }
-            Action::SelectTab(id) => self.workspace.active = Some(id),
             Action::SetTabConnection(id, connection) => {
                 if let Some(tab) = self.workspace.get_mut(id) {
                     tab.connection = connection;
@@ -1656,7 +1743,10 @@ impl VioletApp {
             } => self.open_trigger(ctx, connection, schema, table, name),
             Action::LoadFolder(connection, folder) => self.load_folder(connection, folder),
             Action::ChooseSchemas(session) => self.choose_schemas(ctx, session),
-            Action::SetSchemaFilter(scope, picked) => self.set_schema_filter(ctx, scope, picked),
+            Action::ChooseDatabases(parent) => self.choose_databases(ctx, parent),
+            Action::SetTreeFilter(kind, scope, picked) => {
+                self.set_tree_filter(ctx, kind, scope, picked);
+            }
             Action::AdvancedCopy(tab_id) => self.open_copy_dialog(tab_id),
             Action::RememberCopy(format, headers) => self.copy_choice = (format, headers),
             Action::CloseReference(tab_id) => {
@@ -1730,72 +1820,74 @@ impl VioletApp {
             || self.edit_review.is_some()
             || self.run_review.is_some()
             || self.confirm_delete.is_some()
+            || self.close_confirm.is_some()
             || self.history_view.is_some()
-            || self.task_dialog.is_some();
+            || self.task_dialog.is_some()
+            || self.keys_dialog.is_some();
         if modal_open {
             return;
         }
         let active = self.workspace.active;
         ctx.input_mut(|input| {
             // The script shortcut first: it is the statement one plus Shift.
-            if input.consume_shortcut(&shortcuts::RUN_SCRIPT)
+            if shortcuts::consume(input, Command::RunScript)
                 && let Some(tab) = active
             {
                 self.actions.push(Action::Run(tab, RunScope::Script));
             }
-            if input.consume_shortcut(&shortcuts::EXPLAIN_ANALYZE)
+            if shortcuts::consume(input, Command::ExplainAnalyze)
                 && let Some(tab) = active
             {
                 self.actions
                     .push(Action::Run(tab, RunScope::ExplainAnalyze));
             }
-            if input.consume_shortcut(&shortcuts::EXPLAIN)
+            if shortcuts::consume(input, Command::Explain)
                 && let Some(tab) = active
             {
                 self.actions.push(Action::Run(tab, RunScope::Explain));
             }
             // Save as first: it is save plus Shift.
-            if input.consume_shortcut(&shortcuts::SAVE_AS)
+            if shortcuts::consume(input, Command::SaveAs)
                 && let Some(tab) = active
             {
                 self.actions.push(Action::SaveScriptAs(tab));
             }
-            if input.consume_shortcut(&shortcuts::SAVE)
+            if shortcuts::consume(input, Command::Save)
                 && let Some(tab) = active
             {
                 self.actions.push(Action::SaveScript(tab));
             }
-            if input.consume_shortcut(&shortcuts::OPEN) {
+            if shortcuts::consume(input, Command::Open) {
                 self.actions.push(Action::OpenScriptFile);
             }
-            if input.consume_shortcut(&shortcuts::HISTORY) {
+            if shortcuts::consume(input, Command::History) {
                 self.actions.push(Action::OpenHistory);
             }
-            if input.consume_shortcut(&shortcuts::RUN_STATEMENT)
+            if shortcuts::consume(input, Command::RunStatement)
                 && let Some(tab) = active
             {
                 self.actions.push(Action::Run(tab, RunScope::Statement));
             }
-            if input.consume_shortcut(&shortcuts::CANCEL)
+            if shortcuts::consume(input, Command::Cancel)
                 && let Some(tab) = active
             {
                 self.actions.push(Action::Cancel(tab));
             }
-            if input.consume_shortcut(&shortcuts::NEW_EDITOR) {
+            if shortcuts::consume(input, Command::NewEditor) {
                 self.actions.push(Action::OpenEditor {
                     connection: None,
                     sql: String::new(),
                 });
             }
-            if input.consume_shortcut(&shortcuts::CLOSE_TAB)
+            if shortcuts::consume(input, Command::CloseTab)
                 && let Some(tab) = active
             {
                 self.actions.push(Action::CloseTab(tab));
             }
-            if input.consume_shortcut(&shortcuts::NEW_CONNECTION) {
+            if shortcuts::consume(input, Command::NewConnection) {
                 self.actions.push(Action::NewConnection);
             }
-            if input.consume_shortcut(&shortcuts::TOGGLE_SIDEBAR) {
+            if shortcuts::consume(input, Command::ToggleSidebar) {
                 self.actions.push(Action::ToggleSidebar);
             }
         });
@@ -1948,10 +2040,10 @@ impl VioletApp {
         {
             self.cell_editor = None;
         }
-        if let Some(chooser) = &mut self.schema_chooser
+        if let Some(chooser) = &mut self.chooser
             && !catalog_flow::show_chooser(ctx, chooser, &mut self.actions)
         {
-            self.schema_chooser = None;
+            self.chooser = None;
         }
         if let Some(dialog) = &mut self.copy_dialog
             && !copy_flow::show(ctx, dialog, &mut self.actions)
@@ -1979,6 +2071,19 @@ impl VioletApp {
             }
         }
         self.task_modal(ctx);
+        if let Some(dialog) = &mut self.keys_dialog
+            && !keys_flow::show(ctx, dialog, &mut self.actions)
+        {
+            self.keys_dialog = None;
+        }
+        if let Some(answer) = self
+            .close_confirm
+            .as_ref()
+            .and_then(|confirm| script_flow::confirm_close(ctx, confirm))
+            && let Some(confirm) = self.close_confirm.take()
+        {
+            self.answer_close(ctx, confirm, answer);
+        }
         if let Some(id) = self.confirm_delete {
             let name = self.profile_name(id);
             match connection_form::confirm_delete(ctx, &name) {
@@ -2004,6 +2109,7 @@ impl eframe::App for VioletApp {
     #[hotpath::measure]
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_events(ctx);
+        self.capture_shortcut(ctx);
         self.shortcuts(ctx);
         if std::mem::take(&mut self.names_unchecked) {
             for profile in self.profiles.all() {
@@ -2015,6 +2121,7 @@ impl eframe::App for VioletApp {
         }
         self.fonts.poll(ctx);
         let closing = ctx.input(|input| input.viewport().close_requested());
+        let closing = closing && !self.keeps_window(ctx);
         self.save_session(closing);
     }
 
