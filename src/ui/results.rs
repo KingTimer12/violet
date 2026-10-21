@@ -230,6 +230,8 @@ pub fn show(
                         .show(ui, |ui| paging_bar(ui, tab.id, paging, fetching, actions));
                 }
                 let sort = match &tab.kind {
+                    // Redis returns a key's elements in its own order.
+                    TabKind::Data(view) if view.subtype.is_some() => Sorting::Off,
                     TabKind::Data(view) => Sorting::On(view.order.as_ref().and_then(|order| {
                         set.columns
                             .iter()
@@ -264,6 +266,9 @@ pub fn show(
                     reference,
                     actions,
                 );
+            } else if let (Some(command), None) = (&set.command, set.affected) {
+                // A reply such as Redis's `OK`.
+                widgets::empty_state(ui, Icon::CircleCheck, command, "The command ran.");
             } else {
                 let affected = set.affected.unwrap_or(0);
                 widgets::empty_state(
@@ -416,7 +421,7 @@ fn grid(
         if ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::A)) {
             selected.select_all(rows, columns);
         }
-        if target.is_some()
+        if target.is_some_and(EditTarget::rows_change)
             && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
         {
             actions.push(Action::DeleteRows(tab, selected.rows()));
@@ -627,7 +632,7 @@ fn grid(
                                 selected.click_row(index, columns, Mode::Replace);
                             }
                             response.context_menu(|ui| {
-                                if target.is_some() {
+                                if target.is_some_and(EditTarget::rows_change) {
                                     change_menu(ui, tab, changes.deleted, selected, actions);
                                     ui.separator();
                                 }
@@ -819,7 +824,7 @@ fn grid(
                                     }
                                     ui.separator();
                                 }
-                                if target.is_some() {
+                                if target.is_some_and(EditTarget::rows_change) {
                                     change_menu(ui, tab, changes.deleted, selected, actions);
                                     ui.separator();
                                 }
@@ -1099,7 +1104,8 @@ fn edit_bar(
 ) {
     let palette = Palette::current(ui.ctx());
     ui.add_space(8.0);
-    if matches!(editing, Editing::On(_))
+    let rows_change = matches!(editing, Editing::On(target) if target.rows_change());
+    if rows_change
         && widgets::button(ui, Tone::Ghost, Some(Icon::Plus), "Add row")
             .on_hover_text("Add a row, inserted when you save the changes")
             .clicked()
@@ -1107,7 +1113,7 @@ fn edit_bar(
         actions.push(Action::AddRow(tab));
     }
     // Deletes the picked rows; picked rows all marked keeps them instead.
-    if matches!(editing, Editing::On(_)) {
+    if rows_change {
         let (marked, kept) = &pending.picked;
         let count = |verb: &str, rows: &[usize]| match rows.len() {
             0 | 1 => format!("{verb} row"),

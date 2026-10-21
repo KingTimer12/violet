@@ -17,8 +17,10 @@
 //! [`VioletApp::task_scene`]), `edit` (a data tab of `VIOLET_SCENE_TABLE`,
 //! double-clicked at `VIOLET_SCENE_X`, `VIOLET_SCENE_Y`), `sort` (runs
 //! `VIOLET_SCENE_SQL`, clicks a header at `VIOLET_SCENE_X`, `_Y` and a menu
-//! item at `VIOLET_SCENE_APPLY_X`, `_Y`), `transaction` (manual commit,
-//! then a write into a temporary table, left uncommitted). A profile without
+//! item at `VIOLET_SCENE_APPLY_X`, `_Y`), `keys` (a key-value store's
+//! keys in the tree, and `VIOLET_SCENE_KEY`'s data tab), `transaction`
+//! (manual commit, then a write into a temporary table, left
+//! uncommitted). A profile without
 //! a saved password connects with `VIOLET_SCENE_PASSWORD`. Add
 //! `VIOLET_THEME=light` for the light theme.
 
@@ -154,7 +156,7 @@ impl VioletApp {
             }
             (
                 "browse" | "error" | "data" | "menu" | "page" | "complete" | "explain" | "history"
-                | "task" | "edit" | "sort" | "transaction",
+                | "task" | "edit" | "sort" | "keys" | "transaction",
                 0,
             ) => {
                 if let Some(id) = first {
@@ -174,6 +176,42 @@ impl VioletApp {
                 }
                 snapshot.step += 1;
                 false
+            }
+            ("keys", 1) => {
+                let Some(id) = first else { return true };
+                let Link::Online(server) = self.explorer.link(id) else {
+                    return false;
+                };
+                let schema = server.database.clone();
+                let listed = self
+                    .explorer
+                    .keys
+                    .get(&(id, schema.clone()))
+                    .is_some_and(|keys| keys.listed);
+                if listed {
+                    let key = std::env::var("VIOLET_SCENE_KEY").unwrap_or_else(|_| "user:1".into());
+                    let subtype = self.explorer.keys[&(id, schema.clone())]
+                        .list
+                        .iter()
+                        .find(|object| object.name == key)
+                        .and_then(|object| object.subtype.clone());
+                    self.explorer.selected = Some(NodeKey::Object(id, schema.clone(), key.clone()));
+                    self.actions.push(Action::OpenData {
+                        connection: id,
+                        schema,
+                        relation: key,
+                        subtype,
+                    });
+                    snapshot.step += 1;
+                }
+                false
+            }
+            ("keys", _) => {
+                settle
+                    && self
+                        .workspace
+                        .active()
+                        .is_some_and(|tab| tab.running.is_none())
             }
             ("browse", 1) => {
                 let Some(id) = first else { return true };
@@ -228,6 +266,7 @@ impl VioletApp {
                         connection: id,
                         schema: "public".into(),
                         relation: "customers".into(),
+                        subtype: None,
                     });
                     snapshot.step += 1;
                 }
@@ -302,6 +341,7 @@ impl VioletApp {
                         connection: id,
                         schema: "public".into(),
                         relation: table,
+                        subtype: None,
                     });
                     snapshot.step += 1;
                 }
@@ -503,7 +543,8 @@ impl VioletApp {
                 let loaded = self
                     .explorer
                     .objects
-                    .contains_key(&(id, "public".to_owned()));
+                    .contains_key(&(id, "public".to_owned()))
+                    || self.explorer.keys.values().any(|keys| keys.listed);
                 if loaded && self.explorer.link(id).is_online() {
                     let sql = std::env::var("VIOLET_SCENE_SQL")
                         .unwrap_or_else(|_| "SELECT *\nFROM customers c\nJOIN |".to_owned());

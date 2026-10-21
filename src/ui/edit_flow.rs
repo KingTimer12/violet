@@ -14,7 +14,9 @@ use std::time::SystemTime;
 use egui::{CornerRadius, RichText, Stroke};
 use violet_app::ExecOptions;
 use violet_core::ports::HistoryEntry;
-use violet_core::{ColumnInfo, ConnectionId, Dialect as _, ObjectKind, QueryOutput, Result};
+use violet_core::{
+    ColumnInfo, ConnectionId, Dialect as _, Language, ObjectKind, QueryOutput, Result,
+};
 
 use super::action::{Action, RunScope};
 use super::definition_flow::Family;
@@ -26,7 +28,7 @@ use super::toasts::Toast;
 use super::widgets::{self, Tone};
 use super::workspace::{InlineCell, Outcome, TabId};
 use super::{VioletApp, connection_name};
-use crate::sql::{self, TableRef};
+use crate::sql::TableRef;
 
 /// Whether an editor's rows can be changed.
 pub enum Editing {
@@ -55,6 +57,14 @@ pub struct EditTarget {
     pub insertable: Vec<bool>,
 }
 
+impl EditTarget {
+    /// Whether rows can be added and deleted: a table's, each picked by
+    /// its primary key; not the entries of a key-value store's key.
+    pub fn rows_change(&self) -> bool {
+        !self.keys.is_empty()
+    }
+}
+
 /// A cell being edited.
 pub struct CellEditor {
     pub tab: TabId,
@@ -70,8 +80,10 @@ pub struct EditReview {
     pub tab: TabId,
     pub table: String,
     pub sql: String,
-    /// The rows changed, as "3 rows (1 updated, 2 inserted)".
+    /// The rows changed, as "3 rows (1 updated, 2 inserted)", or the
+    /// commands a key's changes take.
     pub summary: String,
+    pub language: Language,
 }
 
 /// A run waiting for the user to accept statements without `WHERE`.
@@ -79,6 +91,7 @@ pub struct RunReview {
     pub tab: TabId,
     pub scope: RunScope,
     pub writes: Vec<String>,
+    pub language: Language,
 }
 
 /// Changes being written.
@@ -88,6 +101,7 @@ pub struct Applying {
     pub table: String,
     pub sql: String,
     pub summary: String,
+    pub language: Language,
 }
 
 impl VioletApp {
@@ -116,6 +130,28 @@ impl VioletApp {
         let Some(connection) = tab.connection else {
             return Editing::off("");
         };
+        if let Some(view) = tab.data()
+            && let Some(subtype) = &view.subtype
+        {
+            if !self.explorer.link(connection).is_online() {
+                return Editing::off("Not connected");
+            }
+            let editable: Vec<bool> = set
+                .columns
+                .iter()
+                .map(|column| violet_lang::redis::editable(subtype, &column.name))
+                .collect();
+            if !editable.contains(&true) {
+                return Editing::off("Entries of a stream cannot be changed here.");
+            }
+            return Editing::On(EditTarget {
+                schema: view.schema.clone(),
+                relation: view.relation.clone(),
+                keys: Vec::new(),
+                insertable: vec![false; editable.len()],
+                editable,
+            });
+        }
         let Some(source) = tab.source.clone() else {
             return Editing::off(
                 "Only rows of one table can be edited: a data tab, or a SELECT of one \
@@ -321,7 +357,7 @@ impl VioletApp {
                     }
                 }
             }
-            Action::ReviewEdits(tab_id) => match self.edit_statements(tab_id) {
+            Action::ReviewEdits(tab_id) => match self.edit_commands(tab_id) {
                 Ok(review) => self.edit_review = Some(review),
                 Err(error) => self.toasts.push(
                     ctx,
@@ -337,10 +373,21 @@ impl VioletApp {
                     return;
                 };
                 // One execute: the server runs the statements as one
-                // transaction, all or nothing.
-                let request =
-                    self.backend
-                        .execute(connection, review.sql.clone(), ExecOptions::WRITE);
+                // transaction, all or nothing. A key is written in its own
+                // database.
+                let schema = self
+                    .workspace
+                    .get(tab_id)
+                    .and_then(|tab| tab.data())
+                    .filter(|view| view.subtype.is_some())
+                    .map(|view| view.schema.clone());
+                let language = self.tab_language(tab_id);
+                let request = self.backend.execute_in(
+                    connection,
+                    schema,
+                    review.sql.clone(),
+                    ExecOptions::WRITE,
+                );
                 self.applying.insert(
                     request,
                     Applying {
@@ -349,12 +396,90 @@ impl VioletApp {
                         table: review.table,
                         sql: review.sql,
                         summary: review.summary,
+                        language,
                     },
                 );
             }
             Action::RunConfirmed(tab_id, scope) => self.run_checked(ctx, tab_id, scope, true),
             _ => {}
         }
+    }
+
+    /// What writes a tab's changes: `UPDATE`s, or for a key its commands
+    /// inside `MULTI` ... `EXEC`.
+    fn edit_commands(&mut self, tab_id: TabId) -> Result<EditReview> {
+        let key = self
+            .workspace
+            .get(tab_id)
+            .and_then(|tab| tab.data())
+            .and_then(|view| Some((view.relation.clone(), view.subtype.clone()?)));
+        match key {
+            Some((key, subtype)) => self.key_commands(tab_id, &key, &subtype),
+            None => self.edit_statements(tab_id),
+        }
+    }
+
+    /// The commands that write a key's changed cells, row by row. A row's
+    /// value or score is written before its field or member is renamed,
+    /// so the rename carries the new one along.
+    fn key_commands(&mut self, tab_id: TabId, key: &str, subtype: &str) -> Result<EditReview> {
+        let refuse =
+            |message: &str| violet_core::DbError::new(violet_core::ErrorKind::Other, message);
+        if !matches!(self.editing(tab_id), Editing::On(_)) {
+            return Err(refuse("The rows cannot be edited any more."));
+        }
+        let tab = self
+            .workspace
+            .get(tab_id)
+            .ok_or_else(|| refuse("The editor is gone."))?;
+        let Some(Outcome::Done { output }) = &tab.outcome else {
+            return Err(refuse("The rows are gone."));
+        };
+        let set = output
+            .sets
+            .first()
+            .ok_or_else(|| refuse("The rows are gone."))?;
+        let mut rows: BTreeMap<usize, Vec<(usize, &str)>> = BTreeMap::new();
+        for ((row, column), value) in &tab.edits {
+            let value = value
+                .as_deref()
+                .ok_or_else(|| refuse("Redis has no NULL: type a value, or delete the key."))?;
+            rows.entry(*row).or_default().push((*column, value));
+        }
+        if rows.is_empty() {
+            return Err(refuse("Nothing changed."));
+        }
+        let mut lines = Vec::new();
+        for (row, mut changes) in rows {
+            changes.sort_by_key(|change| std::cmp::Reverse(change.0));
+            let mut cells: Vec<Option<String>> = (0..set.columns.len())
+                .map(|column| set.rows.get(row, column).flatten().map(str::to_owned))
+                .collect();
+            for (column, value) in changes {
+                let change = violet_lang::redis::CellChange {
+                    row: cells.iter().map(Option::as_deref).collect(),
+                    column,
+                    value,
+                };
+                lines.push(
+                    violet_lang::redis::edit(subtype, key, &[change]).map_err(|e| refuse(&e))?,
+                );
+                if let Some(cell) = cells.get_mut(column) {
+                    *cell = Some(value.to_owned());
+                }
+            }
+        }
+        let count = lines.len();
+        Ok(EditReview {
+            tab: tab_id,
+            table: key.to_owned(),
+            sql: format!("MULTI\n{}\nEXEC", lines.join("\n")),
+            summary: format!(
+                "{count} {}",
+                if count == 1 { "command" } else { "commands" }
+            ),
+            language: Language::Redis,
+        })
     }
 
     /// The statements that write a tab's changes: `DELETE`s and `UPDATE`s
@@ -402,6 +527,7 @@ impl VioletApp {
             tab: tab_id,
             table: format!("{}.{}", target.schema, target.relation),
             summary: plan.summary(),
+            language: Language::Sql,
             sql: plan.statements.join("\n\n"),
         })
     }
@@ -432,7 +558,7 @@ impl VioletApp {
                     at,
                     connection: Some(applying.connection),
                     source,
-                    sql: sql::redact_secrets(&applying.sql),
+                    sql: crate::lang::redact_secrets(applying.language, &applying.sql),
                     elapsed_ms: u64::try_from(output.elapsed.as_millis()).unwrap_or(u64::MAX),
                     rows: Some(updated),
                     error: None,
@@ -447,7 +573,8 @@ impl VioletApp {
                 } else {
                     ""
                 };
-                if missed == 0 {
+                // A key's commands answer with no row count to miss.
+                if applying.language == Language::Redis || missed == 0 {
                     self.toasts.push(
                         ctx,
                         Toast::success(format!(
@@ -475,7 +602,7 @@ impl VioletApp {
                     at,
                     connection: Some(applying.connection),
                     source,
-                    sql: sql::redact_secrets(&applying.sql),
+                    sql: crate::lang::redact_secrets(applying.language, &applying.sql),
                     elapsed_ms: 0,
                     rows: None,
                     error: Some(error.message.clone()),
@@ -496,11 +623,16 @@ impl VioletApp {
 
     /// Statements in what `run` would send that change every row of a
     /// table, when the user has not accepted them yet.
-    pub(super) fn unbounded_writes(&self, text: &str, connection: ConnectionId) -> Vec<String> {
+    pub(super) fn unbounded_writes(
+        &self,
+        text: &str,
+        connection: ConnectionId,
+        language: Language,
+    ) -> Vec<String> {
         if !matches!(self.explorer.link(connection), Link::Online(_)) {
             return Vec::new();
         }
-        sql::unbounded_writes(text)
+        crate::lang::dangers(language, text)
     }
 }
 
@@ -806,12 +938,19 @@ pub fn show_edit_review(
             );
             ui.add(
                 egui::Label::new(
-                    RichText::new(format!(
-                        "{} change in one transaction: if any statement fails, nothing \
-                         changes. Rows updated or deleted are each picked by its primary key. \
-                         Review what will run:",
-                        review.summary
-                    ))
+                    RichText::new(match review.language {
+                        Language::Redis => format!(
+                            "{} in one MULTI … EXEC block: they run together, one after \
+                             the other. Review what will run:",
+                            review.summary
+                        ),
+                        _ => format!(
+                            "{} change in one transaction: if any statement fails, nothing \
+                             changes. Rows updated or deleted are each picked by its primary \
+                             key. Review what will run:",
+                            review.summary
+                        ),
+                    })
                     .color(palette.secondary),
                 )
                 .wrap(),
@@ -868,22 +1007,24 @@ pub fn show_run_review(ctx: &egui::Context, review: &RunReview, actions: &mut Ve
                 let (rect, _) =
                     ui.allocate_exact_size(egui::Vec2::splat(18.0), egui::Sense::hover());
                 widgets::paint_icon(ui, Icon::ShieldAlert, rect, palette.danger);
+                let title = match review.language {
+                    Language::Redis => "Run these commands?",
+                    _ => "Change every row?",
+                };
                 ui.label(
-                    RichText::new("Change every row?")
+                    RichText::new(title)
                         .font(theme::semibold(16.0))
                         .color(palette.text),
                 );
             });
-            ui.add(
-                egui::Label::new(
-                    RichText::new(
-                        "These statements have no WHERE, so they change or delete every row \
-                         of their table:",
-                    )
-                    .color(palette.secondary),
-                )
-                .wrap(),
-            );
+            let why = match review.language {
+                Language::Redis => "They can lose data or stall the server for everyone:",
+                _ => {
+                    "These statements have no WHERE, so they change or delete every row \
+                      of their table:"
+                }
+            };
+            ui.add(egui::Label::new(RichText::new(why).color(palette.secondary)).wrap());
             for write in &review.writes {
                 ui.label(
                     RichText::new(format!("•  {write}"))

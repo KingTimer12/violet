@@ -36,11 +36,14 @@ pub enum Command {
     Replace,
     Format,
     Comment,
+    Refresh,
+    Rename,
+    EditConnection,
 }
 
 impl Command {
     /// Every command, in the order the shortcuts dialog lists them.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 20] = [
         Self::RunStatement,
         Self::RunScript,
         Self::Cancel,
@@ -58,6 +61,9 @@ impl Command {
         Self::Replace,
         Self::Format,
         Self::Comment,
+        Self::Refresh,
+        Self::Rename,
+        Self::EditConnection,
     ];
 
     /// The name its shortcut is kept under in the settings.
@@ -80,6 +86,9 @@ impl Command {
             Self::Replace => "replace",
             Self::Format => "format",
             Self::Comment => "comment",
+            Self::Refresh => "refresh",
+            Self::Rename => "rename",
+            Self::EditConnection => "edit-connection",
         }
     }
 
@@ -102,6 +111,9 @@ impl Command {
             Self::Replace => "Replace",
             Self::Format => "Format SQL",
             Self::Comment => "Comment lines out",
+            Self::Refresh => "Refresh",
+            Self::Rename => "Rename",
+            Self::EditConnection => "Edit connection",
         }
     }
 
@@ -124,6 +136,9 @@ impl Command {
             Self::Replace => (Modifiers::COMMAND, Key::H),
             Self::Format => (COMMAND_SHIFT, Key::F),
             Self::Comment => (Modifiers::COMMAND, Key::Slash),
+            Self::Refresh => (Modifiers::NONE, Key::F5),
+            Self::Rename => (Modifiers::NONE, Key::F2),
+            Self::EditConnection => (Modifiers::NONE, Key::F4),
         };
         KeyboardShortcut::new(modifiers, key)
     }

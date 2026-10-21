@@ -12,6 +12,7 @@ mod editing;
 mod export;
 mod format;
 mod geometry;
+mod lang;
 mod settings;
 mod sql;
 mod ui;

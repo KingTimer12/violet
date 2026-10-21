@@ -14,9 +14,9 @@ use violet_core::ports::{
 };
 use violet_core::{
     Canceller, ColumnInfo, ConnectionId, ConnectionProfile, Credentials, DbError, DbObject, Driver,
-    DriverId, DriverInfo, ErrorKind, ExecLimits, ForeignKey, ManualCommit, OrderBy, Page, PageInfo,
-    QueryOutput, Result, ResultSet, Secret, ServerInfo, Session, Task, TaskKind, TaskRequest,
-    TaskSettings, ToolCommand,
+    DriverId, DriverInfo, EntryPage, ErrorKind, ExecLimits, ForeignKey, Language, ManualCommit,
+    OrderBy, Page, PageInfo, QueryOutput, Result, ResultSet, Secret, ServerInfo, Session, Task,
+    TaskKind, TaskRequest, TaskSettings, ToolCommand,
 };
 
 use crate::registry::DriverRegistry;
@@ -148,6 +148,16 @@ pub enum Event {
         schema: String,
         relation: String,
         result: Result<Vec<ColumnInfo>>,
+    },
+    /// A page of a schema's keys, for drivers that list them so.
+    Entries {
+        id: ConnectionId,
+        schema: String,
+        /// The glob they match.
+        pattern: String,
+        /// They follow the ones listed before, rather than replace them.
+        more: bool,
+        result: Result<EntryPage>,
     },
     /// Foreign keys from or to a schema's tables.
     ForeignKeys {
@@ -289,7 +299,7 @@ impl Shared {
         tx.open = false;
         tx.writes = 0;
         if tx.manual
-            && let Some(session) = session
+            && let Some(session) = session.filter(|session| session.language() == Language::Sql)
             && let ManualCommit::Setting { off, .. } = session.dialect().manual_commit()
             && let Err(error) = session.execute(off, ExecLimits::default()).await
         {
@@ -310,6 +320,12 @@ impl Shared {
         let mut tx = transaction.lock().await;
         let before = *tx;
         let session = self.session(id).ok();
+        if session
+            .as_ref()
+            .is_some_and(|session| session.language() != Language::Sql)
+        {
+            return Err(DbError::unsupported("This database has no transactions"));
+        }
         let result = async {
             let ending = match command {
                 TxCommand::Commit => Some(true),
@@ -526,8 +542,10 @@ impl Shared {
     }
 
     /// Runs `sql` on `id`'s session as `options` say, through the cache
-    /// and inside the connection's transaction.
+    /// and inside the connection's transaction. `schema`, for drivers that
+    /// are not SQL, is where it runs; SQL names its schemas itself.
     #[hotpath::measure]
+    #[allow(clippy::too_many_arguments)]
     async fn query(
         &self,
         request: RequestId,
@@ -535,9 +553,14 @@ impl Shared {
         sql: String,
         options: ExecOptions,
         limits: ExecLimits,
+        schema: Option<String>,
         control: TxControl,
     ) -> Result<QueryOutput> {
         let session = self.session(id)?;
+        // Transactions are SQL's: other drivers run as they are.
+        if session.language() != Language::Sql {
+            return Self::query_other(&*session, sql, options, limits, schema).await;
+        }
         let transaction = self.transaction(id);
         let mut tx = transaction.lock().await;
         let before = *tx;
@@ -680,6 +703,44 @@ impl Shared {
         }
         Ok(output)
     }
+
+    /// [`Shared::query`] for a driver that is not SQL: it pages itself,
+    /// and nothing is cached (it has no change token to check against).
+    async fn query_other(
+        session: &dyn Session,
+        sql: String,
+        options: ExecOptions,
+        limits: ExecLimits,
+        schema: Option<String>,
+    ) -> Result<QueryOutput> {
+        let started = Instant::now();
+        let (sets, page) = match (options.page, schema) {
+            (Some(page), Some(schema)) => {
+                let limit = u32::try_from(page.limit).unwrap_or(u32::MAX);
+                let mut sets = session.page(&schema, &sql, page.offset, limit).await?;
+                let limit = usize::try_from(page.limit).unwrap_or(usize::MAX);
+                let has_more = sets.first().is_some_and(|set| set.rows.len() > limit);
+                if let Some(set) = sets.first_mut() {
+                    set.rows.truncate(limit);
+                    set.truncated = false;
+                }
+                let info = PageInfo {
+                    offset: page.offset,
+                    limit: page.limit,
+                    has_more,
+                };
+                (sets, Some(info))
+            }
+            (None, Some(schema)) => (session.run_in(&schema, &sql, limits).await?, None),
+            (_, None) => (session.execute(&sql, limits).await?, None),
+        };
+        Ok(QueryOutput {
+            sets,
+            elapsed: started.elapsed(),
+            page,
+            cached: None,
+        })
+    }
 }
 
 /// The interface's handle on everything that talks to databases.
@@ -761,7 +822,8 @@ impl Backend {
         self.shared.sessions().contains_key(&id)
     }
 
-    /// How a data view reads a relation, in the session's dialect.
+    /// How a data view reads a relation, in the session's dialect, or a
+    /// key of type `subtype` for a key-value store.
     #[must_use]
     pub fn browse_sql(
         &self,
@@ -770,16 +832,27 @@ impl Backend {
         relation: &str,
         filter: Option<&str>,
         order: Option<&OrderBy>,
+        subtype: Option<&str>,
     ) -> Option<String> {
         let session = self.shared.session(id).ok()?;
-        Some(session.dialect().browse(schema, relation, filter, order))
+        Some(match session.language() {
+            Language::Redis => violet_lang::redis::browse(subtype, relation, filter),
+            _ => session.dialect().browse(schema, relation, filter, order),
+        })
     }
 
-    /// How the session's dialect explains `sql`.
+    /// How the session's dialect explains `sql`; `None` for languages
+    /// Violet has no plan for.
     #[must_use]
     pub fn explain_sql(&self, id: ConnectionId, sql: &str, analyze: bool) -> Option<String> {
         let session = self.shared.session(id).ok()?;
-        Some(session.dialect().explain(sql, analyze))
+        (session.language() == Language::Sql).then(|| session.dialect().explain(sql, analyze))
+    }
+
+    /// What the open session's statements are written in.
+    #[must_use]
+    pub fn language(&self, id: ConnectionId) -> Option<Language> {
+        Some(self.shared.session(id).ok()?.language())
     }
 
     /// The most rows one result may hold.
@@ -1067,6 +1140,37 @@ impl Backend {
         });
     }
 
+    /// A page of `schema`'s keys matching the glob `pattern`, after the
+    /// ones `cursor` follows.
+    pub fn load_entries(
+        &self,
+        id: ConnectionId,
+        schema: String,
+        pattern: String,
+        cursor: Option<String>,
+    ) {
+        /// Keys listed at a time.
+        const PAGE: u32 = 500;
+        let shared = Arc::clone(&self.shared);
+        self.runtime.spawn(async move {
+            let result = match shared.session(id) {
+                Ok(session) => {
+                    session
+                        .entries(&schema, Some(&pattern), cursor.as_deref(), PAGE)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            shared.emit(Event::Entries {
+                id,
+                schema,
+                pattern,
+                more: cursor.is_some(),
+                result,
+            });
+        });
+    }
+
     /// Reads the foreign keys from or to `schema`'s tables, for completing
     /// joins. Databases the dialect has no query for answer with none.
     pub fn load_foreign_keys(&self, id: ConnectionId, schema: String) {
@@ -1075,6 +1179,9 @@ impl Backend {
         self.runtime.spawn(async move {
             let result = async {
                 let session = shared.session(id)?;
+                if session.language() != Language::Sql {
+                    return Ok(Vec::new());
+                }
                 let Some(sql) = session.dialect().foreign_keys(&schema) else {
                     return Ok(Vec::new());
                 };
@@ -1087,14 +1194,29 @@ impl Backend {
 
     /// Runs `sql` on the open session for `id`.
     pub fn execute(&self, id: ConnectionId, sql: String, options: ExecOptions) -> RequestId {
-        self.execute_script(id, sql, options, TxControl::default())
+        self.execute_script(id, None, sql, options, TxControl::default())
+    }
+
+    /// Runs `sql` on the open session for `id`; for a driver that is not
+    /// SQL, in `schema` when given (a data view's, the tree's), leaving
+    /// the editor's state alone.
+    pub fn execute_in(
+        &self,
+        id: ConnectionId,
+        schema: Option<String>,
+        sql: String,
+        options: ExecOptions,
+    ) -> RequestId {
+        self.execute_script(id, schema, sql, options, TxControl::default())
     }
 
     /// Runs SQL the user wrote, whose own transaction statements `control`
-    /// describes, on the open session for `id`.
+    /// describes, on the open session for `id`; `schema` as for
+    /// [`Backend::execute_in`].
     pub fn execute_script(
         &self,
         id: ConnectionId,
+        schema: Option<String>,
         sql: String,
         options: ExecOptions,
         control: TxControl,
@@ -1104,7 +1226,7 @@ impl Backend {
         let limits = self.limits;
         self.runtime.spawn(async move {
             let result = shared
-                .query(request, id, sql, options, limits, control)
+                .query(request, id, sql, options, limits, schema, control)
                 .await;
             shared.emit(Event::QueryFinished { request, result });
         });
@@ -1127,20 +1249,36 @@ impl Backend {
         });
     }
 
-    /// Counts the rows a single read-only statement returns.
-    pub fn count(&self, id: ConnectionId, sql: String) -> RequestId {
+    /// Counts the rows a single read-only statement returns; for a driver
+    /// that is not SQL, run in `schema`.
+    pub fn count(&self, id: ConnectionId, schema: Option<String>, sql: String) -> RequestId {
         let request = self.request();
         let shared = Arc::clone(&self.shared);
         let limits = self.limits;
         self.runtime.spawn(async move {
             let result = async {
-                let count = shared.session(id)?.dialect().count(&sql);
+                let session = shared.session(id)?;
+                if session.language() != Language::Sql {
+                    let schema = schema.unwrap_or_default();
+                    return session.count(&schema, &sql).await?.ok_or_else(|| {
+                        DbError::unsupported("This command's rows cannot be counted")
+                    });
+                }
+                let count = session.dialect().count(&sql);
                 let options = ExecOptions {
                     cache: CachePolicy::Use,
                     page: None,
                 };
                 let output = shared
-                    .query(request, id, count, options, limits, TxControl::default())
+                    .query(
+                        request,
+                        id,
+                        count,
+                        options,
+                        limits,
+                        None,
+                        TxControl::default(),
+                    )
                     .await?;
                 output
                     .sets

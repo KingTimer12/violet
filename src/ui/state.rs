@@ -3,7 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use violet_core::{ColumnInfo, ConnectionId, DbObject, ForeignKey, ObjectKind, ServerInfo};
+use violet_core::{
+    ColumnInfo, ConnectionId, DbObject, ForeignKey, Language, ObjectKind, ServerInfo,
+};
 
 /// Something fetched from a database.
 #[derive(Clone, Debug, Default)]
@@ -102,6 +104,39 @@ pub struct FolderItem {
 /// A relation: connection, schema and name.
 pub type RelationKey = (ConnectionId, String, String);
 
+/// A key-value database's keys, as far as they are listed: they come a
+/// page at a time, matching a glob.
+#[derive(Clone, Debug, Default)]
+pub struct Keys {
+    /// The glob as typed in the tree.
+    pub pattern: String,
+    /// The glob the keys shown were listed with.
+    pub applied: String,
+    pub list: Arc<[DbObject]>,
+    /// Where listing goes on; `None` once every key was listed.
+    pub next: Option<String>,
+    pub loading: bool,
+    pub error: Option<String>,
+    /// Listed at least once.
+    pub listed: bool,
+}
+
+impl Keys {
+    /// The glob to list with: everything when the box is empty.
+    pub fn glob(&self) -> String {
+        let typed = self.pattern.trim();
+        if typed.is_empty() {
+            "*".to_owned()
+        } else if typed.contains(['*', '?', '[']) {
+            typed.to_owned()
+        } else {
+            // A plain word finds keys containing it, as the object filter
+            // does.
+            format!("*{typed}*")
+        }
+    }
+}
+
 /// Catalogs fetched so far, and the tree's expansion.
 ///
 /// Lists are shared slices: the tree takes a handle each frame while it
@@ -123,6 +158,10 @@ pub struct Explorer {
     pub foreign_keys: HashMap<(ConnectionId, String), Loadable<Arc<[ForeignKey]>>>,
     /// The triggers, roles and extensions of each session's database.
     pub folders: HashMap<(ConnectionId, Folder), Loadable<Arc<[FolderItem]>>>,
+    /// The keys of each key-value database.
+    pub keys: HashMap<(ConnectionId, String), Keys>,
+    /// Each driver's language, by driver id, as installed.
+    pub languages: HashMap<String, Language>,
     pub expanded: HashSet<NodeKey>,
     pub selected: Option<NodeKey>,
     /// The schemas shown per `connection/database` (see
@@ -135,6 +174,8 @@ pub struct Explorer {
     pub transactions: HashMap<ConnectionId, violet_app::Transaction>,
     /// A node was clicked since this was last cleared.
     pub picked: bool,
+    /// The tree was clicked last, so F-key shortcuts act on its selection.
+    pub focused: bool,
     pub filter: String,
 }
 
@@ -157,6 +198,7 @@ impl Explorer {
     pub fn pick(&mut self, key: NodeKey) {
         self.selected = Some(key);
         self.picked = true;
+        self.focused = true;
     }
 
     pub fn toggle(&mut self, key: NodeKey) -> bool {
@@ -177,6 +219,12 @@ impl Explorer {
         self.columns.retain(|(owner, _, _), _| *owner != id);
         self.foreign_keys.retain(|(owner, _), _| *owner != id);
         self.folders.retain(|(owner, _), _| *owner != id);
+        self.keys.retain(|(owner, _), _| *owner != id);
+    }
+
+    /// A driver's language; SQL for one not installed yet.
+    pub fn language(&self, driver: &str) -> Language {
+        self.languages.get(driver).copied().unwrap_or_default()
     }
 
     /// The key a saved connection's database choice is kept under.

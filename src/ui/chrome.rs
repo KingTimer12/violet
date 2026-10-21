@@ -201,6 +201,9 @@ pub fn tab_strip(
         bar.bottom() - 0.5,
         Stroke::new(1.0, palette.outline),
     );
+    // The bar behind the tabs: tabs added after it take the clicks on them.
+    ui.interact(bar, ui.id().with("tab-strip-bar"), Sense::click())
+        .context_menu(|ui| strip_menu(ui, workspace, actions));
 
     egui::ScrollArea::horizontal()
         .id_salt("tab-strip")
@@ -237,6 +240,19 @@ pub fn tab_strip(
 fn tab_menu(ui: &mut Ui, workspace: &Workspace, index: usize, actions: &mut Vec<Action>) {
     let ids: Vec<TabId> = workspace.tabs.iter().map(|tab| tab.id).collect();
     let tab = &workspace.tabs[index];
+    let shortcut = |command| ui.ctx().format_shortcut(&shortcuts::get(command));
+    let (refresh, rename) = (shortcut(Command::Refresh), shortcut(Command::Rename));
+    if (tab.data().is_some() || tab.last_run.is_some())
+        && menu_item(ui, Icon::Refresh, &format!("Refresh  ({refresh})"))
+    {
+        actions.push(Action::RefreshTab(tab.id));
+    }
+    if menu_item(ui, Icon::Pencil, &format!("Rename…  ({rename})")) {
+        actions.push(Action::AskRename(super::rename_flow::RenameTarget::Tab(
+            tab.id,
+        )));
+    }
+    ui.separator();
     let mut close = |ui: &mut Ui, label: &str, icon: Icon, ids: &[TabId]| {
         let clicked = ui
             .add_enabled_ui(!ids.is_empty(), |ui| menu_item(ui, icon, label))
@@ -250,6 +266,13 @@ fn tab_menu(ui: &mut Ui, workspace: &Workspace, index: usize, actions: &mut Vec<
     close(ui, "Close others", Icon::Close, &others);
     close(ui, "Close to the left", Icon::Close, &ids[..index]);
     close(ui, "Close to the right", Icon::Close, &ids[index + 1..]);
+    let saved: Vec<TabId> = workspace
+        .tabs
+        .iter()
+        .filter(|tab| !tab.unsaved())
+        .map(|tab| tab.id)
+        .collect();
+    close(ui, "Close saved", Icon::Close, &saved);
     close(ui, "Close all", Icon::Close, &ids);
     if let Some(file) = &tab.file {
         ui.separator();
@@ -351,17 +374,67 @@ fn tab_button(
     response
 }
 
+/// Intervals offered for reading a tab's rows again on their own.
+const AUTO_REFRESH: [(u64, &str); 7] = [
+    (5, "5 seconds"),
+    (10, "10 seconds"),
+    (30, "30 seconds"),
+    (60, "1 minute"),
+    (300, "5 minutes"),
+    (900, "15 minutes"),
+    (3600, "1 hour"),
+];
+
+/// Picks the interval a tab's rows are read again on.
+pub fn auto_refresh(ui: &mut Ui, tab: &QueryTab, actions: &mut Vec<Action>) {
+    let every = tab.auto_refresh.map(|(every, _)| every.as_secs());
+    let selected = every
+        .and_then(|secs| AUTO_REFRESH.iter().find(|(s, _)| *s == secs))
+        .map_or("Auto-refresh off", |(_, label)| label);
+    egui::ComboBox::from_id_salt(("auto-refresh", tab.id))
+        .selected_text(RichText::new(selected).font(theme::medium(12.5)))
+        .width(130.0)
+        .show_ui(ui, |ui| {
+            if ui.selectable_label(every.is_none(), "Off").clicked() {
+                actions.push(Action::SetAutoRefresh(tab.id, None));
+            }
+            for (secs, label) in AUTO_REFRESH {
+                if ui.selectable_label(every == Some(secs), label).clicked() {
+                    actions.push(Action::SetAutoRefresh(
+                        tab.id,
+                        Some(std::time::Duration::from_secs(secs)),
+                    ));
+                }
+            }
+        })
+        .response
+        .on_hover_text("Read the rows again on their own, as long as no cell is changed");
+}
+
+/// Right-click menu of the empty part of the tab strip.
+fn strip_menu(ui: &mut Ui, workspace: &Workspace, actions: &mut Vec<Action>) {
+    let tabs = &workspace.tabs;
+    if menu_item(ui, Icon::Close, "Close saved") {
+        let saved = tabs.iter().filter(|t| !t.unsaved()).map(|t| t.id);
+        actions.push(Action::CloseTabs(saved.collect()));
+    }
+    if menu_item(ui, Icon::Close, "Close all") {
+        actions.push(Action::CloseTabs(tabs.iter().map(|t| t.id).collect()));
+    }
+}
+
 /// The bar above an editor: connection, run buttons.
 pub fn toolbar(
     ui: &mut Ui,
     tab: &QueryTab,
     profiles: &[ConnectionProfile],
     explorer: &Explorer,
+    language: violet_core::Language,
     actions: &mut Vec<Action>,
 ) {
     let palette = Palette::current(ui.ctx());
     if let Some(view) = tab.data() {
-        data_toolbar(ui, tab, view, profiles, explorer, actions);
+        data_toolbar(ui, tab, view, profiles, explorer, language, actions);
         return;
     }
     ui.horizontal_centered(|ui| {
@@ -393,33 +466,37 @@ pub fn toolbar(
         if response.on_hover_text(script_tip).clicked() {
             actions.push(Action::Run(tab.id, RunScope::Script));
         }
-        let explain = ui
-            .add_enabled_ui(!running, |ui| {
+        // Only SQL has plans to explain.
+        let explain = (language == violet_core::Language::Sql).then(|| {
+            ui.add_enabled_ui(!running, |ui| {
                 widgets::button(ui, Tone::Secondary, Some(Icon::Zap), "Explain")
             })
             .inner
-            .on_hover_text("How the server runs the statement under the cursor");
-        egui::Popup::menu(&explain).show(|ui| {
-            let ctx = ui.ctx().clone();
-            for (icon, label, shortcut, scope) in [
-                (
-                    Icon::Zap,
-                    "Explain plan",
-                    shortcuts::get(Command::Explain),
-                    RunScope::Explain,
-                ),
-                (
-                    Icon::Clock,
-                    "Explain analyze (reads only)",
-                    shortcuts::get(Command::ExplainAnalyze),
-                    RunScope::ExplainAnalyze,
-                ),
-            ] {
-                if mode_item(ui, icon, label, &ctx.format_shortcut(&shortcut)) {
-                    actions.push(Action::Run(tab.id, scope));
-                }
-            }
+            .on_hover_text("How the server runs the statement under the cursor")
         });
+        if let Some(explain) = &explain {
+            egui::Popup::menu(explain).show(|ui| {
+                let ctx = ui.ctx().clone();
+                for (icon, label, shortcut, scope) in [
+                    (
+                        Icon::Zap,
+                        "Explain plan",
+                        shortcuts::get(Command::Explain),
+                        RunScope::Explain,
+                    ),
+                    (
+                        Icon::Clock,
+                        "Explain analyze (reads only)",
+                        shortcuts::get(Command::ExplainAnalyze),
+                        RunScope::ExplainAnalyze,
+                    ),
+                ] {
+                    if mode_item(ui, icon, label, &ctx.format_shortcut(&shortcut)) {
+                        actions.push(Action::Run(tab.id, scope));
+                    }
+                }
+            });
+        }
         let cancel_tip = format!(
             "Cancel ({})",
             ui.ctx().format_shortcut(&shortcuts::get(Command::Cancel))
@@ -479,7 +556,7 @@ pub fn toolbar(
                 actions.push(Action::OpenScriptFile);
             }
         });
-        transaction_controls(ui, tab, explorer, actions);
+        transaction_controls(ui, tab, explorer, language, actions);
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.add_space(10.0);
@@ -502,8 +579,13 @@ fn transaction_controls(
     ui: &mut Ui,
     tab: &QueryTab,
     explorer: &Explorer,
+    language: violet_core::Language,
     actions: &mut Vec<Action>,
 ) {
+    // Transactions are SQL's.
+    if language != violet_core::Language::Sql {
+        return;
+    }
     let Some(id) = tab.connection.filter(|id| explorer.link(*id).is_online()) else {
         return;
     };
@@ -571,6 +653,7 @@ fn data_toolbar(
     view: &DataView,
     profiles: &[ConnectionProfile],
     explorer: &Explorer,
+    language: violet_core::Language,
     actions: &mut Vec<Action>,
 ) {
     let palette = Palette::current(ui.ctx());
@@ -588,6 +671,7 @@ fn data_toolbar(
         {
             actions.push(Action::RefreshTab(tab.id));
         }
+        auto_refresh(ui, tab, actions);
         let cancel_tip = format!(
             "Cancel ({})",
             ui.ctx().format_shortcut(&shortcuts::get(Command::Cancel))
@@ -601,13 +685,31 @@ fn data_toolbar(
         {
             actions.push(Action::Cancel(tab.id));
         }
-        if widgets::icon_button(ui, Icon::Terminal, "Open this query in a SQL editor").clicked() {
-            actions.push(Action::OpenEditor {
-                connection: tab.connection,
-                sql: format!("{};\n", tab.sql),
-            });
+        match view.subtype {
+            Some(_) => {
+                if widgets::icon_button(ui, Icon::Terminal, "Open this command in a Redis editor")
+                    .clicked()
+                {
+                    let select =
+                        violet_lang::redis::actions::select(&view.schema).unwrap_or_default();
+                    actions.push(Action::OpenEditor {
+                        connection: tab.connection,
+                        sql: format!("{select}\n{}\n", tab.sql),
+                    });
+                }
+            }
+            None => {
+                if widgets::icon_button(ui, Icon::Terminal, "Open this query in a SQL editor")
+                    .clicked()
+                {
+                    actions.push(Action::OpenEditor {
+                        connection: tab.connection,
+                        sql: format!("{};\n", tab.sql),
+                    });
+                }
+            }
         }
-        transaction_controls(ui, tab, explorer, actions);
+        transaction_controls(ui, tab, explorer, language, actions);
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.add_space(12.0);
@@ -617,13 +719,20 @@ fn data_toolbar(
                 .map(ConnectionProfile::display_name)
                 .unwrap_or_default();
             ui.label(RichText::new(connection).color(palette.dim));
+            let (name, icon) = match &view.subtype {
+                Some(subtype) => (
+                    format!("{} · {} · {subtype}", view.schema, view.relation),
+                    Icon::for_subtype(Some(subtype)),
+                ),
+                None => (format!("{}.{}", view.schema, view.relation), Icon::Table),
+            };
             ui.label(
-                RichText::new(format!("{}.{}", view.schema, view.relation))
+                RichText::new(name)
                     .font(theme::mono(12.5))
                     .color(palette.secondary),
             );
             let (rect, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
-            widgets::paint_icon(ui, Icon::Table, rect, palette.accent);
+            widgets::paint_icon(ui, icon, rect, palette.accent);
         });
     });
 }
@@ -645,8 +754,25 @@ pub fn filter_bar(ui: &mut Ui, tab: &mut QueryTab, actions: &mut Vec<Action>) {
             rect,
             if active { palette.accent } else { palette.dim },
         );
+        // A key's fields or members are matched with a glob, by the
+        // types Redis scans.
+        let (word, hint) = match view.subtype.as_deref() {
+            None => (
+                "WHERE",
+                "Filter rows, e.g. id > 10 AND name ILIKE 'a%'  —  press Enter",
+            ),
+            Some("hash") => ("MATCH", "Match fields, e.g. name*  —  press Enter"),
+            Some("set" | "zset") => ("MATCH", "Match members, e.g. user:*  —  press Enter"),
+            Some(_) => {
+                ui.label(
+                    RichText::new("Only hashes, sets and sorted sets can be filtered")
+                        .color(palette.dim),
+                );
+                return;
+            }
+        };
         ui.label(
-            RichText::new("WHERE")
+            RichText::new(word)
                 .font(theme::mono(12.0))
                 .color(palette.syntax.keyword),
         );
@@ -655,7 +781,7 @@ pub fn filter_bar(ui: &mut Ui, tab: &mut QueryTab, actions: &mut Vec<Action>) {
         let response = ui.add(
             egui::TextEdit::singleline(&mut view.filter)
                 .id_salt(("filter", id))
-                .hint_text("Filter rows, e.g. id > 10 AND name ILIKE 'a%'  —  press Enter")
+                .hint_text(hint)
                 .font(theme::mono(12.5))
                 .frame(egui::Frame::NONE)
                 .desired_width(width),
@@ -790,6 +916,7 @@ pub fn welcome(
     ui: &mut Ui,
     profiles: &[ConnectionProfile],
     explorer: &Explorer,
+    uri: &mut String,
     actions: &mut Vec<Action>,
 ) {
     let palette = Palette::current(ui.ctx());
@@ -837,6 +964,33 @@ pub fn welcome(
                                 connection: profiles.first().map(|p| p.id),
                                 sql: String::new(),
                             });
+                        }
+                    },
+                );
+
+                // A connection string opens the form filled in.
+                ui.add_space(14.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(width + 120.0, 32.0),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        let masked = uri.contains('@');
+                        let input = ui.add_sized(
+                            [width + 120.0 - 80.0, 30.0],
+                            widgets::text_input(
+                                uri,
+                                "…or paste a connection string: redis://, postgres://",
+                            )
+                            .password(masked),
+                        );
+                        let entered = input.lost_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                        if (widgets::button(ui, Tone::Secondary, Some(Icon::Link), "Open")
+                            .clicked()
+                            || entered)
+                            && !uri.trim().is_empty()
+                        {
+                            actions.push(Action::NewConnectionFromUri(std::mem::take(uri)));
                         }
                     },
                 );

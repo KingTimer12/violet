@@ -375,7 +375,9 @@ pub struct Variable {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Binding {
     Env(String),
-    /// One argument: the option, then the value.
+    /// One argument: the option, then the value. An option ending in a
+    /// space, such as `-h `, is an argument of its own before the value,
+    /// for programs that take no `-hvalue` (`redis-cli`).
     Option(String),
 }
 
@@ -584,7 +586,7 @@ impl Task {
                 Binding::Option(option)
                     if option.starts_with('-') && option.len() <= 32 && plain_text(option) =>
                 {
-                    connection_options.push(option.trim_end_matches('=').to_owned());
+                    connection_options.push(option.trim_end_matches(['=', ' ']).to_owned());
                 }
                 _ => return bad(format!("{binding:?} is not a usable connection binding")),
             }
@@ -598,7 +600,9 @@ impl Task {
                 || upper.contains("PASSWD")
                 // MySQL's and MariaDB's clients only read `MYSQL_PWD`. Not
                 // any `*PWD`: `PWD` itself is the shell's working folder.
-                || upper == "MYSQL_PWD";
+                || upper == "MYSQL_PWD"
+                // And `redis-cli` only `REDISCLI_AUTH`.
+                || upper == "REDISCLI_AUTH";
             if !env_name_ok(name) || !password {
                 return bad(format!("{name:?} is not a usable password variable"));
             }
@@ -841,7 +845,10 @@ impl Task {
                             format!("{value:?} cannot be used as a connection value"),
                         ));
                     }
-                    args.push(format!("{option}{value}"));
+                    match option.strip_suffix(' ') {
+                        Some(option) => args.extend([option.to_owned(), value.to_owned()]),
+                        None => args.push(format!("{option}{value}")),
+                    }
                 }
                 None => {}
             }

@@ -17,6 +17,7 @@ violet-providers = { path = "crates/violet-providers" }
 violet-sdk = { path = "crates/violet-sdk" }
 violet-storage = { path = "crates/violet-storage" }
 violet-wasm = { path = "crates/violet-wasm" }
+violet-lang = { path = "crates/violet-lang" }
 
 async-trait = "0.1"
 directories = "6"
@@ -55,6 +56,7 @@ violet-app.workspace = true
 violet-providers.workspace = true
 violet-wasm.workspace = true
 violet-storage.workspace = true
+violet-lang.workspace = true
 hotpath.workspace = true
 log.workspace = true
 serde.workspace = true

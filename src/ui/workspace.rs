@@ -54,6 +54,10 @@ pub struct DataView {
     /// The filter the rows shown were read with.
     pub applied: String,
     pub order: Option<OrderBy>,
+    /// For a key-value store's key, its type (`hash`, `zset`...): what it
+    /// reads with and how its rows are written back. The relation is then
+    /// the key, and the filter a glob on its fields or members.
+    pub subtype: Option<String>,
 }
 
 impl DataView {
@@ -64,6 +68,7 @@ impl DataView {
             filter: String::new(),
             applied: String::new(),
             order: None,
+            subtype: None,
         }
     }
 
@@ -156,6 +161,8 @@ pub struct QueryTab {
     /// as written, which the sorted one wraps.
     pub sort: Option<(usize, bool)>,
     pub unsorted: Option<String>,
+    /// Reads the rows again on this interval, and when it is next due.
+    pub auto_refresh: Option<(std::time::Duration, std::time::Instant)>,
 }
 
 /// A grid cell edited in place.
@@ -300,6 +307,7 @@ impl Workspace {
             find: None,
             sort: None,
             unsorted: None,
+            auto_refresh: None,
         });
         self.active = Some(id);
         id

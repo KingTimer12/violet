@@ -169,9 +169,15 @@ impl VioletApp {
     }
 
     /// Opens the dialog that picks which databases the tree shows for a
-    /// saved connection that lists them all.
+    /// saved connection that lists them all: a server's, or a key-value
+    /// store's numbered ones.
     pub(super) fn choose_databases(&mut self, ctx: &egui::Context, parent: ConnectionId) {
-        let Some(Loadable::Ready(all)) = self.explorer.databases.get(&parent) else {
+        let list = if self.language(parent) == violet_core::Language::Redis {
+            self.explorer.schemas.get(&parent)
+        } else {
+            self.explorer.databases.get(&parent)
+        };
+        let Some(Loadable::Ready(all)) = list else {
             self.toasts
                 .push(ctx, Toast::info("The databases are still loading."));
             return;
