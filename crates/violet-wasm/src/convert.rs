@@ -133,12 +133,13 @@ fn login(login: data_api::Login) -> Login {
 const MAX_SUBTYPE: usize = 32;
 const MAX_DETAIL: usize = 200;
 
-/// A page of entries, checked: at most `limit` of them, short labels.
+/// A page of entries, checked: about `limit` of them (a `SCAN` batch may
+/// run over, and cannot be split), short labels.
 pub(crate) fn entry_page(schema: &str, page: data_api::EntryPage, limit: u32) -> EntryPage {
     let objects = page
         .entries
         .into_iter()
-        .take(limit as usize)
+        .take((limit as usize).saturating_mul(2).saturating_add(64))
         .map(|entry| DbObject {
             schema: schema.to_owned(),
             name: entry.name,

@@ -1,0 +1,35 @@
+[package]
+name = "violet-provider-redis"
+description = "Redis provider for Violet (Valkey, Dragonfly and other compatible servers), as a WebAssembly component"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+publish = false
+
+# Built on its own for `wasm32-wasip2`, not as part of the app's workspace:
+#   cargo build --release --target wasm32-wasip2 \
+#       --manifest-path providers/redis/Cargo.toml
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+violet-sdk = { path = "../../crates/violet-sdk" }
+violet-lang = { path = "../../crates/violet-lang" }
+log = "0.4"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[lints.rust]
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
