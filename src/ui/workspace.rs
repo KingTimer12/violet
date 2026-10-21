@@ -150,6 +150,8 @@ pub struct QueryTab {
     pub reveal_row: Option<usize>,
     /// The cell being edited in place in the grid.
     pub inline: Option<InlineCell>,
+    /// The editor's find bar, when open.
+    pub find: Option<super::editor::FindBar>,
     /// A query's rows sorted by a column (index, descending), and the query
     /// as written, which the sorted one wraps.
     pub sort: Option<(usize, bool)>,
@@ -295,6 +297,7 @@ impl Workspace {
             deleted: BTreeSet::new(),
             reveal_row: None,
             inline: None,
+            find: None,
             sort: None,
             unsorted: None,
         });

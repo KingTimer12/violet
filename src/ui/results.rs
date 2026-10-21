@@ -116,9 +116,9 @@ pub fn show(
 
     match &tab.outcome {
         None => {
-            let hint = ui
-                .ctx()
-                .format_shortcut(&crate::ui::shortcuts::RUN_STATEMENT);
+            let hint = ui.ctx().format_shortcut(&crate::ui::shortcuts::get(
+                crate::ui::shortcuts::Command::RunStatement,
+            ));
             widgets::empty_state(
                 ui,
                 Icon::Rows,

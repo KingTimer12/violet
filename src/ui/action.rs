@@ -86,6 +86,14 @@ pub enum Action {
     ReviewEdits(TabId),
     /// Writes them, the user having reviewed them.
     ApplyEdits(TabId),
+    /// Opens the keyboard shortcuts dialog.
+    OpenShortcuts,
+    /// Changes a command's shortcut; `None` puts its default back.
+    SetShortcut(super::shortcuts::Command, Option<egui::KeyboardShortcut>),
+    /// Formats an editor's selection, or its whole script.
+    FormatSql(TabId),
+    /// Opens an editor's find bar; `true` with its replace field.
+    Find(TabId, bool),
     /// Saves an editor: to its file, else as a script of its connection's
     /// database, else wherever the user picks.
     SaveScript(TabId),

@@ -63,6 +63,7 @@ fastframe_icons::icons! {
         FolderOpen => "folder-open",
         Save => "save",
         ShieldAlert => "shield-alert",
+        Keyboard => "keyboard",
         PostgreSql => "postgresql",
         MySql => "mysql",
         MariaDb => "mariadb",

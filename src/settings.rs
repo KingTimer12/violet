@@ -64,6 +64,9 @@ pub struct Settings {
     pub database_filters: BTreeMap<String, BTreeSet<String>>,
     /// Check for new versions and download them in the background.
     pub updates: bool,
+    /// Keyboard shortcuts changed from their defaults, by command name:
+    /// `"format": "Command+Alt+L"`.
+    pub shortcuts: BTreeMap<String, String>,
 }
 
 impl Default for Settings {
@@ -82,6 +85,7 @@ impl Default for Settings {
             export_folder: String::new(),
             schema_filters: BTreeMap::new(),
             database_filters: BTreeMap::new(),
+            shortcuts: BTreeMap::new(),
             updates: true,
         }
     }

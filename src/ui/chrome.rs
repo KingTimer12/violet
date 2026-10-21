@@ -6,7 +6,7 @@ use violet_core::{ConnectionId, ConnectionProfile};
 
 use super::action::{Action, RunScope};
 use super::icons::Icon;
-use super::shortcuts;
+use super::shortcuts::{self, Command};
 use super::sidebar::menu_item;
 use super::state::{Explorer, Link};
 use super::theme::{self, Palette};
@@ -84,6 +84,9 @@ pub fn title_bar(
             }
             if widgets::icon_button(ui, Icon::Package, "Database providers").clicked() {
                 actions.push(Action::OpenProviders);
+            }
+            if widgets::icon_button(ui, Icon::Keyboard, "Keyboard shortcuts").clicked() {
+                actions.push(Action::OpenShortcuts);
             }
             let (icon, next, tip) = match theme_preference {
                 egui::ThemePreference::System => {
@@ -365,7 +368,8 @@ pub fn toolbar(
         let running = tab.running.is_some();
         let run_tip = format!(
             "Run statement ({})",
-            ui.ctx().format_shortcut(&shortcuts::RUN_STATEMENT)
+            ui.ctx()
+                .format_shortcut(&shortcuts::get(Command::RunStatement))
         );
         let response = ui
             .add_enabled_ui(!running, |ui| {
@@ -377,7 +381,8 @@ pub fn toolbar(
         }
         let script_tip = format!(
             "Run script ({})",
-            ui.ctx().format_shortcut(&shortcuts::RUN_SCRIPT)
+            ui.ctx()
+                .format_shortcut(&shortcuts::get(Command::RunScript))
         );
         let response = ui
             .add_enabled_ui(!running, |ui| {
@@ -399,13 +404,13 @@ pub fn toolbar(
                 (
                     Icon::Zap,
                     "Explain plan",
-                    shortcuts::EXPLAIN,
+                    shortcuts::get(Command::Explain),
                     RunScope::Explain,
                 ),
                 (
                     Icon::Clock,
                     "Explain analyze (reads only)",
-                    shortcuts::EXPLAIN_ANALYZE,
+                    shortcuts::get(Command::ExplainAnalyze),
                     RunScope::ExplainAnalyze,
                 ),
             ] {
@@ -414,7 +419,10 @@ pub fn toolbar(
                 }
             }
         });
-        let cancel_tip = format!("Cancel ({})", ui.ctx().format_shortcut(&shortcuts::CANCEL));
+        let cancel_tip = format!(
+            "Cancel ({})",
+            ui.ctx().format_shortcut(&shortcuts::get(Command::Cancel))
+        );
         if ui
             .add_enabled_ui(running, |ui| {
                 widgets::icon_button(ui, Icon::Stop, &cancel_tip)
@@ -424,15 +432,30 @@ pub fn toolbar(
         {
             actions.push(Action::Cancel(tab.id));
         }
+        let format_tip = format!(
+            "Format the selection, or the whole script ({})",
+            ui.ctx().format_shortcut(&shortcuts::get(Command::Format))
+        );
+        if widgets::icon_button(ui, Icon::Function, &format_tip).clicked() {
+            actions.push(Action::FormatSql(tab.id));
+        }
+        let find_tip = format!(
+            "Find ({}), replace ({})",
+            ui.ctx().format_shortcut(&shortcuts::get(Command::Find)),
+            ui.ctx().format_shortcut(&shortcuts::get(Command::Replace))
+        );
+        if widgets::icon_button(ui, Icon::Search, &find_tip).clicked() {
+            actions.push(Action::Find(tab.id, false));
+        }
         let save_tip = match &tab.file {
             Some(file) => format!(
                 "Save ({})\n{}",
-                ui.ctx().format_shortcut(&shortcuts::SAVE),
+                ui.ctx().format_shortcut(&shortcuts::get(Command::Save)),
                 file.path.display()
             ),
             None => format!(
                 "Save script ({})",
-                ui.ctx().format_shortcut(&shortcuts::SAVE)
+                ui.ctx().format_shortcut(&shortcuts::get(Command::Save))
             ),
         };
         let save = widgets::icon_button(ui, Icon::Save, &save_tip);
@@ -442,12 +465,15 @@ pub fn toolbar(
         save.context_menu(|ui| {
             let label = format!(
                 "Save as… ({})",
-                ui.ctx().format_shortcut(&shortcuts::SAVE_AS)
+                ui.ctx().format_shortcut(&shortcuts::get(Command::SaveAs))
             );
             if ui.button(label).clicked() {
                 actions.push(Action::SaveScriptAs(tab.id));
             }
-            let label = format!("Open… ({})", ui.ctx().format_shortcut(&shortcuts::OPEN));
+            let label = format!(
+                "Open… ({})",
+                ui.ctx().format_shortcut(&shortcuts::get(Command::Open))
+            );
             if ui.button(label).clicked() {
                 actions.push(Action::OpenScriptFile);
             }
@@ -459,7 +485,7 @@ pub fn toolbar(
             ui.label(RichText::new("Connection").color(palette.dim));
             let history_tip = format!(
                 "Query history ({})",
-                ui.ctx().format_shortcut(&shortcuts::HISTORY)
+                ui.ctx().format_shortcut(&shortcuts::get(Command::History))
             );
             if widgets::icon_button(ui, Icon::Clock, &history_tip).clicked() {
                 actions.push(Action::OpenHistory);
@@ -503,7 +529,10 @@ fn data_toolbar(
         {
             actions.push(Action::RefreshTab(tab.id));
         }
-        let cancel_tip = format!("Cancel ({})", ui.ctx().format_shortcut(&shortcuts::CANCEL));
+        let cancel_tip = format!(
+            "Cancel ({})",
+            ui.ctx().format_shortcut(&shortcuts::get(Command::Cancel))
+        );
         if ui
             .add_enabled_ui(running, |ui| {
                 widgets::icon_button(ui, Icon::Stop, &cancel_tip)
@@ -769,15 +798,18 @@ pub fn welcome(
                             .spacing([40.0, 8.0])
                             .show(ui, |ui| {
                                 for (label, shortcut) in [
-                                    ("Run statement under cursor", shortcuts::RUN_STATEMENT),
-                                    ("Run whole script", shortcuts::RUN_SCRIPT),
-                                    ("Cancel running query", shortcuts::CANCEL),
-                                    ("Explain the statement", shortcuts::EXPLAIN),
-                                    ("Query history", shortcuts::HISTORY),
-                                    ("New SQL editor", shortcuts::NEW_EDITOR),
-                                    ("New connection", shortcuts::NEW_CONNECTION),
-                                    ("Close tab", shortcuts::CLOSE_TAB),
-                                    ("Toggle sidebar", shortcuts::TOGGLE_SIDEBAR),
+                                    (
+                                        "Run statement under cursor",
+                                        shortcuts::get(Command::RunStatement),
+                                    ),
+                                    ("Run whole script", shortcuts::get(Command::RunScript)),
+                                    ("Cancel running query", shortcuts::get(Command::Cancel)),
+                                    ("Explain the statement", shortcuts::get(Command::Explain)),
+                                    ("Query history", shortcuts::get(Command::History)),
+                                    ("New SQL editor", shortcuts::get(Command::NewEditor)),
+                                    ("New connection", shortcuts::get(Command::NewConnection)),
+                                    ("Close tab", shortcuts::get(Command::CloseTab)),
+                                    ("Toggle sidebar", shortcuts::get(Command::ToggleSidebar)),
                                 ] {
                                     ui.label(RichText::new(label).color(palette.secondary));
                                     widgets::pill(

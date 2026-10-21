@@ -162,6 +162,26 @@ Nothing is lost between runs:
   mode `0600`) and reopened on the next start. Like a `.sql` file you
   save, it keeps the text exactly as typed, passwords included.
 
+### Editing
+
+Every shortcut below can be changed: the keyboard button in the title bar
+lists them; click one and press the new keys. Changes are kept in the
+settings, under `shortcuts`.
+
+- **Find** (⌘/Ctrl+F) opens a bar over the editor, seeded with the
+  selected text; Enter and Shift+Enter go through the matches, highlighted
+  in the script, and **Aa** matches case. **Replace** (⌘/Ctrl+H) replaces
+  the picked match and moves on, or all of them. Escape closes it.
+- ⌘/Ctrl+/ comments the selected lines out with `--`, or back in.
+- **Format** (⌘/Ctrl+Shift+F) lays out the selection, or the whole script:
+  a clause per line, select lists and `SET`s an item per line, `AND`/`OR`
+  conditions a line each, subqueries indented, and reserved words in upper
+  case. Only spacing and the case of reserved words change: strings,
+  quoted names and comments stay as they are, and the result is checked
+  token by token against the script, which is left alone if anything else
+  would differ. In MySQL, backticks and `#` comments are kept, and a
+  string escaping a quote with a backslash stops the formatting.
+
 ## Scripts
 
 ⌘/Ctrl + S saves an editor as a script of its connection and database, as
