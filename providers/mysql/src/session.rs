@@ -23,6 +23,8 @@ pub struct MySession {
     wire: RefCell<Wire>,
     /// From the greeting, in case `VERSION()` is not answered.
     version: String,
+    /// The database the profile names; empty for none.
+    database: String,
 }
 
 /// What one statement produced.
@@ -47,6 +49,7 @@ impl MySession {
         Ok(Self {
             wire: RefCell::new(wire),
             version: greeting.version,
+            database: params.database.trim().to_owned(),
         })
     }
 
@@ -128,13 +131,14 @@ fn column(packet: &[u8]) -> Result<Column> {
     let _original_name = r.lenenc_bytes()?;
     let _fixed = r.lenenc()?;
     let charset = r.u16()?;
-    let _length = r.u32()?;
+    let length = r.u32()?;
     let kind = r.u8()?;
     let flags = r.u16()?;
     Ok(Column {
         name,
         kind,
         charset,
+        length,
         flags,
     })
 }
@@ -258,7 +262,20 @@ impl Session for MySession {
         })
     }
 
+    fn databases(&self) -> Result<Vec<String>> {
+        Ok(self
+            .query(catalog::SCHEMAS)?
+            .into_iter()
+            .filter_map(|row| cell(&row, 0))
+            .collect())
+    }
+
+    /// The session's own database alone: the others show as databases.
+    /// Without one, every database.
     fn schemas(&self) -> Result<Vec<String>> {
+        if !self.database.is_empty() {
+            return Ok(vec![self.database.clone()]);
+        }
         Ok(self
             .query(catalog::SCHEMAS)?
             .into_iter()
@@ -372,12 +389,14 @@ mod tests {
                 name: "a".into(),
                 kind: 253,
                 charset: 255,
+                length: 0,
                 flags: 0,
             },
             Column {
                 name: "b".into(),
                 kind: 252,
                 charset: types::BINARY,
+                length: 0,
                 flags: 0,
             },
         ];

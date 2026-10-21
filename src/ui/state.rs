@@ -82,6 +82,14 @@ impl Folder {
     }
 }
 
+/// What a tree filter picks: a database's schemas, or a server's
+/// databases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TreeFilter {
+    Schemas,
+    Databases,
+}
+
 /// An entry of the triggers, roles or extensions folder.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FolderItem {
@@ -159,6 +167,9 @@ pub struct Explorer {
     /// The schemas shown per `connection/database` (see
     /// [`Explorer::schema_scope`]), as the settings keep them.
     pub schema_filters: BTreeMap<String, BTreeSet<String>>,
+    /// The databases shown per saved connection (its id), as the settings
+    /// keep them.
+    pub database_filters: BTreeMap<String, BTreeSet<String>>,
     /// A node was clicked since this was last cleared.
     pub picked: bool,
     /// The tree was clicked last, so F-key shortcuts act on its selection.
@@ -209,15 +220,14 @@ impl Explorer {
         self.languages.get(driver).copied().unwrap_or_default()
     }
 
+    /// The key a saved connection's database choice is kept under.
+    pub fn database_scope(id: ConnectionId) -> String {
+        id.0.to_string()
+    }
+
     /// The saved connection and database a session is on, as
     /// `connection/database`: the key its schema choice is kept under.
     /// `None` until the session says which database it is on.
-    /// The key a saved connection's choice of databases is kept under,
-    /// beside its databases' schema choices.
-    pub fn database_scope(id: ConnectionId) -> String {
-        format!("{}/*", id.0)
-    }
-
     pub fn schema_scope(&self, id: ConnectionId) -> Option<String> {
         if let Some((parent, database)) = self.opened.get(&id) {
             return Some(format!("{}/{database}", parent.0));

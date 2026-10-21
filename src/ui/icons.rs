@@ -1,5 +1,6 @@
-//! Every icon Violet draws. Lucide outlines (ISC), drawn in white and tinted
-//! at paint time; the licence is in `assets/icons/LICENSE.txt`.
+//! Every icon Violet draws. Lucide outlines (ISC) and database logos from
+//! Simple Icons (CC0), drawn in white and tinted at paint time; the
+//! licences are in `assets/icons/LICENSE.txt`.
 
 fastframe_icons::icons! {
     /// The interface's icons.
@@ -28,6 +29,7 @@ fastframe_icons::icons! {
         Rows => "rows",
         ArrowUp => "arrow-up",
         ArrowDown => "arrow-down",
+        ArrowUpRight => "arrow-up-right",
         Funnel => "funnel",
         ChevronsDown => "chevrons-down",
         Package => "package",
@@ -69,6 +71,11 @@ fastframe_icons::icons! {
         Activity => "activity",
         Code => "code",
         Link => "link",
+        Keyboard => "keyboard",
+        PostgreSql => "postgresql",
+        MySql => "mysql",
+        MariaDb => "mariadb",
+        Sqlite => "sqlite",
     }
 }
 
@@ -84,6 +91,23 @@ impl Icon {
             Some("stream") => Self::Activity,
             Some("json") => Self::Code,
             _ => Self::Key,
+        }
+    }
+
+    /// The logo of the database a driver serves; a plain database for
+    /// those without one.
+    pub fn for_driver(id: &str) -> Self {
+        let id = id.to_ascii_lowercase();
+        if id.contains("postgres") {
+            Self::PostgreSql
+        } else if id.contains("maria") {
+            Self::MariaDb
+        } else if id.contains("mysql") {
+            Self::MySql
+        } else if id.contains("sqlite") {
+            Self::Sqlite
+        } else {
+            Self::Database
         }
     }
 

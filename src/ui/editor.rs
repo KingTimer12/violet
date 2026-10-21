@@ -1,6 +1,8 @@
 //! The SQL editor: a code text field with highlighting, line numbers, the
-//! last error marked where the server pointed, and completion as you type.
+//! last error marked where the server pointed, completion as you type, a
+//! find and replace bar, and lines commented out with a shortcut.
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use egui::text::{CCursor, CCursorRange, LayoutJob};
@@ -9,10 +11,12 @@ use violet_core::{ConnectionId, DbObject, Language};
 
 use super::action::Action;
 use super::icons::Icon;
+use super::shortcuts::{self, Command};
 use super::theme::{self, Palette};
-use super::widgets;
+use super::widgets::{self, Tone};
 use super::workspace::QueryTab;
 use crate::completion::{self, Catalog, Completion, Item, Kind};
+use crate::editing::{self, Edited};
 use crate::sql::{self, TokenKind};
 
 const FONT_SIZE: f32 = 13.5;
@@ -84,6 +88,203 @@ fn redis_tokens(text: &str) -> impl Iterator<Item = sql::Token> {
             },
             range: token.range,
         })
+}
+
+/// Replaces `tab`'s editor text and selects the byte range `selection`
+/// of it.
+pub fn replace_text(ctx: &egui::Context, tab: &mut QueryTab, edited: Edited) {
+    let text_id = Id::new(("violet-editor", tab.id));
+    tab.sql = edited.text;
+    select(ctx, text_id, &tab.sql, edited.selection.clone());
+    tab.selection = edited.selection;
+}
+
+/// Selects the byte range `range` of the editor's `text`.
+fn select(ctx: &egui::Context, text_id: Id, text: &str, range: Range<usize>) {
+    let chars = |at: usize| text[..at.min(text.len())].chars().count();
+    let mut state = egui::text_edit::TextEditState::load(ctx, text_id).unwrap_or_default();
+    state.cursor.set_char_range(Some(CCursorRange::two(
+        CCursor::new(chars(range.start)),
+        CCursor::new(chars(range.end)),
+    )));
+    state.store(ctx, text_id);
+}
+
+/// Finding, and replacing, text in an editor.
+#[derive(Default)]
+pub struct FindBar {
+    query: String,
+    replacement: String,
+    replacing: bool,
+    /// Letters match only in the case typed.
+    case: bool,
+    /// The match picked, by its place among them; `None` picks the first
+    /// after the cursor.
+    current: Option<usize>,
+    /// The find field takes the keyboard, its text selected.
+    focus: bool,
+    /// The picked match is selected and scrolled into view.
+    reveal: bool,
+}
+
+/// Opens `tab`'s find bar, seeded with the selected text when it is one
+/// line; `replacing` shows the replace field too.
+pub fn open_find(tab: &mut QueryTab, replacing: bool) {
+    open_bar(&mut tab.find, &tab.sql, &tab.selection, replacing);
+}
+
+fn open_bar(find: &mut Option<FindBar>, sql: &str, selection: &Range<usize>, replacing: bool) {
+    let picked = sql
+        .get(selection.clone())
+        .filter(|text| !text.is_empty() && !text.contains('\n'))
+        .map(str::to_owned);
+    let bar = find.get_or_insert_with(FindBar::default);
+    if let Some(picked) = picked {
+        bar.query = picked;
+    }
+    bar.replacing |= replacing;
+    bar.current = None;
+    bar.focus = true;
+    bar.reveal = true;
+}
+
+/// What the find bar asks of the editor.
+enum FindStep {
+    Stay,
+    /// The query or its case changed: pick the first match after the
+    /// cursor again.
+    Changed,
+    Next,
+    Previous,
+    Replace,
+    ReplaceAll,
+    Close,
+}
+
+fn find_id(tab: u64) -> Id {
+    Id::new(("violet-find", tab))
+}
+
+fn replace_id(tab: u64) -> Id {
+    Id::new(("violet-replace", tab))
+}
+
+/// The bar above the editor. `count` is how many matches there are.
+fn find_bar(ui: &mut Ui, tab: u64, bar: &mut FindBar, count: usize) -> FindStep {
+    let palette = Palette::current(ui.ctx());
+    let mut step = FindStep::Stay;
+    let pressed = |ui: &Ui, key: Key| ui.input(|input| input.key_pressed(key));
+    egui::Frame::new()
+        .fill(palette.panel)
+        .stroke(Stroke::new(1.0, palette.outline))
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+            ui.horizontal(|ui| {
+                if std::mem::take(&mut bar.focus) {
+                    // Typing replaces what the field held.
+                    let mut state = egui::text_edit::TextEditState::load(ui.ctx(), find_id(tab))
+                        .unwrap_or_default();
+                    state.cursor.set_char_range(Some(CCursorRange::two(
+                        CCursor::new(0),
+                        CCursor::new(bar.query.chars().count()),
+                    )));
+                    state.store(ui.ctx(), find_id(tab));
+                    ui.ctx()
+                        .memory_mut(|memory| memory.request_focus(find_id(tab)));
+                }
+                let field = ui.add_sized(
+                    [260.0, 28.0],
+                    widgets::text_input(&mut bar.query, "Find").id(find_id(tab)),
+                );
+                if field.changed() {
+                    step = FindStep::Changed;
+                }
+                if field.lost_focus() {
+                    if pressed(ui, Key::Escape) {
+                        step = FindStep::Close;
+                    } else if pressed(ui, Key::Enter) {
+                        step = if ui.input(|input| input.modifiers.shift) {
+                            FindStep::Previous
+                        } else {
+                            FindStep::Next
+                        };
+                        field.request_focus();
+                    }
+                }
+                let tone = if bar.case { Tone::Primary } else { Tone::Ghost };
+                if widgets::button(ui, tone, None, "Aa")
+                    .on_hover_text("Match case")
+                    .clicked()
+                {
+                    bar.case = !bar.case;
+                    step = FindStep::Changed;
+                }
+                let found = match (count, bar.current) {
+                    _ if bar.query.is_empty() => String::new(),
+                    (0, _) => "No results".to_owned(),
+                    (count, Some(current)) => format!("{} of {count}", current + 1),
+                    (count, None) => format!("{count} found"),
+                };
+                ui.label(egui::RichText::new(found).color(palette.dim));
+                if widgets::icon_button(ui, Icon::ArrowUp, "Previous (Shift+Enter)").clicked() {
+                    step = FindStep::Previous;
+                }
+                if widgets::icon_button(ui, Icon::ArrowDown, "Next (Enter)").clicked() {
+                    step = FindStep::Next;
+                }
+                let tone = if bar.replacing {
+                    Tone::Primary
+                } else {
+                    Tone::Ghost
+                };
+                let replace_tip = format!(
+                    "Replace ({})",
+                    ui.ctx().format_shortcut(&shortcuts::get(Command::Replace))
+                );
+                if widgets::button(ui, tone, None, "Replace")
+                    .on_hover_text(replace_tip)
+                    .clicked()
+                {
+                    bar.replacing = !bar.replacing;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if widgets::icon_button(ui, Icon::Close, "Close (Esc)").clicked() {
+                        step = FindStep::Close;
+                    }
+                });
+            });
+            if bar.replacing {
+                ui.horizontal(|ui| {
+                    let field = ui.add_sized(
+                        [260.0, 28.0],
+                        widgets::text_input(&mut bar.replacement, "Replace with")
+                            .id(replace_id(tab)),
+                    );
+                    if field.lost_focus() {
+                        if pressed(ui, Key::Escape) {
+                            step = FindStep::Close;
+                        } else if pressed(ui, Key::Enter) {
+                            step = FindStep::Replace;
+                            field.request_focus();
+                        }
+                    }
+                    ui.add_enabled_ui(count > 0, |ui| {
+                        if widgets::button(ui, Tone::Secondary, None, "Replace")
+                            .on_hover_text("Replace this match, and go to the next (Enter)")
+                            .clicked()
+                        {
+                            step = FindStep::Replace;
+                        }
+                        if widgets::button(ui, Tone::Secondary, None, "Replace all").clicked() {
+                            step = FindStep::ReplaceAll;
+                        }
+                    });
+                });
+            }
+        });
+    step
 }
 
 #[hotpath::measure]
@@ -196,10 +397,115 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
         selection,
         highlighter,
         popup,
+        find,
         ..
     } = tab;
     let text_id = Id::new(("violet-editor", *id));
     let focused = ui.ctx().memory(|memory| memory.has_focus(text_id));
+    let bar_focused = ui
+        .ctx()
+        .memory(|memory| memory.has_focus(find_id(*id)) || memory.has_focus(replace_id(*id)));
+
+    // Find, replace and format, from the editor, its find bar, or when no
+    // field has the keyboard.
+    if focused || bar_focused || !ui.ctx().egui_wants_keyboard_input() {
+        let (format, find_key, replace_key) = ui.input_mut(|input| {
+            (
+                shortcuts::consume(input, Command::Format),
+                shortcuts::consume(input, Command::Find),
+                shortcuts::consume(input, Command::Replace),
+            )
+        });
+        if format {
+            actions.push(Action::FormatSql(*id));
+        }
+        if find_key || replace_key {
+            open_bar(find, sql, selection, replace_key);
+        }
+    }
+    if focused && ui.input_mut(|input| shortcuts::consume(input, Command::Comment)) {
+        let edited = editing::toggle_comment(sql, selection.clone());
+        *sql = edited.text;
+        select(ui.ctx(), text_id, sql, edited.selection.clone());
+        *selection = edited.selection;
+    }
+    if focused
+        && find.is_some()
+        && !popup.open
+        && ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape))
+    {
+        *find = None;
+    }
+
+    // The find bar, and what it asks.
+    let mut matches: Vec<Range<usize>> = Vec::new();
+    let mut picked = None;
+    let mut reveal = false;
+    if let Some(bar) = find.as_mut() {
+        matches = editing::find_all(sql, &bar.query, bar.case);
+        let step = find_bar(ui, *id, bar, matches.len());
+        let after_cursor = |matches: &[Range<usize>]| {
+            matches
+                .iter()
+                .position(|found| found.start >= selection.start)
+                .or((!matches.is_empty()).then_some(0))
+        };
+        match step {
+            FindStep::Stay => {}
+            FindStep::Changed => {
+                bar.current = None;
+                bar.reveal = true;
+            }
+            FindStep::Next | FindStep::Previous if !matches.is_empty() => {
+                let count = matches.len();
+                bar.current = Some(match (bar.current, matches!(step, FindStep::Next)) {
+                    (Some(current), true) => (current + 1) % count,
+                    (Some(current), false) => (current + count - 1) % count,
+                    (None, _) => after_cursor(&matches).unwrap_or(0),
+                });
+                bar.reveal = true;
+            }
+            FindStep::Next | FindStep::Previous => {}
+            FindStep::Replace => {
+                if let Some(found) = bar.current.and_then(|at| matches.get(at)).cloned() {
+                    sql.replace_range(found, &bar.replacement);
+                    matches = editing::find_all(sql, &bar.query, bar.case);
+                    // The match after it is now at its place.
+                    bar.current = bar
+                        .current
+                        .filter(|at| *at < matches.len())
+                        .or(after_cursor(&matches));
+                    bar.reveal = true;
+                } else {
+                    bar.current = after_cursor(&matches);
+                    bar.reveal = true;
+                }
+            }
+            FindStep::ReplaceAll => {
+                *sql = editing::replace_all(sql, &matches, &bar.replacement);
+                matches = editing::find_all(sql, &bar.query, bar.case);
+                bar.current = None;
+            }
+            FindStep::Close => {
+                ui.ctx().memory_mut(|memory| memory.request_focus(text_id));
+            }
+        }
+        if matches!(step, FindStep::Close) {
+            *find = None;
+            matches.clear();
+        } else {
+            if bar.current.is_none() && bar.reveal {
+                bar.current = after_cursor(&matches);
+            }
+            bar.current = bar.current.filter(|at| *at < matches.len());
+            picked = bar.current;
+            reveal = std::mem::take(&mut bar.reveal) && picked.is_some();
+            if reveal && let Some(found) = picked.and_then(|at| matches.get(at)) {
+                select(ui.ctx(), text_id, sql, found.clone());
+                *selection = found.clone();
+            }
+        }
+    }
 
     // An open list takes the keys it uses before the editor sees them.
     let mut accept = None;
@@ -286,9 +592,18 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
                         bottom: 12,
                     })
                     .hint_text(
-                        egui::RichText::new(match assist.language {
-                            Language::Redis => "# Write Redis commands here, one per line. ⌘↵ runs the one under the cursor (a MULTI … EXEC block whole), ⌃Space completes.",
-                            _ => "-- Write SQL here. ⌘↵ runs the statement under the cursor, ⌃Space completes.",
+                        egui::RichText::new({
+                            let run = ui
+                                .ctx()
+                                .format_shortcut(&shortcuts::get(Command::RunStatement));
+                            match assist.language {
+                                Language::Redis => format!(
+                                    "# Write Redis commands here, one per line. {run} runs the one under the cursor (a MULTI … EXEC block whole), ⌃Space completes."
+                                ),
+                                _ => format!(
+                                    "-- Write SQL here. {run} runs the statement under the cursor, ⌃Space completes."
+                                ),
+                            }
                         })
                         .font(theme::mono(FONT_SIZE))
                         .color(palette.dim),
@@ -320,6 +635,35 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
                     let start = sql[..completion.range.start.min(sql.len())].chars().count();
                     let rect = output.galley.pos_from_cursor(CCursor::new(start));
                     anchor = Some(output.galley_pos + rect.left_bottom().to_vec2());
+                }
+
+                // Matches of the find bar, the picked one stronger.
+                let mut chars = 0;
+                let mut at = 0;
+                for (index, found) in matches.iter().enumerate() {
+                    chars += sql[at..found.start].chars().count();
+                    let start = chars;
+                    chars += sql[found.clone()].chars().count();
+                    at = found.end;
+                    let from = output.galley.pos_from_cursor(CCursor::new(start));
+                    let to = output.galley.pos_from_cursor(CCursor::new(chars));
+                    let right = if to.top() == from.top() {
+                        to.left()
+                    } else {
+                        from.left() + 8.0
+                    };
+                    let rect = egui::Rect::from_min_max(from.min, egui::pos2(right, from.max.y))
+                        .translate(output.galley_pos.to_vec2());
+                    let current = picked == Some(index);
+                    let fill = if current {
+                        palette.accent.gamma_multiply(0.45)
+                    } else {
+                        palette.warning.gamma_multiply(0.28)
+                    };
+                    ui.painter().rect_filled(rect, CornerRadius::same(2), fill);
+                    if current && reveal {
+                        ui.scroll_to_rect(rect.expand(24.0), Some(egui::Align::Center));
+                    }
                 }
 
                 // Line numbers: one per logical line, not per wrapped row.

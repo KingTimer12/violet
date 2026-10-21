@@ -204,7 +204,13 @@ impl VioletApp {
                 }
                 false
             }
-            ("keys", _) => settle && self.workspace.active().is_some_and(|tab| tab.running.is_none()),
+            ("keys", _) => {
+                settle
+                    && self
+                        .workspace
+                        .active()
+                        .is_some_and(|tab| tab.running.is_none())
+            }
             ("browse", 1) => {
                 let Some(id) = first else { return true };
                 let loaded = self

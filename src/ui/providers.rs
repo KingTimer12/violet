@@ -220,7 +220,7 @@ fn row(
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 let (rect, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
-                widgets::paint_icon(ui, Icon::Database, rect, palette.accent);
+                widgets::paint_icon(ui, Icon::for_driver(id.as_str()), rect, palette.accent);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 3.0;
                     ui.horizontal(|ui| {

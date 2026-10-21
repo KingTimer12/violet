@@ -293,9 +293,15 @@ pub trait Dialect: Send + Sync {
     /// database has no way, or `schema` cannot be written safely as a
     /// literal.
     fn foreign_keys(&self, schema: &str) -> Option<String> {
-        let schema = string_literal(schema)?;
-        Some(format!(
-            "SELECT kcu.constraint_schema, kcu.constraint_name, \
+        standard_foreign_keys(schema)
+    }
+}
+
+/// The standard `information_schema` query of [`Dialect::foreign_keys`].
+fn standard_foreign_keys(schema: &str) -> Option<String> {
+    let schema = string_literal(schema)?;
+    Some(format!(
+        "SELECT kcu.constraint_schema, kcu.constraint_name, \
              kcu.table_schema, kcu.table_name, kcu.column_name, \
              ref.table_schema, ref.table_name, ref.column_name \
              FROM information_schema.referential_constraints rc \
@@ -308,8 +314,24 @@ pub trait Dialect: Send + Sync {
              AND ref.ordinal_position = kcu.position_in_unique_constraint \
              WHERE kcu.table_schema = {schema} OR ref.table_schema = {schema} \
              ORDER BY 1, 2, 3, 4, kcu.ordinal_position"
-        ))
-    }
+    ))
+}
+
+/// [`Dialect::foreign_keys`] for MySQL and MariaDB. Their
+/// `referential_constraints` name the referenced key by its index, which
+/// is `PRIMARY` in every table, so the standard query matches every
+/// table's key; their `key_column_usage` names the referenced column
+/// itself.
+fn mysql_foreign_keys(schema: &str) -> Option<String> {
+    let schema = string_literal(schema)?;
+    Some(format!(
+        "SELECT CONSTRAINT_SCHEMA, CONSTRAINT_NAME, TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, \
+         REFERENCED_TABLE_SCHEMA, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME \
+         FROM information_schema.KEY_COLUMN_USAGE \
+         WHERE REFERENCED_TABLE_NAME IS NOT NULL \
+         AND (TABLE_SCHEMA = {schema} OR REFERENCED_TABLE_SCHEMA = {schema}) \
+         ORDER BY 1, 2, 3, 4, ORDINAL_POSITION"
+    ))
 }
 
 /// `text` as a standard SQL string literal, or `None` when it holds a
@@ -384,6 +406,15 @@ impl Dialect for SqlDialect {
             shift: PREFIX.chars().count() as u32,
         }
     }
+
+    fn foreign_keys(&self, schema: &str) -> Option<String> {
+        // Backticks quote names in MySQL and MariaDB alone.
+        if self.quote_open == '`' {
+            mysql_foreign_keys(schema)
+        } else {
+            standard_foreign_keys(schema)
+        }
+    }
 }
 
 /// Standard SQL quoting with double quotes.
@@ -420,6 +451,14 @@ mod tests {
         assert_eq!(string_literal("a\0b"), None);
         let sql = AnsiDialect.foreign_keys("o'k").expect("query");
         assert!(sql.contains("kcu.table_schema = 'o''k' OR ref.table_schema = 'o''k'"));
+        let mysql = SqlDialect {
+            quote_open: '`',
+            quote_close: '`',
+            paging: Paging::LimitOffset,
+        };
+        let sql = mysql.foreign_keys("o'k").expect("query");
+        assert!(sql.contains("FROM information_schema.KEY_COLUMN_USAGE"));
+        assert!(sql.contains("TABLE_SCHEMA = 'o''k' OR REFERENCED_TABLE_SCHEMA = 'o''k'"));
         assert_eq!(AnsiDialect.explain("SELECT 1", false), "EXPLAIN SELECT 1");
         assert_eq!(
             AnsiDialect.explain("SELECT 1", true),

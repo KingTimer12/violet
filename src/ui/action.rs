@@ -97,10 +97,25 @@ pub enum Action {
     SetCell(TabId, usize, usize, Option<String>),
     RevertCell(TabId, usize, usize),
     DiscardEdits(TabId),
+    /// Adds an empty row to a tab's grid, inserted when its changes are
+    /// saved.
+    AddRow(TabId),
+    /// Marks rows of a tab's grid to delete; an added row just goes.
+    DeleteRows(TabId, Vec<usize>),
+    /// Keeps rows marked to delete after all.
+    RestoreRows(TabId, Vec<usize>),
     /// Shows the statements that save a tab's changed cells.
     ReviewEdits(TabId),
     /// Writes them, the user having reviewed them.
     ApplyEdits(TabId),
+    /// Opens the keyboard shortcuts dialog.
+    OpenShortcuts,
+    /// Changes a command's shortcut; `None` puts its default back.
+    SetShortcut(super::shortcuts::Command, Option<egui::KeyboardShortcut>),
+    /// Formats an editor's selection, or its whole script.
+    FormatSql(TabId),
+    /// Opens an editor's find bar; `true` with its replace field.
+    Find(TabId, bool),
     /// Saves an editor: to its file, else as a script of its connection's
     /// database, else wherever the user picks.
     SaveScript(TabId),
@@ -132,6 +147,8 @@ pub enum Action {
     AskRename(super::rename_flow::RenameTarget),
     /// The name typed in the rename prompt.
     RenameTo(String),
+    /// Closes several tabs at once, asking once about unsaved scripts.
+    CloseTabs(Vec<TabId>),
     SelectTab(TabId),
     SetTabConnection(TabId, Option<ConnectionId>),
     SetTheme(egui::ThemePreference),
@@ -162,19 +179,31 @@ pub enum Action {
     LoadFolder(ConnectionId, super::state::Folder),
     /// Opens the dialog picking which schemas a session's database shows.
     ChooseSchemas(ConnectionId),
-    /// Picks which databases the tree shows for a saved connection.
+    /// Opens the dialog picking which databases a connection shows.
     ChooseDatabases(ConnectionId),
-    /// Keeps the schemas picked for a `connection/database`; `None` shows
-    /// them all.
-    SetSchemaFilter(String, Option<std::collections::BTreeSet<String>>),
+    /// Keeps the schemas picked for a `connection/database`, or the
+    /// databases for a connection; `None` shows them all.
+    SetTreeFilter(
+        super::state::TreeFilter,
+        String,
+        Option<std::collections::BTreeSet<String>>,
+    ),
     /// Opens advanced copy for a tab's picked cells.
     AdvancedCopy(TabId),
     /// The format and header choice advanced copy starts with next time.
     RememberCopy(crate::export::Format, bool),
     /// Writes the shown rows of a tab to a file in a format.
     Export(TabId, crate::export::Format),
-    /// Closes the referenced row beside a tab's grid.
-    CloseReference(TabId),
+    /// Opens, beside a tab's grid, the row a foreign key cell points at:
+    /// the tab's row and column.
+    FollowKey(TabId, usize, usize),
+    /// Follows a foreign key from the rows shown beside a tab's grid: the
+    /// step the cell is in, its row and its column.
+    FollowNestedKey(TabId, usize, usize, usize),
+    /// Goes back to a step of the references beside a tab's grid.
+    BackToReference(TabId, usize),
+    /// Closes the referenced rows beside the grid.
+    CloseReference,
     OpenHistory,
     ClearHistory,
     /// Puts SQL at the active editor's cursor.

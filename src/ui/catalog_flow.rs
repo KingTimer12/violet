@@ -12,7 +12,7 @@ use super::VioletApp;
 use super::action::Action;
 use super::definition_flow::Family;
 use super::icons::Icon;
-use super::state::{Folder, FolderItem, Loadable};
+use super::state::{Explorer, Folder, FolderItem, Loadable, TreeFilter};
 use super::theme::{self, Palette};
 use super::toasts::Toast;
 use super::widgets::{self, Tone};
@@ -54,10 +54,12 @@ fn folder_sql(family: Family, folder: Folder) -> Option<&'static str> {
         (Family::Postgres, Folder::Extensions) => {
             "SELECT extname, extversion FROM pg_catalog.pg_extension ORDER BY 1"
         }
+        // The session's database alone; without one, every user database.
         (Family::MySql, Folder::Triggers) => {
             "SELECT TRIGGER_NAME, TRIGGER_SCHEMA, EVENT_OBJECT_TABLE \
              FROM information_schema.TRIGGERS \
-             WHERE TRIGGER_SCHEMA NOT IN ('mysql', 'sys', 'performance_schema', 'information_schema') \
+             WHERE COALESCE(TRIGGER_SCHEMA = DATABASE(), \
+             TRIGGER_SCHEMA NOT IN ('mysql', 'sys', 'performance_schema', 'information_schema')) \
              ORDER BY 2, 3, 1"
         }
         (Family::MySql, Folder::Roles) => {
@@ -161,79 +163,90 @@ impl VioletApp {
         let Some(scope) = self.explorer.schema_scope(session) else {
             return;
         };
-        let all: Vec<String> = all.to_vec();
-        let picked = match self.settings.schema_filters.get(&scope) {
-            Some(picked) => picked.clone(),
-            None => all.iter().cloned().collect(),
-        };
-        self.schema_chooser = Some(SchemaChooser {
-            scope,
-            all,
-            picked,
-            filter: String::new(),
-            noun: "schemas",
-        });
+        let all = all.to_vec();
+        let picked = self.settings.schema_filters.get(&scope).cloned();
+        self.chooser = Some(Chooser::new(TreeFilter::Schemas, scope, all, picked));
     }
 
     /// Opens the dialog that picks which databases the tree shows for a
-    /// connection: a key-value store's numbered ones, or a server's.
-    pub(super) fn choose_databases(&mut self, ctx: &egui::Context, id: ConnectionId) {
-        let list = if self.language(id) == violet_core::Language::Redis {
-            self.explorer.schemas.get(&id)
+    /// saved connection that lists them all: a server's, or a key-value
+    /// store's numbered ones.
+    pub(super) fn choose_databases(&mut self, ctx: &egui::Context, parent: ConnectionId) {
+        let list = if self.language(parent) == violet_core::Language::Redis {
+            self.explorer.schemas.get(&parent)
         } else {
-            self.explorer.databases.get(&id)
+            self.explorer.databases.get(&parent)
         };
         let Some(Loadable::Ready(all)) = list else {
             self.toasts
                 .push(ctx, Toast::info("The databases are still loading."));
             return;
         };
-        let all: Vec<String> = all.to_vec();
-        let scope = super::state::Explorer::database_scope(id);
-        let picked = match self.settings.schema_filters.get(&scope) {
-            Some(picked) => picked.clone(),
-            None => all.iter().cloned().collect(),
-        };
-        self.schema_chooser = Some(SchemaChooser {
-            scope,
-            all,
-            picked,
-            filter: String::new(),
-            noun: "databases",
-        });
+        let scope = Explorer::database_scope(parent);
+        let all = all.to_vec();
+        let picked = self.settings.database_filters.get(&scope).cloned();
+        self.chooser = Some(Chooser::new(TreeFilter::Databases, scope, all, picked));
     }
 
-    /// Keeps the schemas picked for a database; all of them means no
-    /// choice at all.
-    pub(super) fn set_schema_filter(
+    /// Keeps the schemas or databases picked; all of them means no choice
+    /// at all.
+    pub(super) fn set_tree_filter(
         &mut self,
         ctx: &egui::Context,
+        kind: TreeFilter,
         scope: String,
         picked: Option<BTreeSet<String>>,
     ) {
+        let filters = match kind {
+            TreeFilter::Schemas => &mut self.settings.schema_filters,
+            TreeFilter::Databases => &mut self.settings.database_filters,
+        };
         match picked {
-            Some(picked) => self.settings.schema_filters.insert(scope, picked),
-            None => self.settings.schema_filters.remove(&scope),
+            Some(picked) => filters.insert(scope, picked),
+            None => filters.remove(&scope),
         };
         self.explorer
             .schema_filters
             .clone_from(&self.settings.schema_filters);
+        self.explorer
+            .database_filters
+            .clone_from(&self.settings.database_filters);
         self.save_settings(ctx);
     }
 }
 
-/// Picking the schemas a database shows.
-pub struct SchemaChooser {
+/// Picking the schemas a database shows, or the databases a connection
+/// shows.
+pub struct Chooser {
+    kind: TreeFilter,
     scope: String,
     all: Vec<String>,
     picked: BTreeSet<String>,
     filter: String,
-    /// What is picked: `schemas` or `databases`.
-    noun: &'static str,
 }
 
-/// Schemas every PostgreSQL or MySQL server has, which few people browse.
-fn is_system_schema(name: &str) -> bool {
+impl Chooser {
+    /// Starts from the names picked before, or all of them.
+    fn new(
+        kind: TreeFilter,
+        scope: String,
+        all: Vec<String>,
+        picked: Option<BTreeSet<String>>,
+    ) -> Self {
+        let picked = picked.unwrap_or_else(|| all.iter().cloned().collect());
+        Self {
+            kind,
+            scope,
+            all,
+            picked,
+            filter: String::new(),
+        }
+    }
+}
+
+/// Schemas and databases every PostgreSQL or MySQL server has, which few
+/// people browse.
+fn is_system_name(name: &str) -> bool {
     name.starts_with("pg_")
         || matches!(
             name,
@@ -247,35 +260,32 @@ fn is_system_schema(name: &str) -> bool {
 }
 
 /// Shows the dialog. Returns whether it is still open.
-pub fn show_chooser(
-    ctx: &egui::Context,
-    chooser: &mut SchemaChooser,
-    actions: &mut Vec<Action>,
-) -> bool {
+pub fn show_chooser(ctx: &egui::Context, chooser: &mut Chooser, actions: &mut Vec<Action>) -> bool {
     let palette = Palette::current(ctx);
+    let (title, noun, hide) = match chooser.kind {
+        TreeFilter::Schemas => ("Schemas to show", "schemas", "Hide system schemas"),
+        TreeFilter::Databases => ("Databases to show", "databases", "Hide system databases"),
+    };
     let mut open = true;
-    let modal = egui::Modal::new(egui::Id::new("schema-chooser"))
+    let modal = egui::Modal::new(egui::Id::new("tree-chooser"))
         .frame(super::edit_flow::frame(&palette))
         .show(ctx, |ui| {
             ui.set_width(420.0);
             ui.spacing_mut().item_spacing.y = 10.0;
             ui.label(
-                RichText::new(format!("{} to show", capitalized(chooser.noun)))
+                RichText::new(title)
                     .font(theme::semibold(16.0))
                     .color(palette.text),
             );
             ui.label(
                 RichText::new(format!(
-                    "{} of {} picked. The editor still reaches the others.",
+                    "{} of {} picked. The others only leave the tree: the editor still reaches them.",
                     chooser.picked.len(),
                     chooser.all.len()
                 ))
                 .color(palette.dim),
             );
-            ui.add(widgets::text_input(
-                &mut chooser.filter,
-                &format!("Filter {}", chooser.noun),
-            ));
+            ui.add(widgets::text_input(&mut chooser.filter, &format!("Filter {noun}")));
             ui.horizontal(|ui| {
                 if widgets::button(ui, Tone::Ghost, None, "All").clicked() {
                     chooser.picked = chooser.all.iter().cloned().collect();
@@ -283,9 +293,8 @@ pub fn show_chooser(
                 if widgets::button(ui, Tone::Ghost, None, "None").clicked() {
                     chooser.picked.clear();
                 }
-                let hide = format!("Hide system {}", chooser.noun);
-                if widgets::button(ui, Tone::Ghost, None, &hide).clicked() {
-                    chooser.picked.retain(|name| !is_system_schema(name));
+                if widgets::button(ui, Tone::Ghost, None, hide).clicked() {
+                    chooser.picked.retain(|name| !is_system_name(name));
                 }
             });
             let filter = chooser.filter.trim().to_lowercase();
@@ -316,11 +325,15 @@ pub fn show_chooser(
                             widgets::button(ui, Tone::Primary, Some(Icon::Check), "Save")
                         })
                         .inner
-                        .on_disabled_hover_text("Pick at least one");
+                        .on_disabled_hover_text(format!("Pick at least one of the {noun}"));
                     if save.clicked() {
                         let all = chooser.picked.len() == chooser.all.len();
                         let picked = (!all).then(|| chooser.picked.clone());
-                        actions.push(Action::SetSchemaFilter(chooser.scope.clone(), picked));
+                        actions.push(Action::SetTreeFilter(
+                            chooser.kind,
+                            chooser.scope.clone(),
+                            picked,
+                        ));
                         open = false;
                     }
                     if widgets::button(ui, Tone::Ghost, None, "Cancel").clicked() {
@@ -330,14 +343,6 @@ pub fn show_chooser(
             });
         });
     open && !modal.should_close()
-}
-
-fn capitalized(word: &str) -> String {
-    let mut chars = word.chars();
-    chars
-        .next()
-        .map(|first| first.to_uppercase().chain(chars).collect())
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -378,6 +383,7 @@ mod tests {
         let items = folder_items(Folder::Triggers, &set);
         assert_eq!(items[0].schema.as_deref(), Some("public"));
         assert_eq!(items[0].table.as_deref(), Some("orders"));
-        assert!(is_system_schema("pg_catalog") && !is_system_schema("public"));
+        assert!(is_system_name("pg_catalog") && is_system_name("template1"));
+        assert!(!is_system_name("public"));
     }
 }

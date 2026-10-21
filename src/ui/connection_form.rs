@@ -229,11 +229,7 @@ pub fn show(
                         } else {
                             Tone::Secondary
                         };
-                        let icon = if driver.installed {
-                            Icon::Database
-                        } else {
-                            Icon::Download
-                        };
+                        let icon = Icon::for_driver(driver.info.id.as_str());
                         let response = widgets::button(ui, tone, Some(icon), &driver.info.name);
                         let response = if driver.installed {
                             response

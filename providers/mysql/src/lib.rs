@@ -31,8 +31,9 @@ impl Provider for MySql {
             description: "MySQL 5.7 and later, MariaDB 10.3 and later".into(),
             default_user: "root".into(),
             capabilities: Capabilities {
-                // A MySQL database is a schema: they show as schemas.
-                databases: false,
+                // A MySQL database is what MySQL also calls a schema: the
+                // tree shows them as databases, each opened on its own.
+                databases: true,
                 schemas: true,
                 // Stopping a statement takes `KILL QUERY` from a second
                 // authenticated connection, and cancelling runs without

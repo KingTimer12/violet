@@ -203,6 +203,26 @@ Nothing is lost between runs:
   mode `0600`) and reopened on the next start. Like a `.sql` file you
   save, it keeps the text exactly as typed, passwords included.
 
+### Editing
+
+Every shortcut below can be changed: the keyboard button in the title bar
+lists them; click one and press the new keys. Changes are kept in the
+settings, under `shortcuts`.
+
+- **Find** (⌘/Ctrl+F) opens a bar over the editor, seeded with the
+  selected text; Enter and Shift+Enter go through the matches, highlighted
+  in the script, and **Aa** matches case. **Replace** (⌘/Ctrl+H) replaces
+  the picked match and moves on, or all of them. Escape closes it.
+- ⌘/Ctrl+/ comments the selected lines out with `--`, or back in.
+- **Format** (⌘/Ctrl+Shift+F) lays out the selection, or the whole script:
+  a clause per line, select lists and `SET`s an item per line, `AND`/`OR`
+  conditions a line each, subqueries indented, and reserved words in upper
+  case. Only spacing and the case of reserved words change: strings,
+  quoted names and comments stay as they are, and the result is checked
+  token by token against the script, which is left alone if anything else
+  would differ. In MySQL, backticks and `#` comments are kept, and a
+  string escaping a quote with a backslash stops the formatting.
+
 ## Scripts
 
 ⌘/Ctrl + S saves an editor as a script of its connection and database, as
@@ -314,15 +334,22 @@ row is sorted, not only the page shown.
 Rows that map back to one table with a primary key can be edited in the
 grid: a data tab, or the result of a `SELECT` of one table's plain
 columns (no joins, grouping, `DISTINCT` or computed columns), primary key
-included. Double-click a cell, or right-click it to set it to NULL or
-revert it. Changes stay in the grid, highlighted, until **Save…** shows
-the `UPDATE` statements they make, one per row and each picking its row
-by primary key, and you apply them. They run as one transaction: if one
-fails, nothing changes and the edits stay. Key columns cannot be edited,
-values holding a backslash or a control character other than line breaks
-and tabs are refused, and reading the rows again with changes pending is
-blocked until they are saved or discarded. Applied changes go to the
-query history.
+included. Double-click a cell, or press Enter or F2, to edit it in place:
+Enter or clicking elsewhere keeps the change, Escape drops it, Tab and
+Shift+Tab move along the row. A value of several lines opens in a dialog,
+as does **Edit value…**; right-click a cell to set it to NULL or revert
+it. **Add row** appends an empty row (in green), its first cell open for
+typing; a cell left alone takes the column's default. Pick rows and press
+**Delete row** (or Delete) to mark them for deletion (in red), and
+**Keep** them again. Changes stay in the grid until **Save…** shows the
+statements they make: `DELETE`s, then `UPDATE`s, one per row and each
+picking its row by primary key, then `INSERT`s. They run as one
+transaction: if one fails, nothing changes and the edits stay. Key
+columns can only be typed in added rows, values holding a backslash or a
+control character other than line breaks and tabs are refused, and
+reading the rows again with changes pending (or more rows, with rows
+added) is blocked until they are saved or discarded. Applied changes go
+to the query history.
 
 `UPDATE` and `DELETE` statements without a `WHERE` (in `WITH` queries
 too) ask before they run, naming each table whose every row they would

@@ -2,70 +2,27 @@
 //! the progress of a running query.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use egui::text::{LayoutJob, TextWrapping};
-use egui::{
-    Align, Color32, CornerRadius, Layout, Pos2, RichText, Sense, Stroke, TextFormat, Ui, Vec2,
-};
+use egui::{Align, CornerRadius, Layout, RichText, Sense, Stroke, Ui, Vec2};
 use egui_extras::{Column, TableBuilder};
 use violet_core::{DbError, ResultSet};
 
 use super::action::Action;
+use super::cells::{self, Cell, Look};
 use super::edit_flow::{EditTarget, Editing};
 use super::icons::Icon;
+use super::reference::{self, Reference};
 use super::selection::{Mode, Selection};
 use super::theme::{self, Palette};
 use super::widgets::{self, Tone};
 use super::workspace::{
-    Count, Executed, Outcome, Paging, QueryTab, TabKind, format_duration, thousands,
+    Count, Executed, InlineCell, Outcome, Paging, QueryTab, TabKind, format_duration, thousands,
 };
 use crate::export::{to_delimited, write_row};
 use crate::sql;
 
 const ROW_HEIGHT: f32 = 26.0;
-/// Characters shown per cell; the full value is a click away.
-const CELL_PREVIEW: usize = 300;
-/// Room between a cell's edge and its text.
-const CELL_PADDING: f32 = 6.0;
-
-/// What a cell shows.
-#[derive(Clone, Copy)]
-enum Cell<'a> {
-    Value(&'a str),
-    Null,
-    RowNumber(usize),
-}
-
-/// Paints `cell` in the cell `ui` stands for, cut to its width and centred
-/// vertically. Painted directly rather than as a label widget; the layout
-/// comes from egui's own cache, which knows when the font atlas changes.
-fn paint_cell(ui: &Ui, cell: Cell<'_>, right_aligned: bool, color: Color32) {
-    let rect = ui.max_rect();
-    let mut format = TextFormat::simple(theme::mono(12.5), color);
-    let text = match cell {
-        Cell::Value(text) => preview(text).into_owned(),
-        Cell::Null => {
-            format.font_id = theme::mono(11.5);
-            format.italics = true;
-            "NULL".to_owned()
-        }
-        Cell::RowNumber(row) => {
-            format.font_id = theme::mono(11.0);
-            (row + 1).to_string()
-        }
-    };
-    let mut job = LayoutJob::single_section(text, format);
-    job.wrap = TextWrapping::truncate_at_width((rect.width() - 2.0 * CELL_PADDING).max(0.0));
-    let galley = ui.painter().layout_job(job);
-    let x = if right_aligned {
-        rect.right() - CELL_PADDING - galley.size().x
-    } else {
-        rect.left() + CELL_PADDING
-    };
-    let y = rect.center().y - galley.size().y / 2.0;
-    ui.painter().galley(Pos2::new(x, y), galley, color);
-}
 
 #[hotpath::measure]
 pub fn show(
@@ -73,6 +30,7 @@ pub fn show(
     tab: &mut QueryTab,
     editing: &Editing,
     links: &[bool],
+    reference: Option<&Reference>,
     actions: &mut Vec<Action>,
 ) {
     let palette = Palette::current(ui.ctx());
@@ -109,9 +67,9 @@ pub fn show(
 
     match &tab.outcome {
         None => {
-            let hint = ui
-                .ctx()
-                .format_shortcut(&crate::ui::shortcuts::RUN_STATEMENT);
+            let hint = ui.ctx().format_shortcut(&crate::ui::shortcuts::get(
+                crate::ui::shortcuts::Command::RunStatement,
+            ));
             widgets::empty_state(
                 ui,
                 Icon::Rows,
@@ -136,6 +94,21 @@ pub fn show(
             tab.active_set = tab.active_set.min(count - 1);
             let elapsed = output.elapsed;
             let set = &output.sets[tab.active_set];
+            let server_rows = set.rows.len();
+            let pending = Pending {
+                cells: tab
+                    .edits
+                    .keys()
+                    .filter(|(row, _)| *row < server_rows && !tab.deleted.contains(row))
+                    .count(),
+                added: tab.added,
+                deleted: tab.deleted.len(),
+                picked: tab
+                    .grid_selection
+                    .rows()
+                    .into_iter()
+                    .partition(|row| tab.deleted.contains(row)),
+            };
 
             // Header: result set chips, then stats and actions.
             egui::Frame::new()
@@ -164,7 +137,7 @@ pub fn show(
                             );
                         }
                         if set.has_rows() {
-                            edit_bar(ui, tab.id, tab.edits.len(), editing, actions);
+                            edit_bar(ui, tab.id, &pending, editing, actions);
                         }
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if set.has_rows() {
@@ -270,19 +243,27 @@ pub fn show(
                     TabKind::Script if tab.paging.is_some() => Sorting::On(tab.sort),
                     TabKind::Script => Sorting::Off,
                 };
-                let target = match editing {
-                    Editing::On(target) => Some(target),
-                    Editing::Off(_) | Editing::Loading => None,
+                let changes = GridChanges {
+                    target: match editing {
+                        Editing::On(target) => Some(target),
+                        Editing::Off(_) | Editing::Loading => None,
+                    },
+                    edits: &tab.edits,
+                    added: tab.added,
+                    deleted: &tab.deleted,
                 };
+                let reveal = tab.reveal_row.take();
                 grid(
                     ui,
                     tab.id,
                     set,
                     sort,
                     &mut tab.grid_selection,
-                    target,
-                    &tab.edits,
+                    &changes,
+                    &mut tab.inline,
+                    reveal,
                     links,
+                    reference,
                     actions,
                 );
             } else if let (Some(command), None) = (&set.command, set.affected) {
@@ -392,17 +373,35 @@ fn grid(
     set: &ResultSet,
     sort: Sorting,
     selected: &mut Selection,
-    target: Option<&EditTarget>,
-    edits: &BTreeMap<(usize, usize), Option<String>>,
+    changes: &GridChanges<'_>,
+    inline: &mut Option<InlineCell>,
+    reveal: Option<usize>,
     links: &[bool],
+    reference: Option<&Reference>,
     actions: &mut Vec<Action>,
 ) {
     let palette = Palette::current(ui.ctx());
-    let number_width = 14.0 + 7.5 * set.rows.len().max(1).to_string().len() as f32;
+    let (target, edits) = (changes.target, changes.edits);
+    // The result's rows, then the added ones.
+    let rows = set.rows.len() + changes.added;
+    // Added rows set the key too; rows to delete change no more.
+    let can_edit = |row: usize, column: usize| {
+        !changes.deleted.contains(&row)
+            && target.is_some_and(|t| {
+                let columns = if row >= set.rows.len() {
+                    &t.insertable
+                } else {
+                    &t.editable
+                };
+                columns.get(column).copied().unwrap_or(false)
+            })
+    };
+    let number_width = 14.0 + 7.5 * rows.max(1).to_string().len() as f32;
 
     // Clicks pick cells as DBeaver does: Ctrl (⌘) adds, Shift extends.
     let mode = Mode::from_modifiers(ui.input(|input| input.modifiers));
     let columns = set.columns.len();
+    let looks: Vec<Look> = set.columns.iter().map(Look::of).collect();
 
     // The platform shortcuts copy the picked cells and pick them all,
     // once the grid is in use and no text field takes the keys.
@@ -420,14 +419,42 @@ fn grid(
             actions.push(Action::Copy(copy_selection(set, edits, selected, false)));
         }
         if ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::A)) {
-            selected.select_all(set.rows.len(), columns);
+            selected.select_all(rows, columns);
+        }
+        if target.is_some_and(EditTarget::rows_change)
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
+        {
+            actions.push(Action::DeleteRows(tab, selected.rows()));
+        }
+        // Enter or F2 edits the cell clicked last, in place.
+        let edit_key = ui.input_mut(|input| {
+            input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                || input.consume_key(egui::Modifiers::NONE, egui::Key::F2)
+        });
+        if edit_key
+            && inline.is_none()
+            && let Some((row, column)) = selected.focus
+            && can_edit(row, column)
+        {
+            start_edit(tab, set, edits, row, column, inline, actions);
         }
     }
+
+    // The rows a followed foreign key points at open in an extra row under
+    // the one it was followed from: grid rows past it move down one.
+    let opened = reference.filter(|reference| reference.row < set.rows.len());
+    let shown = |index: usize| match opened {
+        Some(reference) if index > reference.row => index + 1,
+        _ => index,
+    };
+    let extra = opened.map(|reference| reference.row + 1);
 
     egui::ScrollArea::horizontal()
         .id_salt(("grid-h", tab))
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            // What the grid shows across: the extra row spans it.
+            let viewport = ui.clip_rect();
             let mut table = TableBuilder::new(ui)
                 .id_salt(("grid", tab))
                 .striped(true)
@@ -437,6 +464,9 @@ fn grid(
                 .min_scrolled_height(0.0)
                 .max_scroll_height(f32::INFINITY)
                 .column(Column::exact(number_width));
+            if let Some(row) = reveal {
+                table = table.scroll_to_row(shown(row), Some(Align::BOTTOM));
+            }
             for (index, column) in set.columns.iter().enumerate() {
                 table = table.column(
                     Column::initial(column_width(set, index, &column.name))
@@ -454,8 +484,8 @@ fn grid(
                         header.col(|ui| {
                             ui.painter().rect_filled(ui.max_rect(), 0.0, palette.panel);
                             ui.add_space(6.0);
-                            // A foreign key: picking a cell shows the row
-                            // it points at.
+                            // A foreign key: its values open the row they
+                            // point at.
                             if links.get(index).copied().unwrap_or(false) {
                                 let (rect, _) =
                                     ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
@@ -536,13 +566,58 @@ fn grid(
                     }
                 })
                 .body(|body| {
-                    body.rows(ROW_HEIGHT, set.rows.len(), |mut row| {
-                        let index = row.index();
+                    let heights =
+                        (0..rows + usize::from(extra.is_some())).map(|index| match opened {
+                            Some(reference) if Some(index) == extra => reference::height(reference),
+                            _ => ROW_HEIGHT,
+                        });
+                    body.heterogeneous_rows(heights, |mut row| {
+                        if let Some(reference) = opened
+                            && Some(row.index()) == extra
+                        {
+                            // Every column, the last one painting the row
+                            // across them all.
+                            for column in 0..=columns {
+                                row.col(|ui| {
+                                    if column < columns {
+                                        return;
+                                    }
+                                    let cell = ui.max_rect();
+                                    let clip = egui::Rect::from_x_y_ranges(
+                                        viewport.x_range(),
+                                        ui.clip_rect().y_range(),
+                                    );
+                                    let rect = egui::Rect::from_x_y_ranges(
+                                        viewport.x_range(),
+                                        cell.y_range(),
+                                    );
+                                    reference::show(ui, rect, clip, reference, actions);
+                                });
+                            }
+                            return;
+                        }
+                        let index = match extra {
+                            Some(extra) if row.index() > extra => row.index() - 1,
+                            _ => row.index(),
+                        };
+                        let added = index >= set.rows.len();
+                        let deleted = changes.deleted.contains(&index);
+                        // Added rows in green, rows to delete in red.
+                        let tint = if added {
+                            Some(palette.success.gamma_multiply(0.15))
+                        } else if deleted {
+                            Some(palette.danger.gamma_multiply(0.18))
+                        } else {
+                            None
+                        };
                         row.set_selected(selected.has_row(index));
                         // The row number picks the whole row.
                         let mut number = None;
                         row.col(|ui| {
-                            paint_cell(ui, Cell::RowNumber(index), true, palette.dim);
+                            if let Some(tint) = tint {
+                                ui.painter().rect_filled(ui.max_rect(), 0.0, tint);
+                            }
+                            cells::paint_text(ui, Cell::RowNumber(index), true, palette.dim);
                             number = Some(ui.interact(
                                 ui.max_rect(),
                                 ui.id().with("row-number"),
@@ -557,26 +632,58 @@ fn grid(
                                 selected.click_row(index, columns, Mode::Replace);
                             }
                             response.context_menu(|ui| {
+                                if target.is_some_and(EditTarget::rows_change) {
+                                    change_menu(ui, tab, changes.deleted, selected, actions);
+                                    ui.separator();
+                                }
                                 rows_menu(ui, set, edits, selected, actions);
                                 advanced_copy_item(ui, tab, actions);
                             });
                         }
-                        let Some(cells) = set.rows.row(index) else {
-                            return;
-                        };
-                        for (column, value) in cells.iter().enumerate() {
-                            let meta = &set.columns[column];
+                        for (column, meta) in set.columns.iter().enumerate() {
                             let edited = edits.get(&(index, column));
                             // A change not saved yet shows instead of the
                             // server's value.
                             let value = match edited {
                                 Some(change) => change.as_deref(),
-                                None => value,
+                                None => set.rows.get(index, column).flatten(),
                             };
-                            let editable = target
-                                .is_some_and(|t| t.editable.get(column).copied().unwrap_or(false));
+                            let editable = can_edit(index, column);
                             let mut cell = None;
+                            // A foreign key value's link.
+                            let mut chip = None;
+                            // Set when the field in the cell lets go of
+                            // the keyboard: whether by Escape, by Tab, and
+                            // with Shift.
+                            let mut finished = None;
                             row.col(|ui| {
+                                if let Some(tint) = tint {
+                                    ui.painter().rect_filled(ui.max_rect(), 0.0, tint);
+                                }
+                                if let Some(edit) = inline
+                                    .as_mut()
+                                    .filter(|edit| (edit.row, edit.column) == (index, column))
+                                {
+                                    let response = ui.add_sized(
+                                        ui.max_rect().size(),
+                                        egui::TextEdit::singleline(&mut edit.text)
+                                            .font(theme::mono(12.5))
+                                            .margin(egui::Margin::symmetric(5, 2)),
+                                    );
+                                    if std::mem::take(&mut edit.focus) {
+                                        response.request_focus();
+                                    }
+                                    if response.lost_focus() {
+                                        finished = Some(ui.input(|input| {
+                                            (
+                                                input.key_pressed(egui::Key::Escape),
+                                                input.key_pressed(egui::Key::Tab),
+                                                input.modifiers.shift,
+                                            )
+                                        }));
+                                    }
+                                    return;
+                                }
                                 if edited.is_some() {
                                     ui.painter().rect_filled(
                                         ui.max_rect(),
@@ -600,10 +707,26 @@ fn grid(
                                     );
                                 }
                                 let (cell_text, color) = match value {
+                                    None if added && edited.is_none() => {
+                                        (Cell::Default, palette.dim)
+                                    }
                                     None => (Cell::Null, palette.dim),
+                                    Some(text) if deleted => (Cell::Value(text), palette.dim),
                                     Some(text) => (Cell::Value(text), palette.text),
                                 };
-                                paint_cell(ui, cell_text, meta.numeric, color);
+                                // Rows not saved yet point at nothing.
+                                let link = links.get(column).copied().unwrap_or(false)
+                                    && !added
+                                    && !deleted;
+                                chip = cells::paint(
+                                    ui,
+                                    cell_text,
+                                    looks[column],
+                                    meta.numeric,
+                                    color,
+                                    link,
+                                )
+                                .link;
                                 // The cell is painted, not laid out, and the
                                 // table's own response for it has no area:
                                 // it takes clicks itself.
@@ -613,11 +736,49 @@ fn grid(
                                     Sense::click(),
                                 ));
                             });
+                            if let Some((escape, tab_key, back)) = finished
+                                && let Some(edit) = inline.take()
+                            {
+                                if !escape && edit.text != edit.initial {
+                                    actions.push(Action::SetCell(
+                                        tab,
+                                        edit.row,
+                                        edit.column,
+                                        Some(edit.text),
+                                    ));
+                                }
+                                // Tab goes on to the next cell of the row
+                                // that can change, Shift+Tab back.
+                                let next = if back {
+                                    (0..column).rev().find(|c| can_edit(index, *c))
+                                } else {
+                                    (column + 1..columns).find(|c| can_edit(index, *c))
+                                };
+                                if tab_key
+                                    && !escape
+                                    && let Some(next) = next
+                                {
+                                    selected.click((index, next), Mode::Replace);
+                                    start_edit(tab, set, edits, index, next, inline, actions);
+                                }
+                            }
                             let Some(response) = cell else {
                                 continue;
                             };
                             if response.clicked() {
                                 selected.click((index, column), mode);
+                                let on_link = response
+                                    .interact_pointer_pos()
+                                    .zip(chip)
+                                    .is_some_and(|(pointer, chip)| chip.contains(pointer));
+                                if on_link && mode == Mode::Replace {
+                                    actions.push(Action::FollowKey(tab, index, column));
+                                }
+                            }
+                            if chip.is_some_and(|chip| {
+                                response.hover_pos().is_some_and(|p| chip.contains(p))
+                            }) {
+                                response.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                             }
                             // Right-clicking outside the selection picks the
                             // cell; inside, the menu acts on all of it.
@@ -625,17 +786,22 @@ fn grid(
                                 selected.click((index, column), Mode::Replace);
                             }
                             if response.double_clicked() && editable {
-                                actions.push(Action::EditCell(tab, index, column));
+                                start_edit(tab, set, edits, index, column, inline, actions);
                             }
                             // Long values get a tooltip; only measured when hovered.
                             if response.hovered()
                                 && let Some(text) = value
-                                && (text.len() > 40 || text.contains('\n'))
                             {
-                                response.clone().on_hover_ui(|ui| {
-                                    ui.set_max_width(480.0);
-                                    ui.label(RichText::new(text).font(theme::mono(12.0)));
-                                });
+                                let text = match looks[column] {
+                                    Look::Geometry => cells::geometry_text(text),
+                                    Look::Text | Look::Boolean => Cow::Borrowed(text),
+                                };
+                                if text.len() > 40 || text.contains('\n') {
+                                    response.clone().on_hover_ui(|ui| {
+                                        ui.set_max_width(480.0);
+                                        ui.label(RichText::new(text).font(theme::mono(12.0)));
+                                    });
+                                }
                             }
                             response.context_menu(|ui| {
                                 if editable {
@@ -646,15 +812,20 @@ fn grid(
                                     if super::sidebar::menu_item(ui, Icon::Close, "Set to NULL") {
                                         actions.push(Action::SetCell(tab, index, column, None));
                                     }
+                                    let revert = if added {
+                                        "Use the default"
+                                    } else {
+                                        "Revert change"
+                                    };
                                     if edited.is_some()
-                                        && super::sidebar::menu_item(
-                                            ui,
-                                            Icon::Refresh,
-                                            "Revert change",
-                                        )
+                                        && super::sidebar::menu_item(ui, Icon::Refresh, revert)
                                     {
                                         actions.push(Action::RevertCell(tab, index, column));
                                     }
+                                    ui.separator();
+                                }
+                                if target.is_some_and(EditTarget::rows_change) {
+                                    change_menu(ui, tab, changes.deleted, selected, actions);
                                     ui.separator();
                                 }
                                 let label = match selected.len() {
@@ -675,6 +846,22 @@ fn grid(
                                         set, edits, selected, true,
                                     )));
                                 }
+                                if looks[column] == Look::Geometry
+                                    && let Some(text) = value
+                                    && let Some(wkt) = crate::geometry::wkt(text)
+                                    && super::sidebar::menu_item(ui, Icon::Copy, "Copy as WKT")
+                                {
+                                    actions.push(Action::Copy(wkt));
+                                }
+                                if chip.is_some()
+                                    && super::sidebar::menu_item(
+                                        ui,
+                                        Icon::ArrowUpRight,
+                                        "Open referenced row",
+                                    )
+                                {
+                                    actions.push(Action::FollowKey(tab, index, column));
+                                }
                                 advanced_copy_item(ui, tab, actions);
                                 ui.separator();
                                 rows_menu(ui, set, edits, selected, actions);
@@ -688,6 +875,70 @@ fn grid(
                     });
                 });
         });
+}
+
+/// Edits a cell in place, or in the dialog when its value has several
+/// lines. A NULL or default cell starts empty.
+fn start_edit(
+    tab: u64,
+    set: &ResultSet,
+    edits: &BTreeMap<(usize, usize), Option<String>>,
+    row: usize,
+    column: usize,
+    inline: &mut Option<InlineCell>,
+    actions: &mut Vec<Action>,
+) {
+    let text = shown(set, edits, row, column).unwrap_or_default();
+    if text.contains('\n') {
+        actions.push(Action::EditCell(tab, row, column));
+    } else {
+        *inline = Some(InlineCell::new(row, column, text));
+    }
+}
+
+/// What the grid shows of its changes not saved yet, and whether its rows
+/// can change at all.
+struct GridChanges<'a> {
+    target: Option<&'a EditTarget>,
+    edits: &'a BTreeMap<(usize, usize), Option<String>>,
+    added: usize,
+    deleted: &'a BTreeSet<usize>,
+}
+
+/// Adding a row, and deleting the picked rows or keeping them after all.
+fn change_menu(
+    ui: &mut Ui,
+    tab: u64,
+    deleted: &BTreeSet<usize>,
+    selected: &Selection,
+    actions: &mut Vec<Action>,
+) {
+    if super::sidebar::menu_item(ui, Icon::Plus, "Add row") {
+        actions.push(Action::AddRow(tab));
+    }
+    let (restore, delete): (Vec<usize>, Vec<usize>) = selected
+        .rows()
+        .into_iter()
+        .partition(|row| deleted.contains(row));
+    let label = |verb: &str, count: usize| match count {
+        1 => format!("{verb} row"),
+        count => format!("{verb} {} rows", thousands(count)),
+    };
+    if !delete.is_empty() {
+        let shortcut = ui.ctx().format_shortcut(&egui::KeyboardShortcut::new(
+            egui::Modifiers::NONE,
+            egui::Key::Delete,
+        ));
+        let label = format!("{}   {shortcut}", label("Delete", delete.len()));
+        if super::sidebar::menu_item(ui, Icon::Trash, &label) {
+            actions.push(Action::DeleteRows(tab, delete));
+        }
+    }
+    if !restore.is_empty()
+        && super::sidebar::menu_item(ui, Icon::Refresh, &label("Keep", restore.len()))
+    {
+        actions.push(Action::RestoreRows(tab, restore));
+    }
 }
 
 /// Opens advanced copy, with its shortcut shown.
@@ -833,17 +1084,76 @@ enum Sorting {
     On(Option<(usize, bool)>),
 }
 
+/// A grid's changes not saved yet.
+struct Pending {
+    /// Cells changed in rows of the result that are kept.
+    cells: usize,
+    added: usize,
+    deleted: usize,
+    /// The picked rows: those marked to delete, and the others.
+    picked: (Vec<usize>, Vec<usize>),
+}
+
 /// Changes waiting to be saved, or why the rows cannot change.
-fn edit_bar(ui: &mut Ui, tab: u64, changes: usize, editing: &Editing, actions: &mut Vec<Action>) {
+fn edit_bar(
+    ui: &mut Ui,
+    tab: u64,
+    pending: &Pending,
+    editing: &Editing,
+    actions: &mut Vec<Action>,
+) {
     let palette = Palette::current(ui.ctx());
     ui.add_space(8.0);
-    if changes > 0 {
+    let rows_change = matches!(editing, Editing::On(target) if target.rows_change());
+    if rows_change
+        && widgets::button(ui, Tone::Ghost, Some(Icon::Plus), "Add row")
+            .on_hover_text("Add a row, inserted when you save the changes")
+            .clicked()
+    {
+        actions.push(Action::AddRow(tab));
+    }
+    // Deletes the picked rows; picked rows all marked keeps them instead.
+    if rows_change {
+        let (marked, kept) = &pending.picked;
+        let count = |verb: &str, rows: &[usize]| match rows.len() {
+            0 | 1 => format!("{verb} row"),
+            count => format!("{verb} {} rows", thousands(count)),
+        };
+        if kept.is_empty() && !marked.is_empty() {
+            if widgets::button(ui, Tone::Ghost, Some(Icon::Refresh), &count("Keep", marked))
+                .on_hover_text("Keep the picked rows, not deleting them")
+                .clicked()
+            {
+                actions.push(Action::RestoreRows(tab, marked.clone()));
+            }
+        } else {
+            let response = ui
+                .add_enabled_ui(!kept.is_empty(), |ui| {
+                    widgets::button(ui, Tone::Ghost, Some(Icon::Trash), &count("Delete", kept))
+                })
+                .inner
+                .on_hover_text("Delete the picked rows when you save the changes (Delete)")
+                .on_disabled_hover_text("Pick the rows to delete");
+            if response.clicked() {
+                actions.push(Action::DeleteRows(tab, kept.clone()));
+            }
+        }
+    }
+    let mut parts = Vec::new();
+    if pending.cells > 0 {
+        let noun = if pending.cells == 1 { "cell" } else { "cells" };
+        parts.push(format!("{} {noun} changed", pending.cells));
+    }
+    if pending.added > 0 {
+        parts.push(format!("{} added", pending.added));
+    }
+    if pending.deleted > 0 {
+        parts.push(format!("{} to delete", pending.deleted));
+    }
+    if !parts.is_empty() {
         widgets::pill(
             ui,
-            &format!(
-                "{changes} {} changed",
-                if changes == 1 { "cell" } else { "cells" }
-            ),
+            &parts.join(" · "),
             palette.warning,
             palette.warning.gamma_multiply(0.15),
         );
@@ -871,23 +1181,8 @@ fn edit_bar(ui: &mut Ui, tab: u64, changes: usize, editing: &Editing, actions: &
     }
 }
 
-/// The first line, at most [`CELL_PREVIEW`] characters. Borrowed in the
-/// common case, so drawing a cell allocates nothing.
-fn preview(text: &str) -> Cow<'_, str> {
-    let line = text.lines().next().unwrap_or_default();
-    let end = line
-        .char_indices()
-        .nth(CELL_PREVIEW)
-        .map_or(line.len(), |(at, _)| at);
-    if end == text.len() {
-        Cow::Borrowed(text)
-    } else {
-        Cow::Owned(format!("{}…", &line[..end]))
-    }
-}
-
 /// A starting width from the header and the first rows' lengths.
-fn column_width(set: &ResultSet, index: usize, name: &str) -> f32 {
+pub(super) fn column_width(set: &ResultSet, index: usize, name: &str) -> f32 {
     let longest = set
         .rows
         .iter()
@@ -1022,14 +1317,5 @@ mod tests {
             "a0\tb0\tc0\na2\tb2\tc2"
         );
         assert_eq!(copy_rows(&set, &edits, &[1], true), "a\tb\tc\na1\t\tc1");
-    }
-
-    #[test]
-    fn previews_show_the_first_line() {
-        assert_eq!(preview("one\ntwo"), "one…");
-        assert_eq!(preview("short"), "short");
-        assert!(matches!(preview("short"), Cow::Borrowed(_)));
-        let long = "x".repeat(CELL_PREVIEW + 5);
-        assert_eq!(preview(&long).chars().count(), CELL_PREVIEW + 1);
     }
 }
