@@ -37,11 +37,26 @@ use wasmtime::{Config, Engine};
 pub use convert::valid_id;
 pub use driver::{Loader, WasmDriver};
 
-use crate::bindings::exports::violet::provider::{provider as provider_api, tools as tools_api};
+use crate::bindings::exports::violet::provider::{
+    data as data_api, provider as provider_api, tools as tools_api,
+};
 use crate::host::HostState;
 
 /// The provider contract version this host speaks; see `violet-sdk`.
-pub const API_VERSION: &str = "0.1.0";
+/// Providers for 0.1 (SQL only) still run: 0.2 added the optional `data`
+/// interface for other languages, under the same WIT package.
+pub const API_VERSION: &str = "0.2.0";
+
+/// The contract level an index entry records for a provider: 0.1 for SQL
+/// ones, which older Violets run as well, 0.2 for the rest.
+#[must_use]
+pub fn api_level(info: &DriverInfo) -> &'static str {
+    if info.language == violet_core::Language::Sql {
+        "0.1.0"
+    } else {
+        API_VERSION
+    }
+}
 
 /// How often running guest code yields to the async runtime.
 const TICK: Duration = Duration::from_millis(10);
@@ -130,11 +145,14 @@ impl Runtime {
         })?;
         // Backup and restore came later: providers without them still run.
         let tools = tools_api::GuestIndices::new(&pre).ok();
+        // As did languages other than SQL.
+        let data = data_api::GuestIndices::new(&pre).ok();
         Ok(Provider {
             engine: self.engine.clone(),
             pre,
             api,
             tools,
+            data,
         })
     }
 
@@ -156,6 +174,8 @@ pub struct Provider {
     api: provider_api::GuestIndices,
     /// `None` for a provider without backup and restore.
     tools: Option<tools_api::GuestIndices>,
+    /// `None` for a provider from before languages other than SQL.
+    data: Option<data_api::GuestIndices>,
 }
 
 impl Provider {
@@ -164,7 +184,8 @@ impl Provider {
     pub async fn describe(&self) -> Result<Description> {
         let mut instance = session::Instance::start(self, None).await?;
         let info = instance.info().await?;
-        convert::description(info)
+        let extras = instance.extras().await?;
+        convert::description(info, extras)
     }
 }
 

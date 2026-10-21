@@ -16,9 +16,9 @@ pub mod query;
 pub mod secret;
 pub mod tools;
 
-pub use catalog::{ColumnInfo, DbObject, ForeignKey, ObjectKind, ServerInfo};
+pub use catalog::{ColumnInfo, DbObject, EntryPage, ForeignKey, ObjectKind, ServerInfo};
 pub use driver::{
-    Canceller, Capabilities, Dialect, Driver, DriverInfo, OrderBy, PagedSql, Paging, Session,
+    Canceller, Capabilities, Dialect, Driver, DriverInfo, Language, Login, OrderBy, PagedSql, Paging, Session,
     SqlDialect, string_literal,
 };
 pub use error::{DbError, ErrorKind, Result};

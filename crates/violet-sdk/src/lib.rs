@@ -40,6 +40,7 @@
 //! Violet installs it from. The contract itself is `wit/provider.wit`, for
 //! providers written in other languages.
 
+pub mod data;
 mod error;
 pub mod files;
 pub mod net;
@@ -119,6 +120,12 @@ pub trait Provider: 'static {
         let _ = (params, ticket);
         Err(DbError::unsupported("Cancelling is not supported"))
     }
+
+    /// The language its statements are in, and what the connection form
+    /// asks for (see [`data`]). SQL with a required user by default.
+    fn extras() -> data::ProviderExtras {
+        data::ProviderExtras::default()
+    }
 }
 
 /// An open connection.
@@ -158,6 +165,33 @@ pub trait Session: 'static {
     /// connecting.
     fn cancel_ticket(&self) -> Option<Vec<u8>> {
         None
+    }
+
+    /// Objects in `schema` matching the glob `pattern`, a page at a time,
+    /// for providers that are not SQL (see [`data`]).
+    fn entries(
+        &self,
+        schema: &str,
+        pattern: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<data::EntryPage> {
+        let _ = (schema, pattern, cursor, limit);
+        Err(DbError::unsupported("Listing entries is not supported"))
+    }
+
+    /// Rows `offset .. offset + limit` of a statement's first result, run in
+    /// `schema`. Violet pages SQL itself.
+    fn page(&self, schema: &str, statement: &str, offset: u64, limit: usize) -> Result<Vec<ResultSet>> {
+        let _ = (schema, statement, offset, limit);
+        Err(DbError::unsupported("Paging is not supported"))
+    }
+
+    /// The rows a statement returns, `None` when it cannot tell. Violet
+    /// counts SQL itself.
+    fn count(&self, schema: &str, statement: &str) -> Result<Option<u64>> {
+        let _ = (schema, statement);
+        Err(DbError::unsupported("Counting is not supported"))
     }
 }
 
@@ -293,6 +327,8 @@ pub mod __private {
         Guest, GuestSession, Session as SessionHandle,
     };
     pub use crate::bindings::exports::violet::provider::tools::Guest as ToolsGuest;
+    pub use crate::bindings::exports::violet::provider::data::Guest as DataGuest;
+    pub use crate::bindings::exports::violet::provider::provider::SessionBorrow;
 
     use crate::{
         ColumnInfo, ConnectParams, DbError, DbObject, Provider, ProviderInfo, ResultSet,
@@ -350,6 +386,10 @@ pub mod __private {
         P::connect(params).map(|session| SessionHandle::new(SessionAdapter(session)))
     }
 
+    pub fn adapter<'a, S: Session>(session: &'a SessionBorrow<'a>) -> &'a S {
+        &session.get::<SessionAdapter<S>>().0
+    }
+
     pub fn cancel<P: Provider>(params: ConnectParams, ticket: Vec<u8>) -> Result<(), DbError> {
         crate::logging::install();
         P::cancel(params, ticket)
@@ -404,6 +444,57 @@ macro_rules! export_provider {
             ) -> ::std::vec::Vec<(::std::string::String, ::std::string::String)> {
                 $crate::logging::install();
                 <$provider as $crate::Provider>::inspect(&head, &entries, directory)
+            }
+        }
+
+        impl $crate::__private::DataGuest for __VioletProvider {
+            fn extras() -> $crate::data::ProviderExtras {
+                $crate::logging::install();
+                <$provider as $crate::Provider>::extras()
+            }
+
+            fn entries(
+                s: $crate::__private::SessionBorrow<'_>,
+                schema: ::std::string::String,
+                pattern: ::std::option::Option<::std::string::String>,
+                cursor: ::std::option::Option<::std::string::String>,
+                limit: u32,
+            ) -> ::std::result::Result<$crate::data::EntryPage, $crate::DbError> {
+                $crate::Session::entries(
+                    $crate::__private::adapter::<<$provider as $crate::Provider>::Session>(&s),
+                    &schema,
+                    pattern.as_deref(),
+                    cursor.as_deref(),
+                    limit as usize,
+                )
+            }
+
+            fn page(
+                s: $crate::__private::SessionBorrow<'_>,
+                schema: ::std::string::String,
+                statement: ::std::string::String,
+                offset: u64,
+                limit: u32,
+            ) -> ::std::result::Result<::std::vec::Vec<$crate::ResultSet>, $crate::DbError> {
+                $crate::Session::page(
+                    $crate::__private::adapter::<<$provider as $crate::Provider>::Session>(&s),
+                    &schema,
+                    &statement,
+                    offset,
+                    limit as usize,
+                )
+            }
+
+            fn count(
+                s: $crate::__private::SessionBorrow<'_>,
+                schema: ::std::string::String,
+                statement: ::std::string::String,
+            ) -> ::std::result::Result<::std::option::Option<u64>, $crate::DbError> {
+                $crate::Session::count(
+                    $crate::__private::adapter::<<$provider as $crate::Provider>::Session>(&s),
+                    &schema,
+                    &statement,
+                )
             }
         }
 

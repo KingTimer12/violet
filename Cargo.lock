@@ -5365,6 +5365,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "violet-lang"
+version = "0.1.8"
+
+[[package]]
 name = "violet-provider-cli"
 version = "0.1.8"
 dependencies = [

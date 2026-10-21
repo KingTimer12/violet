@@ -546,10 +546,73 @@ interface tools {
     inspect: func(head: list<u8>, entries: list<string>, directory: bool) -> list<tuple<string, string>>;
 }
 
+/// Optional. Providers whose statements are not SQL: they describe their
+/// language and list, page and count objects themselves. Violet runs
+/// providers without it as SQL ones.
+interface data {
+    use types.{db-error, result-set};
+    use provider.{session};
+
+    /// What the editor speaks, and so what Violet generates.
+    enum language {
+        sql,
+        redis,
+        mongodb,
+    }
+
+    /// Whether the connection form asks for, and demands, a value.
+    enum login {
+        required,
+        optional,
+        none,
+    }
+
+    record provider-extras {
+        language: language,
+        user: login,
+        password: login,
+        /// What the tree calls schemas, such as `Databases`; empty for the
+        /// default.
+        schema-label: string,
+    }
+
+    /// An object of a schema, such as a Redis key.
+    record entry {
+        name: string,
+        /// `string`, `hash`, `list`, `set`, `zset`, `stream`, `json`...:
+        /// the icon, and how a data view reads it.
+        subtype: option<string>,
+        /// Shown on hover, such as `hash · 120 fields · TTL 3600 s`.
+        detail: option<string>,
+        /// Elements, when cheap to know.
+        size: option<s64>,
+    }
+
+    record entry-page {
+        entries: list<entry>,
+        /// Passed back to read on; `none` at the end.
+        next: option<string>,
+    }
+
+    /// Called without a connection, like `info`.
+    extras: func() -> provider-extras;
+
+    /// Objects in `schema` matching the glob `pattern`, a page at a time.
+    entries: func(s: borrow<session>, schema: string, pattern: option<string>, cursor: option<string>, limit: u32) -> result<entry-page, db-error>;
+
+    /// Rows `offset` .. `offset + limit` of a statement's first result, run
+    /// in `schema`.
+    page: func(s: borrow<session>, schema: string, statement: string, offset: u64, limit: u32) -> result<list<result-set>, db-error>;
+
+    /// The rows a statement returns; `none` when it cannot tell.
+    count: func(s: borrow<session>, schema: string, statement: string) -> result<option<u64>, db-error>;
+}
+
 world provider-world {
     import network;
     import files;
     import logging;
     export provider;
     export tools;
+    export data;
 }

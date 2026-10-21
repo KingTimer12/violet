@@ -90,6 +90,7 @@ impl Driver for WasmDriver {
             target,
             params,
             self.info.dialect,
+            self.info.language,
             self.info.capabilities.cancel,
         )
         .await?;

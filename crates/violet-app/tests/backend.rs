@@ -78,6 +78,10 @@ impl Driver for FakeDriver {
                 tls: false,
             },
             dialect: SqlDialect::ANSI,
+            language: violet_core::Language::Sql,
+            user: violet_core::Login::Required,
+            password: violet_core::Login::Optional,
+            schema_label: String::new(),
         }
     }
 

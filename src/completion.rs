@@ -1743,7 +1743,7 @@ fn relation_kind(kind: ObjectKind) -> Option<Kind> {
     match kind {
         ObjectKind::Table | ObjectKind::ForeignTable => Some(Kind::Table),
         ObjectKind::View | ObjectKind::MaterializedView => Some(Kind::View),
-        ObjectKind::Function | ObjectKind::Sequence => None,
+        ObjectKind::Function | ObjectKind::Sequence | ObjectKind::Key => None,
     }
 }
 
@@ -1755,6 +1755,7 @@ fn object_label(kind: ObjectKind) -> String {
         ObjectKind::ForeignTable => "foreign table",
         ObjectKind::Function => "function",
         ObjectKind::Sequence => "sequence",
+        ObjectKind::Key => "key",
     }
     .to_owned()
 }
@@ -1871,6 +1872,8 @@ mod tests {
             kind,
             comment: None,
             estimated_rows: None,
+            subtype: None,
+            detail: None,
         }
     }
 

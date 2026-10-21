@@ -6,14 +6,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 use violet_core::{
-    Canceller, ColumnInfo, DbError, DbObject, Dialect, ErrorKind, ExecLimits, Result, ResultSet,
+    Canceller, ColumnInfo, DbError, DbObject, Dialect, EntryPage, ErrorKind, ExecLimits, Language,
+    Result, ResultSet,
     ServerInfo, Session, SqlDialect,
 };
 use wasmtime::component::ResourceAny;
 use wasmtime::{Store, UpdateDeadline};
 
 use crate::Provider;
-use crate::bindings::exports::violet::provider::{provider as provider_api, tools as tools_api};
+use crate::bindings::exports::violet::provider::{
+    data as data_api, provider as provider_api, tools as tools_api,
+};
 use crate::bindings::types as wit;
 use crate::convert;
 use crate::host::HostState;
@@ -35,9 +38,14 @@ pub(crate) struct Instance {
 pub(crate) struct Exports {
     provider: provider_api::Guest,
     tools: Option<tools_api::Guest>,
+    data: Option<data_api::Guest>,
 }
 
 impl Exports {
+    fn data(&self) -> Option<&data_api::Guest> {
+        self.data.as_ref()
+    }
+
     fn violet_provider_provider(&self) -> &provider_api::Guest {
         &self.provider
     }
@@ -82,6 +90,13 @@ impl Instance {
                 ),
                 None => None,
             },
+            data: match &provider.data {
+                Some(data) => Some(
+                    data.load(&mut store, &instance)
+                        .map_err(|error| crashed(&error))?,
+                ),
+                None => None,
+            },
         };
         Ok(Self { store, world, kill })
     }
@@ -99,6 +114,18 @@ impl Instance {
 }
 
 impl Instance {
+    /// The provider's language and login, when it says.
+    pub(crate) async fn extras(&mut self) -> Result<Option<data_api::ProviderExtras>> {
+        let Some(data) = self.world.data() else {
+            return Ok(None);
+        };
+        refuel(&mut self.store);
+        data.call_extras(&mut self.store)
+            .await
+            .map(Some)
+            .map_err(|error| crashed(&error))
+    }
+
     pub(crate) fn exports(&self) -> &Exports {
         &self.world
     }
@@ -137,6 +164,7 @@ pub(crate) struct WasmSession {
     /// Set after a trap: the instance is gone, the session with it.
     broken: AtomicBool,
     dialect: SqlDialect,
+    language: Language,
     cancel: Option<Arc<CancelPlan>>,
 }
 
@@ -156,6 +184,7 @@ impl WasmSession {
         target: Target,
         params: wit::ConnectParams,
         dialect: SqlDialect,
+        language: Language,
         cancellable: bool,
     ) -> Result<Self> {
         let mut instance = Instance::start(&provider, Some(target.clone())).await?;
@@ -193,6 +222,7 @@ impl WasmSession {
             kill,
             broken: AtomicBool::new(false),
             dialect,
+            language,
             cancel,
         })
     }
@@ -233,6 +263,17 @@ impl WasmSession {
                 }
             }
         }
+    }
+}
+
+fn unsupported() -> wit::DbError {
+    wit::DbError {
+        kind: wit::ErrorKind::Unsupported,
+        message: "The provider does not support this".into(),
+        code: None,
+        detail: None,
+        hint: None,
+        position: None,
     }
 }
 
@@ -354,6 +395,65 @@ impl Session for WasmSession {
 
     fn dialect(&self) -> &dyn Dialect {
         &self.dialect
+    }
+
+    fn language(&self) -> Language {
+        self.language
+    }
+
+    async fn entries(
+        &self,
+        schema: &str,
+        pattern: Option<&str>,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<EntryPage> {
+        let page = self
+            .with("WasmSession::entries", async |store, world, session| {
+                let Some(data) = world.data() else {
+                    return Ok(Err(unsupported()));
+                };
+                data.call_entries(store, session, schema, pattern, cursor, limit)
+                    .await
+            })
+            .await?;
+        Ok(convert::entry_page(schema, page, limit))
+    }
+
+    async fn page(
+        &self,
+        schema: &str,
+        statement: &str,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<ResultSet>> {
+        let sets = self
+            .with("WasmSession::page", async |store, world, session| {
+                let Some(data) = world.data() else {
+                    return Ok(Err(unsupported()));
+                };
+                data.call_page(store, session, schema, statement, offset, limit)
+                    .await
+            })
+            .await?;
+        let mut converted = Vec::with_capacity(sets.len());
+        for set in sets {
+            let mut set = convert::result_set(set)?;
+            // One row past the page tells another follows; no more.
+            set.rows.truncate(limit as usize + 1);
+            converted.push(set);
+        }
+        Ok(converted)
+    }
+
+    async fn count(&self, schema: &str, statement: &str) -> Result<Option<u64>> {
+        self.with("WasmSession::count", async |store, world, session| {
+            let Some(data) = world.data() else {
+                return Ok(Err(unsupported()));
+            };
+            data.call_count(store, session, schema, statement).await
+        })
+        .await
     }
 
     async fn close(&self) {

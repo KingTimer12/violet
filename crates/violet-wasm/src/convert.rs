@@ -3,10 +3,11 @@
 
 use violet_core::{
     Capabilities, ColumnInfo, ColumnMeta, ConnectionProfile, Credentials, DbError, DbObject,
-    DriverId, DriverInfo, ErrorKind, ObjectKind, Paging, ResultSet, Rows, ServerInfo, SqlDialect,
+    DriverId, DriverInfo, EntryPage, ErrorKind, Language, Login, ObjectKind, Paging, ResultSet, Rows, ServerInfo, SqlDialect,
     SslMode,
 };
 
+use crate::bindings::exports::violet::provider::data as data_api;
 use crate::bindings::types as wit;
 
 /// Longest id a provider may claim.
@@ -54,7 +55,10 @@ pub fn valid_id(id: &str) -> bool {
         && !id.starts_with('-')
 }
 
-pub(crate) fn description(info: wit::ProviderInfo) -> Result<crate::Description, DbError> {
+pub(crate) fn description(
+    info: wit::ProviderInfo,
+    extras: Option<data_api::ProviderExtras>,
+) -> Result<crate::Description, DbError> {
     if !valid_id(&info.id) {
         return Err(DbError::new(
             ErrorKind::Provider,
@@ -94,12 +98,68 @@ pub(crate) fn description(info: wit::ProviderInfo) -> Result<crate::Description,
                 wit::Paging::OffsetFetch => Paging::OffsetFetch,
             },
         },
+        language: Language::Sql,
+        user: Login::Required,
+        password: Login::Optional,
+        schema_label: String::new(),
     };
+    let mut info = info;
+    if let Some(extras) = extras {
+        info.language = match extras.language {
+            data_api::Language::Sql => Language::Sql,
+            data_api::Language::Redis => Language::Redis,
+            data_api::Language::Mongodb => Language::Mongodb,
+        };
+        info.user = login(extras.user);
+        info.password = login(extras.password);
+        info.schema_label = short(extras.schema_label);
+    }
     Ok(crate::Description {
         info,
         version: info_version,
         description,
     })
+}
+
+fn login(login: data_api::Login) -> Login {
+    match login {
+        data_api::Login::Required => Login::Required,
+        data_api::Login::Optional => Login::Optional,
+        data_api::Login::None => Login::None,
+    }
+}
+
+/// Longest key type a provider may name, and hover text it may show.
+const MAX_SUBTYPE: usize = 32;
+const MAX_DETAIL: usize = 200;
+
+/// A page of entries, checked: at most `limit` of them, short labels.
+pub(crate) fn entry_page(schema: &str, page: data_api::EntryPage, limit: u32) -> EntryPage {
+    let objects = page
+        .entries
+        .into_iter()
+        .take(limit as usize)
+        .map(|entry| DbObject {
+            schema: schema.to_owned(),
+            name: entry.name,
+            kind: ObjectKind::Key,
+            comment: None,
+            estimated_rows: entry.size,
+            subtype: entry.subtype.filter(|subtype| {
+                subtype.len() <= MAX_SUBTYPE
+                    && subtype
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            }),
+            detail: entry
+                .detail
+                .map(|detail| detail.chars().take(MAX_DETAIL).collect()),
+        })
+        .collect();
+    EntryPage {
+        objects,
+        next: page.next.filter(|next| next.len() <= 1024),
+    }
 }
 
 pub(crate) fn error(error: wit::DbError) -> DbError {
@@ -143,6 +203,8 @@ pub(crate) fn object(schema: &str, object: wit::DbObject) -> DbObject {
         },
         comment: object.comment,
         estimated_rows: object.estimated_rows,
+        subtype: None,
+        detail: None,
     }
 }
 
