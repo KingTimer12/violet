@@ -201,7 +201,6 @@ fn task_from(task: api::Task) -> Task {
                     .collect(),
                 stdout_to_path: command.stdout_to_path,
                 stdin_from_path: command.stdin_from_path,
-                stdin_lines: command.stdin_lines,
             })
             .collect(),
     }

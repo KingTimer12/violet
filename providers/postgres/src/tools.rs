@@ -406,9 +406,8 @@ fn backup_command() -> Command {
     tls(tail(command))
 }
 
-/// Plain SQL runs in psql, without ~/.psqlrc. pg_dump 17 and later write
-/// `SET transaction_timeout`, which servers before 17 reject, so Violet
-/// swaps it for a call that only sets it where the server knows it.
+/// Plain SQL runs in psql, without ~/.psqlrc. Through standard input, so
+/// Violet can swap lines older servers reject.
 fn psql_command() -> Command {
     let command = Command::new("psql")
         .when(is("format", &["plain"]))
@@ -420,14 +419,7 @@ fn psql_command() -> Command {
         // --single-transaction needs --file, so standard input goes as `-`.
         .arg([text("--file=-")])
         .extra("extra")
-        .stdin_from_path()
-        .replace_line(
-            "SET transaction_timeout = 0;",
-            "SELECT pg_catalog.set_config('transaction_timeout', '0', false) \
-             WHERE current_setting('server_version_num')::int >= 170000;",
-        )
-        // Dumps that pick schemas create public, which every database has.
-        .replace_line("CREATE SCHEMA public;", "CREATE SCHEMA IF NOT EXISTS public;");
+        .stdin_from_path();
     tls(command)
 }
 

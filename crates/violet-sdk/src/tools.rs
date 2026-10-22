@@ -199,7 +199,6 @@ impl Command {
             variables: Vec::new(),
             stdout_to_path: false,
             stdin_from_path: false,
-            stdin_lines: Vec::new(),
         }
     }
 
@@ -308,13 +307,6 @@ impl Command {
     #[must_use]
     pub fn stdin_from_path(mut self) -> Self {
         self.stdin_from_path = true;
-        self
-    }
-
-    /// While feeding the path, Violet swaps each line reading `from` for `to`.
-    #[must_use]
-    pub fn replace_line(mut self, from: &str, to: &str) -> Self {
-        self.stdin_lines.push((from.to_owned(), to.to_owned()));
         self
     }
 }

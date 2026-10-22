@@ -172,6 +172,21 @@ const MAX_ARGS: usize = 512;
 const MAX_ARG: usize = 32 << 10;
 const MAX_ENV: usize = 32;
 
+/// Lines of pg_dump 17 and later that older servers reject, swapped while
+/// psql reads a dump: `transaction_timeout` set only where the server knows
+/// it, and `public`, which dumps that pick schemas create, kept if it exists.
+const PSQL_SWAPS: &[(&str, &str)] = &[
+    (
+        "SET transaction_timeout = 0;",
+        "SELECT pg_catalog.set_config('transaction_timeout', '0', false) \
+         WHERE current_setting('server_version_num')::int >= 170000;",
+    ),
+    (
+        "CREATE SCHEMA public;",
+        "CREATE SCHEMA IF NOT EXISTS public;",
+    ),
+];
+
 /// What a task does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -410,7 +425,6 @@ pub struct CommandTemplate {
     pub variables: Vec<Variable>,
     pub stdout_to_path: bool,
     pub stdin_from_path: bool,
-    pub stdin_lines: Vec<(String, String)>,
 }
 
 /// A backup or restore a driver offers.
@@ -701,16 +715,6 @@ impl Task {
             if command.stdout_to_path && command.stdin_from_path {
                 return bad("a command both reads and writes the path".into());
             }
-            if !command.stdin_lines.is_empty() && !command.stdin_from_path {
-                return bad("a command replaces lines it does not read".into());
-            }
-            if command.stdin_lines.len() > MAX_ENV
-                || command.stdin_lines.iter().any(|(from, to)| {
-                    from.len() + to.len() > MAX_ARG || from.contains('\n') || to.contains('\n')
-                })
-            {
-                return bad("a command replaces too many lines".into());
-            }
             if command.parts.len() > MAX_PARTS || command.variables.len() > MAX_ENV {
                 return bad("a command is too long".into());
             }
@@ -922,7 +926,14 @@ impl Task {
             password_env: self.connection.password_env.clone(),
             stdout_to_path: template.stdout_to_path,
             stdin_from_path: template.stdin_from_path,
-            stdin_lines: template.stdin_lines.clone(),
+            stdin_lines: if template.program == "psql" && template.stdin_from_path {
+                PSQL_SWAPS
+                    .iter()
+                    .map(|&(from, to)| (from.to_owned(), to.to_owned()))
+                    .collect()
+            } else {
+                Vec::new()
+            },
         })
     }
 
@@ -1419,7 +1430,6 @@ mod tests {
                 ],
                 stdout_to_path: false,
                 stdin_from_path: false,
-                stdin_lines: Vec::new(),
             }],
         }
     }
