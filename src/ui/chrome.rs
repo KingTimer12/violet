@@ -21,6 +21,7 @@ pub const TITLE_BAR_HEIGHT: f32 = 44.0;
 pub fn title_bar(
     ui: &mut Ui,
     title: &str,
+    settings: &crate::settings::Settings,
     theme_preference: egui::ThemePreference,
     update: &crate::update::Status,
     actions: &mut Vec<Action>,
@@ -63,6 +64,8 @@ pub fn title_bar(
                 .font(theme::bold(14.5))
                 .color(palette.text),
         );
+        ui.label(RichText::new("/").color(palette.dim));
+        project_switcher(ui, settings, actions);
         if !title.is_empty() {
             ui.label(RichText::new("/").color(palette.dim));
             ui.label(
@@ -106,6 +109,63 @@ pub fn title_bar(
             update_badge(ui, update, actions);
         });
     });
+}
+
+/// The open workspace, and a menu to open, add, rename or delete one.
+fn project_switcher(ui: &mut Ui, settings: &crate::settings::Settings, actions: &mut Vec<Action>) {
+    let palette = Palette::current(ui.ctx());
+    let active = settings.project();
+    let label = RichText::new(settings.project_name())
+        .font(theme::medium(13.0))
+        .color(palette.text);
+    ui.menu_button(label, |ui| {
+        let all = std::iter::once((None, "Default")).chain(
+            settings
+                .projects
+                .iter()
+                .map(|project| (Some(project.id.as_str()), project.name.as_str())),
+        );
+        for (id, name) in all {
+            let icon = if id == active {
+                Icon::Check
+            } else {
+                Icon::Folder
+            };
+            if menu_item(ui, icon, name) {
+                actions.push(Action::SwitchProject(id.map(str::to_owned)));
+            }
+        }
+        ui.separator();
+        if menu_item(ui, Icon::Plus, "New workspace…") {
+            actions.push(Action::AskRename(
+                super::rename_flow::RenameTarget::NewProject,
+            ));
+        }
+        if let Some(id) = active
+            && menu_item(ui, Icon::Pencil, "Rename…")
+        {
+            actions.push(Action::AskRename(
+                super::rename_flow::RenameTarget::Project(id.to_owned()),
+            ));
+        }
+        // The default workspace and the open one stay.
+        let others: Vec<_> = settings
+            .projects
+            .iter()
+            .filter(|project| Some(project.id.as_str()) != active)
+            .collect();
+        if !others.is_empty() {
+            ui.menu_button("Delete", |ui| {
+                for project in others {
+                    if menu_item(ui, Icon::Trash, &format!("{}…", project.name)) {
+                        actions.push(Action::AskDeleteProject(project.id.clone()));
+                    }
+                }
+            });
+        }
+    })
+    .response
+    .on_hover_text("Workspace: its own connections, editors and scripts");
 }
 
 /// A new version: downloading, ready to install on restart, or to be

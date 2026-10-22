@@ -39,6 +39,10 @@ pub enum Action {
     MoveToFolder(ConnectionId, String),
     /// Deletes a connection folder, moving what it holds up a level.
     DeleteFolder(String),
+    /// Opens a workspace; `None` for the default one.
+    SwitchProject(Option<String>),
+    AskDeleteProject(String),
+    DeleteProject(String),
     Connect(ConnectionId),
     /// Disconnects, asking first about an open transaction.
     Disconnect(ConnectionId),

@@ -33,6 +33,15 @@ impl From<egui::ThemePreference> for ThemeChoice {
     }
 }
 
+/// A workspace besides the default one: its own connections, open editors
+/// and scripts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Project {
+    /// Names its folders; never changes.
+    pub id: String,
+    pub name: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -69,6 +78,10 @@ pub struct Settings {
     pub shortcuts: BTreeMap<String, String>,
     /// Rows a paged result reads at a time.
     pub fetch_size: u64,
+    /// The workspaces besides the default one.
+    pub projects: Vec<Project>,
+    /// The workspace open; `None` for the default one.
+    pub active_project: Option<String>,
 }
 
 impl Default for Settings {
@@ -90,6 +103,29 @@ impl Default for Settings {
             shortcuts: BTreeMap::new(),
             updates: true,
             fetch_size: violet_core::Page::SIZE,
+            projects: Vec::new(),
+            active_project: None,
         }
+    }
+}
+
+impl Settings {
+    /// The workspace open, when it is still one of [`Settings::projects`];
+    /// else the default one.
+    pub fn project(&self) -> Option<&str> {
+        let id = self.active_project.as_deref()?;
+        self.projects
+            .iter()
+            .any(|project| project.id == id)
+            .then_some(id)
+    }
+
+    /// The open workspace's name.
+    pub fn project_name(&self) -> &str {
+        let id = self.project();
+        self.projects
+            .iter()
+            .find(|project| Some(project.id.as_str()) == id)
+            .map_or("Default", |project| project.name.as_str())
     }
 }

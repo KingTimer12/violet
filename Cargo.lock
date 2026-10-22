@@ -5331,6 +5331,7 @@ dependencies = [
  "serde",
  "serde_json",
  "ureq",
+ "uuid",
  "violet-app",
  "violet-core",
  "violet-lang",

@@ -21,7 +21,7 @@ pub mod scripts;
 mod secrets;
 
 pub use cache::{MemoryKv, MemoryResultCache};
-pub use dirs::AppDirs;
+pub use dirs::{AppDirs, ProjectPaths};
 pub use history::JsonLinesHistory;
 pub use json::{JsonFile, JsonProfileRepository};
 pub use scripts::{SavedScript, ScriptFolder, ScriptStore};

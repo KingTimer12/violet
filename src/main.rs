@@ -109,8 +109,9 @@ fn main() -> eframe::Result {
             fastframe_icons::install::<ui::icons::Icon>(&ctx);
 
             let secrets: Arc<dyn SecretStore> = Arc::new(KeyringSecretStore);
+            let project = dirs.project(settings.project());
             let repository: Arc<dyn ProfileRepository> =
-                Arc::new(JsonProfileRepository::new(dirs.profiles_file()));
+                Arc::new(JsonProfileRepository::new(&project.profiles_file));
             let (profiles, error) = ProfileService::load(repository, Arc::clone(&secrets));
             if let Some(error) = launch.error {
                 startup_errors.push(ui::toast_error(
@@ -160,8 +161,9 @@ fn main() -> eframe::Result {
                 settings: settings_file,
                 providers_dir,
                 history,
-                session: JsonFile::new(dirs.session_file()),
-                scripts: ScriptStore::new(dirs.scripts_dir()),
+                session: JsonFile::new(project.session_file),
+                scripts: ScriptStore::new(project.scripts_dir),
+                dirs: dirs.clone(),
                 updates: settings
                     .updates
                     .then(|| {

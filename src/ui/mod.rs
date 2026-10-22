@@ -19,6 +19,7 @@ mod history;
 pub mod icons;
 mod key_flow;
 mod keys_flow;
+mod project_flow;
 mod providers;
 mod reference;
 mod rename_flow;
@@ -87,6 +88,8 @@ pub struct Services {
     /// The editors open last time.
     pub session: JsonFile<SavedSession>,
     pub scripts: ScriptStore,
+    /// Where each workspace keeps its files.
+    pub dirs: violet_storage::AppDirs,
     /// The update worker; `None` when updates are off.
     pub updates: Option<crate::update::Updates>,
     /// Set when this launch is a just-installed update, to confirm once
@@ -149,6 +152,9 @@ pub struct VioletApp {
     /// The format and header choice advanced copy starts with.
     copy_choice: (crate::export::Format, bool),
     confirm_delete: Option<ConnectionId>,
+    /// A workspace waiting for the user to confirm its deletion.
+    confirm_project_delete: Option<String>,
+    dirs: violet_storage::AppDirs,
     /// A connection string typed on the welcome screen.
     welcome_uri: String,
     /// Runs waiting for their tab's connection to open.
@@ -291,6 +297,8 @@ impl VioletApp {
             key_requests: HashMap::new(),
             copy_choice: (crate::export::Format::Tsv, true),
             confirm_delete: None,
+            confirm_project_delete: None,
+            dirs: services.dirs,
             welcome_uri: String::new(),
             queued: Vec::new(),
             actions: Vec::new(),
@@ -1892,6 +1900,9 @@ impl VioletApp {
             | Action::OpenScriptFile
             | Action::OpenScript(_)
             | Action::MoveScript(..)) => self.script_action(ctx, action),
+            action @ (Action::SwitchProject(_)
+            | Action::AskDeleteProject(_)
+            | Action::DeleteProject(_)) => self.project_action(ctx, action),
             Action::RefreshTab(tab) => self.refresh(ctx, tab),
             Action::ApplyFilter(tab) => self.run_data(ctx, tab, CachePolicy::Use),
             Action::ClearFilter(tab) => {
@@ -2238,6 +2249,7 @@ impl VioletApp {
             || self.edit_review.is_some()
             || self.run_review.is_some()
             || self.confirm_delete.is_some()
+            || self.confirm_project_delete.is_some()
             || self.close_confirm.is_some()
             || self.tx_confirm.is_some()
             || self.history_view.is_some()
@@ -2582,6 +2594,29 @@ impl VioletApp {
         {
             self.answer_transactions(ctx, confirm, answer);
         }
+        if let Some(id) = self.confirm_project_delete.clone() {
+            let name = self
+                .settings
+                .projects
+                .iter()
+                .find(|project| project.id == id)
+                .map_or_else(String::new, |project| project.name.clone());
+            match connection_form::confirm(
+                ctx,
+                "Delete workspace?",
+                &format!(
+                    "\u{201C}{name}\u{201D}, its connections, their saved passwords and its \
+                     scripts will be removed. The databases themselves are not touched."
+                ),
+            ) {
+                Some(true) => {
+                    self.actions.push(Action::DeleteProject(id));
+                    self.confirm_project_delete = None;
+                }
+                Some(false) => self.confirm_project_delete = None,
+                None => {}
+            }
+        }
         if let Some(id) = self.confirm_delete {
             let name = self.profile_name(id);
             match connection_form::confirm_delete(ctx, &name) {
@@ -2668,6 +2703,7 @@ impl eframe::App for VioletApp {
                 chrome::title_bar(
                     ui,
                     &title,
+                    &self.settings,
                     self.settings.theme.into(),
                     &update,
                     &mut self.actions,

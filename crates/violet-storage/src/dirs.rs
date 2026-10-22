@@ -4,6 +4,14 @@ use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
 
+/// Where a workspace keeps its connections, open editors and scripts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectPaths {
+    pub profiles_file: PathBuf,
+    pub session_file: PathBuf,
+    pub scripts_dir: PathBuf,
+}
+
 /// Config, state and log locations for the current user.
 #[derive(Clone, Debug)]
 pub struct AppDirs {
@@ -98,5 +106,53 @@ impl AppDirs {
     #[must_use]
     pub fn state_dir(&self) -> &Path {
         &self.state
+    }
+
+    /// The files of workspace `id`. The default one (`None`) keeps the
+    /// paths Violet used before workspaces, so nothing has to move.
+    #[must_use]
+    pub fn project(&self, id: Option<&str>) -> ProjectPaths {
+        match id {
+            None => ProjectPaths {
+                profiles_file: self.profiles_file(),
+                session_file: self.session_file(),
+                scripts_dir: self.scripts_dir(),
+            },
+            Some(id) => ProjectPaths {
+                profiles_file: self
+                    .config
+                    .join("workspaces")
+                    .join(id)
+                    .join("connections.json"),
+                session_file: self.state.join("workspaces").join(id).join("session.json"),
+                scripts_dir: self.data.join("workspaces").join(id).join("scripts"),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_workspace_keeps_the_old_paths() {
+        let dirs = AppDirs::at("/v");
+        let default = dirs.project(None);
+        assert_eq!(default.profiles_file, dirs.profiles_file());
+        assert_eq!(default.session_file, dirs.session_file());
+        assert_eq!(default.scripts_dir, dirs.scripts_dir());
+
+        let other = dirs.project(Some("abc"));
+        let root = Path::new("/v");
+        assert_eq!(
+            other.profiles_file,
+            root.join("config/workspaces/abc/connections.json")
+        );
+        assert_eq!(
+            other.session_file,
+            root.join("state/workspaces/abc/session.json")
+        );
+        assert_eq!(other.scripts_dir, root.join("data/workspaces/abc/scripts"));
     }
 }

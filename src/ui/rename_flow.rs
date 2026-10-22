@@ -37,6 +37,10 @@ pub enum RenameTarget {
     NewFolder(String),
     /// A connection folder, by its path.
     Folder(String),
+    /// A new workspace.
+    NewProject,
+    /// A workspace, by its id.
+    Project(String),
     /// A new folder of scripts, inside `parent` of a database.
     NewScriptFolder {
         connection: ConnectionId,
@@ -82,7 +86,15 @@ pub struct DropPrompt {
 impl VioletApp {
     pub(super) fn ask_rename(&mut self, ctx: &egui::Context, target: RenameTarget) {
         let text = match &target {
-            RenameTarget::NewFolder(_) | RenameTarget::NewScriptFolder { .. } => String::new(),
+            RenameTarget::NewFolder(_)
+            | RenameTarget::NewScriptFolder { .. }
+            | RenameTarget::NewProject => String::new(),
+            RenameTarget::Project(id) => self
+                .settings
+                .projects
+                .iter()
+                .find(|project| project.id == *id)
+                .map_or_else(String::new, |project| project.name.clone()),
             RenameTarget::Folder(path) => path.rsplit('/').next().unwrap_or(path).to_owned(),
             RenameTarget::Tab(id) => match self.workspace.get(*id) {
                 Some(tab) => tab.title.clone(),
@@ -170,6 +182,12 @@ impl VioletApp {
             return;
         }
         match prompt.target.clone() {
+            RenameTarget::NewProject => {
+                self.rename_prompt = None;
+                self.create_project(ctx, &to);
+                return;
+            }
+            RenameTarget::Project(id) => self.rename_project(ctx, &id, &to),
             RenameTarget::NewFolder(_)
             | RenameTarget::Folder(_)
             | RenameTarget::NewScriptFolder { .. }
@@ -632,6 +650,12 @@ pub fn show(ctx: &egui::Context, prompt: &mut RenamePrompt, actions: &mut Vec<Ac
     let mut open = true;
     let (title, body) = match &prompt.target {
         RenameTarget::NewFolder(_) => ("New folder", "Folders group connections in the tree."),
+        RenameTarget::NewProject => (
+            "New workspace",
+            "A workspace has its own connections, editors and scripts.",
+        ),
+        RenameTarget::Project(_) => ("Rename workspace", "Only its name changes."),
+
         RenameTarget::NewScriptFolder { .. } => (
             "New folder",
             "A folder on disk, below the database's scripts.",
@@ -662,7 +686,8 @@ pub fn show(ctx: &egui::Context, prompt: &mut RenamePrompt, actions: &mut Vec<Ac
     let (icon, verb) = match &prompt.target {
         RenameTarget::NewDatabase(_)
         | RenameTarget::NewFolder(_)
-        | RenameTarget::NewScriptFolder { .. } => (Icon::Plus, "Create"),
+        | RenameTarget::NewScriptFolder { .. }
+        | RenameTarget::NewProject => (Icon::Plus, "Create"),
         _ => (Icon::Pencil, "Rename"),
     };
     let modal = egui::Modal::new(egui::Id::new("rename-prompt"))

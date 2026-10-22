@@ -60,6 +60,7 @@ violet-lang.workspace = true
 hotpath.workspace = true
 log.workspace = true
 serde.workspace = true
+uuid.workspace = true
 zeroize.workspace = true
 # Local times in the query history. Already in the tree via fastframe-log.
 jiff = "0.2"
