@@ -172,6 +172,21 @@ const MAX_ARGS: usize = 512;
 const MAX_ARG: usize = 32 << 10;
 const MAX_ENV: usize = 32;
 
+/// Lines of pg_dump 17 and later that older servers reject, swapped while
+/// psql reads a dump: `transaction_timeout` set only where the server knows
+/// it, and `public`, which dumps that pick schemas create, kept if it exists.
+const PSQL_SWAPS: &[(&str, &str)] = &[
+    (
+        "SET transaction_timeout = 0;",
+        "SELECT pg_catalog.set_config('transaction_timeout', '0', false) \
+         WHERE current_setting('server_version_num')::int >= 170000;",
+    ),
+    (
+        "CREATE SCHEMA public;",
+        "CREATE SCHEMA IF NOT EXISTS public;",
+    ),
+];
+
 /// What a task does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -904,13 +919,30 @@ impl Task {
         {
             return Err(invalid("the command is too long or holds a NUL".into()));
         }
+        let mut stdin_from_path = template.stdin_from_path;
+        let mut stdin_lines = Vec::new();
+        if template.program == "psql" && !template.stdout_to_path {
+            // Providers built before Violet swapped lines pass the dump as --file.
+            let file = format!("--file={}", request.path);
+            if let Some(arg) = args.iter_mut().find(|arg| **arg == file) {
+                "--file=-".clone_into(arg);
+                stdin_from_path = true;
+            }
+            if stdin_from_path {
+                stdin_lines = PSQL_SWAPS
+                    .iter()
+                    .map(|&(from, to)| (from.to_owned(), to.to_owned()))
+                    .collect();
+            }
+        }
         Ok(ToolCommand {
             program: template.program.clone(),
             args,
             env,
             password_env: self.connection.password_env.clone(),
             stdout_to_path: template.stdout_to_path,
-            stdin_from_path: template.stdin_from_path,
+            stdin_from_path,
+            stdin_lines,
         })
     }
 
@@ -1244,6 +1276,8 @@ pub struct ToolCommand {
     pub stdout_to_path: bool,
     /// Feed the path to standard input.
     pub stdin_from_path: bool,
+    /// Lines swapped, whole, while feeding the path.
+    pub stdin_lines: Vec<(String, String)>,
 }
 
 #[cfg(test)]

@@ -176,7 +176,9 @@ async fn backups_and_restores_are_declared_and_filled_by_violet() {
     let psql = restore.build(&profile, &request).expect("psql");
     assert_eq!(psql.program, "psql");
     assert!(psql.args.contains(&"--dbname=copy".to_owned()));
-    assert!(psql.args.contains(&"--file=/tmp/shop.sql".to_owned()));
+    assert!(psql.args.contains(&"--file=-".to_owned()));
+    assert!(psql.stdin_from_path);
+    assert_eq!(psql.stdin_lines.len(), 2);
     request.settings.insert("format".into(), "custom".into());
     let pg_restore = restore.build(&profile, &request).expect("pg_restore");
     assert_eq!(pg_restore.program, "pg_restore");

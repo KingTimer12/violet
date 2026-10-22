@@ -281,9 +281,15 @@ pub async fn run(
             None => process.env_remove(name),
         };
     }
+    let mut input = None;
     if command.stdin_from_path {
         let file = std::fs::File::open(&path).map_err(|error| io("open the input", &error))?;
-        process.stdin(Stdio::from(file));
+        if command.stdin_lines.is_empty() {
+            process.stdin(Stdio::from(file));
+        } else {
+            process.stdin(Stdio::piped());
+            input = Some(file);
+        }
     } else {
         process.stdin(Stdio::null());
     }
@@ -293,6 +299,13 @@ pub async fn run(
 
     let line = std::sync::Arc::new(line);
     let mut readers = Vec::new();
+    if let (Some(file), Some(stdin)) = (input, child.stdin.take()) {
+        let swaps = command.stdin_lines.clone();
+        readers.push(tokio::spawn(async move {
+            // The program may stop reading early, on an error of its own.
+            let _ = feed(tokio::fs::File::from_std(file), stdin, &swaps).await;
+        }));
+    }
     if let Some(stderr) = child.stderr.take() {
         readers.push(tokio::spawn(lines(stderr, std::sync::Arc::clone(&line))));
     }
@@ -352,6 +365,32 @@ pub async fn run(
         elapsed: started.elapsed(),
         bytes,
     })
+}
+
+/// Copies `file` to `stdin` line by line, swapping whole lines, with or
+/// without their `\r`.
+async fn feed(
+    file: tokio::fs::File,
+    stdin: tokio::process::ChildStdin,
+    swaps: &[(String, String)],
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let mut reader = tokio::io::BufReader::new(file);
+    let mut writer = tokio::io::BufWriter::new(stdin);
+    let mut line = Vec::new();
+    while reader.read_until(b'\n', &mut line).await? > 0 {
+        let body = line.strip_suffix(b"\n").unwrap_or(&line);
+        let body = body.strip_suffix(b"\r").unwrap_or(body);
+        match swaps.iter().find(|(from, _)| from.as_bytes() == body) {
+            Some((_, to)) => {
+                writer.write_all(to.as_bytes()).await?;
+                writer.write_all(&line[body.len()..]).await?;
+            }
+            None => writer.write_all(&line).await?,
+        }
+        line.clear();
+    }
+    writer.shutdown().await
 }
 
 async fn cancelled(cancel: &mut watch::Receiver<bool>) {
@@ -534,6 +573,7 @@ mod tests {
             password_env: Some("PGPASSWORD".into()),
             stdout_to_path: false,
             stdin_from_path: false,
+            stdin_lines: Vec::new(),
         };
         assert_eq!(
             display(Path::new("/usr/bin/pg_dump"), &command),
@@ -557,6 +597,7 @@ mod tests {
             password_env: password_env.map(str::to_owned),
             stdout_to_path: false,
             stdin_from_path: false,
+            stdin_lines: Vec::new(),
         };
         // Lines, and the size of what was written.
         let mut write = command(&["a\\nb\\n"], None);
