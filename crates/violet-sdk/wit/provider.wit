@@ -489,6 +489,9 @@ interface tools {
         stdout-to-path: bool,
         /// Violet feeds the path to the program's standard input.
         stdin-from-path: bool,
+        /// Lines Violet swaps, whole, while feeding the path, such as a
+        /// setting older servers reject.
+        stdin-lines: list<tuple<string, string>>,
     }
 
     record task {

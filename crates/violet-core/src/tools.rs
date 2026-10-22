@@ -410,6 +410,7 @@ pub struct CommandTemplate {
     pub variables: Vec<Variable>,
     pub stdout_to_path: bool,
     pub stdin_from_path: bool,
+    pub stdin_lines: Vec<(String, String)>,
 }
 
 /// A backup or restore a driver offers.
@@ -700,6 +701,16 @@ impl Task {
             if command.stdout_to_path && command.stdin_from_path {
                 return bad("a command both reads and writes the path".into());
             }
+            if !command.stdin_lines.is_empty() && !command.stdin_from_path {
+                return bad("a command replaces lines it does not read".into());
+            }
+            if command.stdin_lines.len() > MAX_ENV
+                || command.stdin_lines.iter().any(|(from, to)| {
+                    from.len() + to.len() > MAX_ARG || from.contains('\n') || to.contains('\n')
+                })
+            {
+                return bad("a command replaces too many lines".into());
+            }
             if command.parts.len() > MAX_PARTS || command.variables.len() > MAX_ENV {
                 return bad("a command is too long".into());
             }
@@ -911,6 +922,7 @@ impl Task {
             password_env: self.connection.password_env.clone(),
             stdout_to_path: template.stdout_to_path,
             stdin_from_path: template.stdin_from_path,
+            stdin_lines: template.stdin_lines.clone(),
         })
     }
 
@@ -1244,6 +1256,8 @@ pub struct ToolCommand {
     pub stdout_to_path: bool,
     /// Feed the path to standard input.
     pub stdin_from_path: bool,
+    /// Lines swapped, whole, while feeding the path.
+    pub stdin_lines: Vec<(String, String)>,
 }
 
 #[cfg(test)]
@@ -1405,6 +1419,7 @@ mod tests {
                 ],
                 stdout_to_path: false,
                 stdin_from_path: false,
+                stdin_lines: Vec::new(),
             }],
         }
     }
