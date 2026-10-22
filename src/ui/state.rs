@@ -56,6 +56,8 @@ pub enum NodeKey {
     ConnectionFolder(String),
     /// The scripts saved for a connection.
     Scripts(ConnectionId),
+    /// A folder of a connection's scripts: its database and path.
+    ScriptFolder(ConnectionId, String, String),
     Schema(ConnectionId, String),
     Group(ConnectionId, String, ObjectKind),
     Object(ConnectionId, String, String),
@@ -311,6 +313,7 @@ fn owner(key: &NodeKey) -> Option<ConnectionId> {
         NodeKey::Connection(id)
         | NodeKey::Database(id, _)
         | NodeKey::Scripts(id)
+        | NodeKey::ScriptFolder(id, ..)
         | NodeKey::Schema(id, _)
         | NodeKey::Group(id, _, _)
         | NodeKey::Object(id, _, _)

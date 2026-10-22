@@ -47,7 +47,7 @@ use egui::{Frame, Id, Panel, Stroke};
 use violet_app::{Backend, CachePolicy, Event, ExecOptions, ProfileService, TaskId};
 use violet_core::ports::{HistoryEntry, QueryHistory};
 use violet_core::{ConnectionId, ConnectionProfile, DriverId, ErrorKind, Language, Page};
-use violet_storage::{JsonFile, SavedScript, ScriptStore};
+use violet_storage::{JsonFile, SavedScript, ScriptFolder, ScriptStore};
 
 use crate::completion::{self, Need};
 use crate::settings::Settings;
@@ -109,6 +109,8 @@ pub struct VioletApp {
     scripts: ScriptStore,
     /// The scripts saved for connections, as last listed.
     script_list: Vec<SavedScript>,
+    /// The folders below databases' scripts, as last listed.
+    script_folders: Vec<ScriptFolder>,
     script_prompt: Option<script_flow::ScriptPrompt>,
     /// Asks about unsaved scripts before their tabs close.
     close_confirm: Option<script_flow::CloseConfirm>,
@@ -263,6 +265,7 @@ impl VioletApp {
             prompt: None,
             scripts: services.scripts,
             script_list: Vec::new(),
+            script_folders: Vec::new(),
             script_prompt: None,
             close_confirm: None,
             quitting: false,
@@ -484,7 +487,10 @@ impl VioletApp {
                 | NodeKey::Object(id, _, _),
             ) => Some(id),
             Some(NodeKey::Folder(id, _)) => Some(id),
-            Some(NodeKey::Scripts(_) | NodeKey::ConnectionFolder(_)) | None => None,
+            Some(
+                NodeKey::Scripts(_) | NodeKey::ScriptFolder(..) | NodeKey::ConnectionFolder(_),
+            )
+            | None => None,
         };
         let Some(session) = session else {
             return;
@@ -1884,7 +1890,8 @@ impl VioletApp {
             | Action::SaveScriptAs(_)
             | Action::SaveScriptNamed(..)
             | Action::OpenScriptFile
-            | Action::OpenScript(_)) => self.script_action(ctx, action),
+            | Action::OpenScript(_)
+            | Action::MoveScript(..)) => self.script_action(ctx, action),
             Action::RefreshTab(tab) => self.refresh(ctx, tab),
             Action::ApplyFilter(tab) => self.run_data(ctx, tab, CachePolicy::Use),
             Action::ClearFilter(tab) => {
@@ -2083,6 +2090,7 @@ impl VioletApp {
             NodeKey::Connection(id)
             | NodeKey::Database(id, _)
             | NodeKey::Scripts(id)
+            | NodeKey::ScriptFolder(id, ..)
             | NodeKey::Schema(id, _)
             | NodeKey::Group(id, ..)
             | NodeKey::Object(id, ..)
@@ -2110,7 +2118,9 @@ impl VioletApp {
                 | NodeKey::Object(id, schema, _) => Some(Action::LoadObjects(*id, schema.clone())),
                 NodeKey::Folder(id, state::Folder::Schemas) => Some(Action::Refresh(*id)),
                 NodeKey::Folder(id, folder) => Some(Action::LoadFolder(*id, *folder)),
-                NodeKey::Scripts(_) | NodeKey::ConnectionFolder(_) => None,
+                NodeKey::Scripts(_) | NodeKey::ScriptFolder(..) | NodeKey::ConnectionFolder(_) => {
+                    None
+                }
             };
             self.actions.extend(action);
         }
@@ -2698,6 +2708,7 @@ impl eframe::App for VioletApp {
                     self.profiles.all(),
                     &self.profiles.folders(),
                     &self.script_list,
+                    &self.script_folders,
                     &mut self.explorer,
                     &mut self.actions,
                 );

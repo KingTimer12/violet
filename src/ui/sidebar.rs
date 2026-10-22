@@ -5,7 +5,7 @@ use egui::{Align2, Color32, CornerRadius, Response, Sense, Ui, Vec2};
 use violet_core::{
     ConnectionId, ConnectionProfile, DbObject, Language, ObjectKind, ObjectRef, TaskKind,
 };
-use violet_storage::SavedScript;
+use violet_storage::{SavedScript, ScriptFolder};
 
 use super::action::Action;
 use super::catalog_flow;
@@ -158,6 +158,7 @@ pub fn show(
     profiles: &[ConnectionProfile],
     folders: &[String],
     scripts: &[SavedScript],
+    script_folders: &[ScriptFolder],
     explorer: &mut Explorer,
     actions: &mut Vec<Action>,
 ) {
@@ -236,6 +237,7 @@ pub fn show(
                 profiles,
                 folders,
                 scripts,
+                script_folders,
                 filter: explorer.filter.trim().to_lowercase(),
             };
             tree.contents(ui, "", 0, explorer, actions);
@@ -264,6 +266,7 @@ struct Tree<'a> {
     profiles: &'a [ConnectionProfile],
     folders: &'a [String],
     scripts: &'a [SavedScript],
+    script_folders: &'a [ScriptFolder],
     /// The filter box, lower case.
     filter: String,
 }
@@ -362,7 +365,19 @@ impl Tree<'_> {
                 })
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
-                    connection(ui, profile, self.folders, self.scripts, explorer, actions);
+                    let scripts = Scripts {
+                        all: self
+                            .scripts
+                            .iter()
+                            .filter(|script| script.connection == profile.id)
+                            .collect(),
+                        folders: self
+                            .script_folders
+                            .iter()
+                            .filter(|folder| folder.connection == profile.id)
+                            .collect(),
+                    };
+                    connection(ui, profile, self.folders, &scripts, explorer, actions);
                 });
         }
     }
@@ -372,7 +387,7 @@ fn connection(
     ui: &mut Ui,
     profile: &ConnectionProfile,
     all_folders: &[String],
-    scripts: &[SavedScript],
+    scripts: &Scripts<'_>,
     explorer: &mut Explorer,
     actions: &mut Vec<Action>,
 ) {
@@ -518,12 +533,8 @@ fn connection(
     if !expanded {
         return;
     }
-    let scripts: Vec<&SavedScript> = scripts
-        .iter()
-        .filter(|script| script.connection == id)
-        .collect();
-    if !scripts.is_empty() {
-        scripts_node(ui, profile, &scripts, explorer, actions);
+    if !scripts.all.is_empty() || !scripts.folders.is_empty() {
+        scripts_node(ui, profile, scripts, explorer, actions);
     }
     if language == Language::Redis {
         match explorer.schemas.get(&id).cloned().unwrap_or_default() {
@@ -599,11 +610,17 @@ fn picked_databases<'a>(
         .collect()
 }
 
+/// A connection's saved scripts and the folders they are kept in.
+struct Scripts<'a> {
+    all: Vec<&'a SavedScript>,
+    folders: Vec<&'a ScriptFolder>,
+}
+
 /// The scripts saved for a connection, each opening on its database.
 fn scripts_node(
     ui: &mut Ui,
     profile: &ConnectionProfile,
-    scripts: &[&SavedScript],
+    scripts: &Scripts<'_>,
     explorer: &mut Explorer,
     actions: &mut Vec<Action>,
 ) {
@@ -611,22 +628,12 @@ fn scripts_node(
     let filter = explorer.filter.trim().to_lowercase();
     let filtering = !filter.is_empty();
     let shown: Vec<&SavedScript> = scripts
+        .all
         .iter()
         .copied()
         .filter(|script| !filtering || matches_filter(&script.name, &filter))
         .collect();
     if filtering && shown.is_empty() {
-        return;
-    }
-    let expanded = filtering || explorer.is_expanded(&key);
-    let count = shown.len().to_string();
-    let mut row = Row::new(1, Icon::Folder, "Scripts");
-    row.expanded = Some(expanded);
-    row.detail = Some(&count);
-    if row.show(ui).clicked() {
-        explorer.toggle(key);
-    }
-    if !expanded {
         return;
     }
     // The database shows only for scripts of another one than the
@@ -635,28 +642,178 @@ fn scripts_node(
         Link::Online(server) => server.database.clone(),
         _ => profile.database.clone(),
     };
-    for script in shown {
-        let mut row = Row::new(2, Icon::FileCode, &script.name);
-        if script.database != own {
-            row.detail = Some(&script.database);
+    let expanded = filtering || explorer.is_expanded(&key);
+    let count = shown.len().to_string();
+    let mut row = Row::new(1, Icon::Folder, "Scripts");
+    row.expanded = Some(expanded);
+    row.detail = Some(&count);
+    let response = row.show(ui);
+    if response.clicked() {
+        explorer.toggle(key);
+    }
+    response.context_menu(|ui| {
+        if !own.is_empty() && menu_item(ui, Icon::Folder, "New folder…") {
+            actions.push(new_script_folder(profile.id, &own, ""));
         }
-        let response =
-            row.show(ui)
-                .on_hover_text(format!("{}\n{}", script.database, script.path.display()));
-        if response.clicked() {
-            actions.push(Action::OpenScript(script.path.clone()));
+    });
+    if !expanded {
+        return;
+    }
+    let level = ScriptLevel {
+        connection: profile.id,
+        own: &own,
+        shown: &shown,
+        folders: &scripts.folders,
+        filtering,
+    };
+    level.show(ui, None, "", 2, explorer, actions);
+}
+
+fn new_script_folder(connection: ConnectionId, database: &str, parent: &str) -> Action {
+    Action::AskRename(super::rename_flow::RenameTarget::NewScriptFolder {
+        connection,
+        database: database.to_owned(),
+        parent: parent.to_owned(),
+    })
+}
+
+/// What drawing a level of a connection's scripts needs.
+struct ScriptLevel<'a> {
+    connection: ConnectionId,
+    /// The connection's own database.
+    own: &'a str,
+    /// The scripts the filter lets through.
+    shown: &'a [&'a SavedScript],
+    folders: &'a [&'a ScriptFolder],
+    filtering: bool,
+}
+
+impl ScriptLevel<'_> {
+    /// The folders, then the scripts, in `folder` of `database` (of every
+    /// database at the top).
+    fn show(
+        &self,
+        ui: &mut Ui,
+        database: Option<&str>,
+        folder: &str,
+        depth: usize,
+        explorer: &mut Explorer,
+        actions: &mut Vec<Action>,
+    ) {
+        let here = |db: &str| database.is_none_or(|database| database == db);
+        for child in self.folders.iter().filter(|child| {
+            here(&child.database) && violet_app::parent_folder(&child.folder) == folder
+        }) {
+            let prefix = format!("{}/", child.folder);
+            let count = self
+                .shown
+                .iter()
+                .filter(|script| {
+                    script.database == child.database
+                        && (script.folder == child.folder || script.folder.starts_with(&prefix))
+                })
+                .count();
+            if self.filtering && count == 0 {
+                continue;
+            }
+            let key = NodeKey::ScriptFolder(
+                self.connection,
+                child.database.clone(),
+                child.folder.clone(),
+            );
+            let expanded = self.filtering || explorer.is_expanded(&key);
+            let name = child.folder.rsplit('/').next().unwrap_or(&child.folder);
+            let detail = if child.database == self.own {
+                count.to_string()
+            } else {
+                format!("{} · {count}", child.database)
+            };
+            let mut row = Row::new(
+                depth,
+                if expanded {
+                    Icon::FolderOpen
+                } else {
+                    Icon::Folder
+                },
+                name,
+            );
+            row.expanded = Some(expanded);
+            row.detail = Some(&detail);
+            let response = row.show(ui);
+            if response.clicked() {
+                explorer.toggle(key);
+            }
+            response.context_menu(|ui| {
+                if menu_item(ui, Icon::Folder, "New folder…") {
+                    actions.push(new_script_folder(
+                        self.connection,
+                        &child.database,
+                        &child.folder,
+                    ));
+                }
+            });
+            if expanded {
+                self.show(
+                    ui,
+                    Some(&child.database),
+                    &child.folder,
+                    depth + 1,
+                    explorer,
+                    actions,
+                );
+            }
         }
-        response.context_menu(|ui| {
-            if menu_item(ui, Icon::FileCode, "Open") {
+        for script in self
+            .shown
+            .iter()
+            .filter(|script| here(&script.database) && script.folder == folder)
+        {
+            let mut row = Row::new(depth, Icon::FileCode, &script.name);
+            if script.database != self.own {
+                row.detail = Some(&script.database);
+            }
+            let response = row.show(ui).on_hover_text(format!(
+                "{}\n{}",
+                script.database,
+                script.path.display()
+            ));
+            if response.clicked() {
                 actions.push(Action::OpenScript(script.path.clone()));
             }
-            if menu_item(ui, Icon::FolderOpen, "Show in folder") {
-                actions.push(Action::Reveal(script.path.clone()));
-            }
-            if menu_item(ui, Icon::Copy, "Copy path") {
-                actions.push(Action::Copy(script.path.display().to_string()));
-            }
-        });
+            response.context_menu(|ui| {
+                if menu_item(ui, Icon::FileCode, "Open") {
+                    actions.push(Action::OpenScript(script.path.clone()));
+                }
+                ui.menu_button("Move to folder", |ui| {
+                    if !script.folder.is_empty() && menu_item(ui, Icon::Folder, "(top level)") {
+                        actions.push(Action::MoveScript(script.path.clone(), String::new()));
+                    }
+                    for target in self.folders.iter().filter(|target| {
+                        target.database == script.database && target.folder != script.folder
+                    }) {
+                        if menu_item(ui, Icon::Folder, &target.folder) {
+                            actions.push(Action::MoveScript(
+                                script.path.clone(),
+                                target.folder.clone(),
+                            ));
+                        }
+                    }
+                    if menu_item(ui, Icon::Plus, "New folder…") {
+                        actions.push(new_script_folder(
+                            self.connection,
+                            &script.database,
+                            &script.folder,
+                        ));
+                    }
+                });
+                if menu_item(ui, Icon::FolderOpen, "Show in folder") {
+                    actions.push(Action::Reveal(script.path.clone()));
+                }
+                if menu_item(ui, Icon::Copy, "Copy path") {
+                    actions.push(Action::Copy(script.path.display().to_string()));
+                }
+            });
+        }
     }
 }
 

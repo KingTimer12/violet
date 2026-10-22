@@ -1,9 +1,10 @@
 //! Scripts saved for a connection's database, as plain `.sql` files (or
 //! `.redis` ones, for Redis connections).
 //!
-//! A script lives at `<root>/<connection id>/<database>/<name>.sql`: the
-//! folders say what it runs on, so nothing else has to be kept in step
-//! with the files, and they can be copied, renamed or edited elsewhere.
+//! A script lives at `<root>/<connection id>/<database>/<name>.sql`, or in
+//! folders below the database's: the folders say what it runs on, so
+//! nothing else has to be kept in step with the files, and they can be
+//! copied, renamed or edited elsewhere.
 //! Names are kept as typed; characters a file name cannot hold are
 //! written `%XX`.
 
@@ -30,6 +31,18 @@ pub struct SavedScript {
     pub name: String,
     pub connection: ConnectionId,
     pub database: String,
+    /// The folders below the database's it is in, as `a/b`; empty for
+    /// none.
+    pub folder: String,
+}
+
+/// A folder of scripts below a database's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptFolder {
+    pub connection: ConnectionId,
+    pub database: String,
+    /// As `a/b`.
+    pub folder: String,
 }
 
 /// The scripts folder.
@@ -58,10 +71,47 @@ impl ScriptStore {
         name: &str,
         extension: &str,
     ) -> PathBuf {
-        self.root
-            .join(connection.to_string())
-            .join(encode(database))
+        self.path_in(connection, database, "", name, extension)
+    }
+
+    /// Where a script named `name` goes in `folder` (as `a/b`, empty for
+    /// none) of `database` of `connection`.
+    #[must_use]
+    pub fn path_in(
+        &self,
+        connection: ConnectionId,
+        database: &str,
+        folder: &str,
+        name: &str,
+        extension: &str,
+    ) -> PathBuf {
+        self.folder_path(connection, database, folder)
             .join(format!("{}.{extension}", encode(name)))
+    }
+
+    /// The directory of `folder` (as `a/b`, empty for the database's own).
+    #[must_use]
+    pub fn folder_path(&self, connection: ConnectionId, database: &str, folder: &str) -> PathBuf {
+        let mut path = self
+            .root
+            .join(connection.to_string())
+            .join(encode(database));
+        for part in folder.split('/').filter(|part| !part.is_empty()) {
+            path.push(encode(part));
+        }
+        path
+    }
+
+    /// Makes a folder of scripts.
+    pub fn create_folder(
+        &self,
+        connection: ConnectionId,
+        database: &str,
+        folder: &str,
+    ) -> Result<()> {
+        let path = self.folder_path(connection, database, folder);
+        fs::create_dir_all(&path)
+            .map_err(|error| storage_error(format!("Cannot create {}: {error}", path.display())))
     }
 
     /// The connection and database a file in the scripts folder belongs
@@ -72,11 +122,14 @@ impl ScriptStore {
         let mut parts = relative.iter();
         let connection = parts.next()?.to_str()?;
         let database = parts.next()?.to_str()?;
-        let file = Path::new(parts.next()?);
-        if parts.next().is_some()
-            || !EXTENSIONS
-                .iter()
-                .any(|e| file.extension() == Some(e.as_ref()))
+        let mut folders: Vec<String> = parts
+            .map(|part| part.to_str().map(decode))
+            .collect::<Option<_>>()?;
+        folders.pop()?;
+        let file = Path::new(path.file_name()?);
+        if !EXTENSIONS
+            .iter()
+            .any(|e| file.extension() == Some(e.as_ref()))
         {
             return None;
         }
@@ -85,36 +138,76 @@ impl ScriptStore {
             name: decode(file.file_stem()?.to_str()?),
             connection: ConnectionId(Uuid::parse_str(connection).ok()?),
             database: decode(database),
+            folder: folders.join("/"),
         })
     }
 
-    /// Every saved script, by connection, database and name. A missing
-    /// folder has none.
-    pub fn list(&self) -> Result<Vec<SavedScript>> {
+    /// Every saved script, by connection, database, folder and name, and
+    /// every folder below a database's, empty ones too. A missing folder
+    /// has none.
+    pub fn list(&self) -> Result<(Vec<SavedScript>, Vec<ScriptFolder>)> {
         let mut scripts = Vec::new();
-        for connection in entries(&self.root)?
+        let mut folders = Vec::new();
+        for connection_dir in entries(&self.root)?
             .into_iter()
             .filter(|path| path.is_dir())
         {
-            for database in entries(&connection)?
+            let Some(connection) = connection_dir
+                .file_name()
+                .and_then(|name| Uuid::parse_str(name.to_str()?).ok())
+                .map(ConnectionId)
+            else {
+                continue;
+            };
+            for database_dir in entries(&connection_dir)?
                 .into_iter()
                 .filter(|path| path.is_dir())
             {
-                for file in entries(&database)? {
-                    if let Some(script) = self.locate(&file) {
-                        scripts.push(script);
+                let Some(database) = database_dir.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                let database = decode(database);
+                let mut pending = vec![(database_dir.clone(), String::new())];
+                while let Some((directory, folder)) = pending.pop() {
+                    for path in entries(&directory)? {
+                        if !path.is_dir() {
+                            scripts.extend(self.locate(&path));
+                            continue;
+                        }
+                        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                            continue;
+                        };
+                        let below = if folder.is_empty() {
+                            decode(name)
+                        } else {
+                            format!("{folder}/{}", decode(name))
+                        };
+                        folders.push(ScriptFolder {
+                            connection,
+                            database: database.clone(),
+                            folder: below.clone(),
+                        });
+                        pending.push((path, below));
                     }
                 }
             }
         }
         scripts.sort_by(|a, b| {
-            (a.connection, &a.database, a.name.to_lowercase()).cmp(&(
+            (a.connection, &a.database, &a.folder, a.name.to_lowercase()).cmp(&(
                 b.connection,
                 &b.database,
+                &b.folder,
                 b.name.to_lowercase(),
             ))
         });
-        Ok(scripts)
+        folders.sort_by(|a, b| {
+            (a.connection, &a.database, a.folder.to_lowercase()).cmp(&(
+                b.connection,
+                &b.database,
+                b.folder.to_lowercase(),
+            ))
+        });
+        Ok((scripts, folders))
     }
 }
 
@@ -260,8 +353,27 @@ mod tests {
         write(&dir.path().join("notes.txt"), "")?;
         write(&dir.path().join("not-an-id").join("db").join("x.sql"), "")?;
 
-        let scripts = store.list()?;
-        assert_eq!(scripts.len(), 3);
+        let nested = store.path_in(connection, "postgres", "reports/2026", "q1", EXTENSION);
+        write(&nested, "SELECT 3;")?;
+        store.create_folder(connection, "postgres", "empty")?;
+
+        let (scripts, folders) = store.list()?;
+        assert_eq!(scripts.len(), 4);
+        let found = scripts
+            .iter()
+            .find(|script| script.path == nested)
+            .ok_or_else(|| storage_error("missing nested"))?;
+        assert_eq!(
+            (
+                found.connection,
+                found.database.as_str(),
+                found.folder.as_str()
+            ),
+            (connection, "postgres", "reports/2026")
+        );
+        assert_eq!(found.name, "q1");
+        let folders: Vec<&str> = folders.iter().map(|f| f.folder.as_str()).collect();
+        assert_eq!(folders, ["empty", "reports", "reports/2026"]);
         let script = scripts
             .iter()
             .find(|script| script.path == path)
@@ -269,6 +381,7 @@ mod tests {
         assert_eq!(script.name, "Relatório: vendas");
         assert_eq!(script.database, "app/prod");
         assert_eq!(script.connection, connection);
+        assert_eq!(script.folder, "");
         assert_eq!(read(&path)?, "SELECT 1;");
         assert_eq!(store.locate(Path::new("/elsewhere/x.sql")), None);
         Ok(())
@@ -277,7 +390,7 @@ mod tests {
     #[test]
     fn a_missing_folder_has_no_scripts() -> Result<()> {
         let store = ScriptStore::new("/no/such/violet/scripts");
-        assert!(store.list()?.is_empty());
+        assert!(store.list()?.0.is_empty());
         Ok(())
     }
 }

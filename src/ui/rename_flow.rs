@@ -37,6 +37,12 @@ pub enum RenameTarget {
     NewFolder(String),
     /// A connection folder, by its path.
     Folder(String),
+    /// A new folder of scripts, inside `parent` of a database.
+    NewScriptFolder {
+        connection: ConnectionId,
+        database: String,
+        parent: String,
+    },
 }
 
 pub struct RenamePrompt {
@@ -76,7 +82,7 @@ pub struct DropPrompt {
 impl VioletApp {
     pub(super) fn ask_rename(&mut self, ctx: &egui::Context, target: RenameTarget) {
         let text = match &target {
-            RenameTarget::NewFolder(_) => String::new(),
+            RenameTarget::NewFolder(_) | RenameTarget::NewScriptFolder { .. } => String::new(),
             RenameTarget::Folder(path) => path.rsplit('/').next().unwrap_or(path).to_owned(),
             RenameTarget::Tab(id) => match self.workspace.get(*id) {
                 Some(tab) => tab.title.clone(),
@@ -164,9 +170,40 @@ impl VioletApp {
             return;
         }
         match prompt.target.clone() {
-            RenameTarget::NewFolder(_) | RenameTarget::Folder(_) if to.contains('/') => {
-                prompt.error = Some("A folder name cannot hold /.".into());
+            RenameTarget::NewFolder(_)
+            | RenameTarget::Folder(_)
+            | RenameTarget::NewScriptFolder { .. }
+                if to.contains(['/', '\\']) =>
+            {
+                prompt.error = Some("A folder name cannot hold / or \\.".into());
                 return;
+            }
+            RenameTarget::NewScriptFolder {
+                connection,
+                database,
+                parent,
+            } => {
+                let folder = folder_path(&parent, &to);
+                if self
+                    .scripts
+                    .folder_path(connection, &database, &folder)
+                    .exists()
+                {
+                    prompt.error = Some("There is a folder with this name here.".into());
+                    return;
+                }
+                if let Err(error) = self.create_script_folder(ctx, connection, &database, &folder) {
+                    if let Some(prompt) = &mut self.rename_prompt {
+                        prompt.error = Some(error.to_string());
+                    }
+                    return;
+                }
+                let key = if parent.is_empty() {
+                    super::state::NodeKey::Scripts(connection)
+                } else {
+                    super::state::NodeKey::ScriptFolder(connection, database, parent)
+                };
+                self.explorer.expanded.insert(key);
             }
             RenameTarget::NewFolder(parent) => {
                 let path = folder_path(&parent, &to);
@@ -595,6 +632,11 @@ pub fn show(ctx: &egui::Context, prompt: &mut RenamePrompt, actions: &mut Vec<Ac
     let mut open = true;
     let (title, body) = match &prompt.target {
         RenameTarget::NewFolder(_) => ("New folder", "Folders group connections in the tree."),
+        RenameTarget::NewScriptFolder { .. } => (
+            "New folder",
+            "A folder on disk, below the database's scripts.",
+        ),
+
         RenameTarget::Folder(_) => (
             "Rename folder",
             "The connections and folders inside move with it.",
@@ -618,7 +660,9 @@ pub fn show(ctx: &egui::Context, prompt: &mut RenamePrompt, actions: &mut Vec<Ac
         ),
     };
     let (icon, verb) = match &prompt.target {
-        RenameTarget::NewDatabase(_) | RenameTarget::NewFolder(_) => (Icon::Plus, "Create"),
+        RenameTarget::NewDatabase(_)
+        | RenameTarget::NewFolder(_)
+        | RenameTarget::NewScriptFolder { .. } => (Icon::Plus, "Create"),
         _ => (Icon::Pencil, "Rename"),
     };
     let modal = egui::Modal::new(egui::Id::new("rename-prompt"))

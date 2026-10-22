@@ -135,6 +135,9 @@ pub enum Action {
     OpenScriptFile,
     /// Opens a script, on the database it was saved for.
     OpenScript(PathBuf),
+    /// Moves a saved script to a folder of its database; empty for the
+    /// database's own.
+    MoveScript(PathBuf, String),
     /// Reads the shown result again, skipping the cache.
     RefreshTab(TabId),
     /// Applies a data tab's filter box.
