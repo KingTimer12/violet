@@ -35,6 +35,10 @@ pub enum Action {
     DuplicateConnection(ConnectionId),
     AskDeleteConnection(ConnectionId),
     DeleteConnection(ConnectionId),
+    /// Files a connection in a folder; empty for the top level.
+    MoveToFolder(ConnectionId, String),
+    /// Deletes a connection folder, moving what it holds up a level.
+    DeleteFolder(String),
     Connect(ConnectionId),
     /// Disconnects, asking first about an open transaction.
     Disconnect(ConnectionId),

@@ -156,6 +156,7 @@ impl<'a> Row<'a> {
 pub fn show(
     ui: &mut Ui,
     profiles: &[ConnectionProfile],
+    folders: &[String],
     scripts: &[SavedScript],
     explorer: &mut Explorer,
     actions: &mut Vec<Action>,
@@ -169,6 +170,9 @@ pub fn show(
             ui.add_space(8.0);
             if widgets::icon_button_sized(ui, Icon::Plus, "New connection", 24.0, 15.0).clicked() {
                 actions.push(Action::NewConnection);
+            }
+            if widgets::icon_button_sized(ui, Icon::Folder, "New folder", 24.0, 15.0).clicked() {
+                actions.push(new_folder(""));
             }
         });
     });
@@ -200,7 +204,7 @@ pub fn show(
     });
     ui.add_space(8.0);
 
-    if profiles.is_empty() {
+    if profiles.is_empty() && folders.is_empty() {
         ui.add_space(24.0);
         widgets::empty_state(
             ui,
@@ -228,16 +232,146 @@ pub fn show(
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            for profile in profiles {
-                connection(ui, profile, scripts, explorer, actions);
-            }
-            ui.add_space(12.0);
+            let tree = Tree {
+                profiles,
+                folders,
+                scripts,
+                filter: explorer.filter.trim().to_lowercase(),
+            };
+            tree.contents(ui, "", 0, explorer, actions);
+            // The space below the tree takes the tree-wide menu.
+            let rest = ui.available_size_before_wrap().max(Vec2::new(0.0, 12.0));
+            let (_, response) = ui.allocate_exact_size(rest, Sense::click());
+            response.context_menu(|ui| {
+                if menu_item(ui, Icon::Plus, "New connection") {
+                    actions.push(Action::NewConnection);
+                }
+                if menu_item(ui, Icon::Folder, "New folder…") {
+                    actions.push(new_folder(""));
+                }
+            });
         });
+}
+
+fn new_folder(parent: &str) -> Action {
+    Action::AskRename(super::rename_flow::RenameTarget::NewFolder(
+        parent.to_owned(),
+    ))
+}
+
+/// The saved connections, filed in their folders.
+struct Tree<'a> {
+    profiles: &'a [ConnectionProfile],
+    folders: &'a [String],
+    scripts: &'a [SavedScript],
+    /// The filter box, lower case.
+    filter: String,
+}
+
+impl Tree<'_> {
+    /// Whether a connection shows while filtering: its name matches, or it
+    /// is online and may hold objects that do.
+    fn shown(&self, profile: &ConnectionProfile, explorer: &Explorer) -> bool {
+        self.filter.is_empty()
+            || matches_filter(&profile.display_name(), &self.filter)
+            || explorer.link(profile.id).is_online()
+    }
+
+    /// The connections in `folder` and the folders below it that show.
+    fn count(&self, folder: &str, explorer: &Explorer) -> usize {
+        let prefix = format!("{folder}/");
+        self.profiles
+            .iter()
+            .filter(|profile| profile.folder == folder || profile.folder.starts_with(&prefix))
+            .filter(|profile| self.shown(profile, explorer))
+            .count()
+    }
+
+    /// The folders in `parent`, then its connections, at `depth`.
+    fn contents(
+        &self,
+        ui: &mut Ui,
+        parent: &str,
+        depth: usize,
+        explorer: &mut Explorer,
+        actions: &mut Vec<Action>,
+    ) {
+        let filtering = !self.filter.is_empty();
+        for folder in self
+            .folders
+            .iter()
+            .filter(|folder| violet_app::parent_folder(folder) == parent)
+        {
+            let count = self.count(folder, explorer);
+            if filtering && count == 0 {
+                continue;
+            }
+            let key = NodeKey::ConnectionFolder(folder.clone());
+            let expanded = filtering || explorer.is_expanded(&key);
+            let name = folder.rsplit('/').next().unwrap_or(folder);
+            let detail = count.to_string();
+            let mut row = Row::new(
+                depth,
+                if expanded {
+                    Icon::FolderOpen
+                } else {
+                    Icon::Folder
+                },
+                name,
+            );
+            row.expanded = Some(expanded);
+            row.selected = explorer.selected.as_ref() == Some(&key);
+            row.detail = Some(&detail);
+            let response = row.show(ui).on_hover_text(folder);
+            if response.clicked() {
+                explorer.pick(key.clone());
+                explorer.toggle(key);
+            }
+            response.context_menu(|ui| {
+                if menu_item(ui, Icon::Folder, "New subfolder…") {
+                    actions.push(new_folder(folder));
+                }
+                if menu_item(ui, Icon::Pencil, "Rename…") {
+                    actions.push(Action::AskRename(super::rename_flow::RenameTarget::Folder(
+                        folder.clone(),
+                    )));
+                }
+                if menu_item(ui, Icon::Trash, "Delete") {
+                    actions.push(Action::DeleteFolder(folder.clone()));
+                }
+            });
+            if expanded {
+                self.contents(ui, folder, depth + 1, explorer, actions);
+            }
+        }
+        for profile in self
+            .profiles
+            .iter()
+            .filter(|profile| profile.folder == parent)
+        {
+            if !self.shown(profile, explorer) {
+                continue;
+            }
+            // The connection's own rows count depth from 0: the frame
+            // shifts them under their folder.
+            let indent = (depth as f32 * INDENT).min(f32::from(i8::MAX)) as i8;
+            egui::Frame::new()
+                .inner_margin(egui::Margin {
+                    left: indent,
+                    ..egui::Margin::ZERO
+                })
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    connection(ui, profile, self.folders, self.scripts, explorer, actions);
+                });
+        }
+    }
 }
 
 fn connection(
     ui: &mut Ui,
     profile: &ConnectionProfile,
+    all_folders: &[String],
     scripts: &[SavedScript],
     explorer: &mut Explorer,
     actions: &mut Vec<Action>,
@@ -360,6 +494,22 @@ fn connection(
         if menu_item(ui, Icon::Copy, "Duplicate") {
             actions.push(Action::DuplicateConnection(id));
         }
+        ui.menu_button("Move to folder", |ui| {
+            if !profile.folder.is_empty() && menu_item(ui, Icon::Database, "(root)") {
+                actions.push(Action::MoveToFolder(id, String::new()));
+            }
+            for folder in all_folders
+                .iter()
+                .filter(|folder| **folder != profile.folder)
+            {
+                if menu_item(ui, Icon::Folder, folder) {
+                    actions.push(Action::MoveToFolder(id, folder.clone()));
+                }
+            }
+            if menu_item(ui, Icon::Plus, "New folder…") {
+                actions.push(new_folder(""));
+            }
+        });
         if menu_item(ui, Icon::Trash, "Delete…") {
             actions.push(Action::AskDeleteConnection(id));
         }

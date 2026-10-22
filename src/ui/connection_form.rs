@@ -163,6 +163,7 @@ pub fn show(
     ctx: &egui::Context,
     form: &mut ConnectionForm,
     drivers: &[DriverChoice],
+    folders: &[String],
     actions: &mut Vec<Action>,
 ) -> bool {
     let chosen = drivers
@@ -436,6 +437,38 @@ pub fn show(
                         }
                     });
                 });
+                if !folders.is_empty() {
+                    ui.add_space(16.0);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 5.0;
+                        ui.label(
+                            RichText::new("Folder")
+                                .font(theme::medium(12.0))
+                                .color(palette.secondary),
+                        );
+                        let shown = if form.profile.folder.is_empty() {
+                            "(root)"
+                        } else {
+                            form.profile.folder.as_str()
+                        };
+                        egui::ComboBox::from_id_salt("connection-folder")
+                            .selected_text(shown.to_owned())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut form.profile.folder,
+                                    String::new(),
+                                    "(root)",
+                                );
+                                for folder in folders {
+                                    ui.selectable_value(
+                                        &mut form.profile.folder,
+                                        folder.clone(),
+                                        folder,
+                                    );
+                                }
+                            });
+                    });
+                }
             });
             if form.profile.ssl == SslMode::Disable && tls && !is_loopback(&form.profile.host) {
                 notice(

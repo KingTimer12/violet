@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use violet_core::ports::ProfileRepository;
+use violet_core::ports::{ProfileRepository, SavedProfiles};
 use violet_core::{ConnectionProfile, DbError, ErrorKind, Result};
 
 /// A value stored as one JSON file.
@@ -96,6 +96,8 @@ pub(crate) fn storage_error(message: impl Into<String>) -> DbError {
 struct ProfilesFile {
     version: u32,
     connections: Vec<ConnectionProfile>,
+    #[serde(default)]
+    folders: Vec<String>,
 }
 
 /// Saved connections in `connections.json`.
@@ -109,6 +111,7 @@ impl std::fmt::Debug for ProfilesFile {
         f.debug_struct("ProfilesFile")
             .field("version", &self.version)
             .field("connections", &self.connections.len())
+            .field("folders", &self.folders.len())
             .finish()
     }
 }
@@ -122,18 +125,22 @@ impl JsonProfileRepository {
 }
 
 impl ProfileRepository for JsonProfileRepository {
-    fn load(&self) -> Result<Vec<ConnectionProfile>> {
+    fn load(&self) -> Result<SavedProfiles> {
         Ok(self
             .file
             .read()?
-            .map(|file| file.connections)
+            .map(|file| SavedProfiles {
+                connections: file.connections,
+                folders: file.folders,
+            })
             .unwrap_or_default())
     }
 
-    fn save(&self, profiles: &[ConnectionProfile]) -> Result<()> {
+    fn save(&self, profiles: &SavedProfiles) -> Result<()> {
         self.file.write(&ProfilesFile {
             version: 1,
-            connections: profiles.to_vec(),
+            connections: profiles.connections.clone(),
+            folders: profiles.folders.clone(),
         })
     }
 }
@@ -147,16 +154,19 @@ mod tests {
     fn profiles_round_trip_and_hold_no_password() {
         let directory = tempfile::tempdir().expect("temp dir");
         let repository = JsonProfileRepository::new(directory.path().join("c/connections.json"));
-        assert!(repository.load().expect("empty").is_empty());
+        assert_eq!(repository.load().expect("empty"), SavedProfiles::default());
 
         let mut profile = ConnectionProfile::new(DriverId::new("postgres"), 5432);
         profile.name = "Local".to_owned();
         profile.username = "app".to_owned();
-        repository
-            .save(std::slice::from_ref(&profile))
-            .expect("save");
+        profile.folder = "Prod/Clients".to_owned();
+        let saved = SavedProfiles {
+            connections: vec![profile],
+            folders: vec!["Prod/Clients".to_owned(), "Empty".to_owned()],
+        };
+        repository.save(&saved).expect("save");
 
-        assert_eq!(repository.load().expect("load"), vec![profile]);
+        assert_eq!(repository.load().expect("load"), saved);
         let text = fs::read_to_string(directory.path().join("c/connections.json")).expect("read");
         assert!(!text.contains("\"password\""));
     }
@@ -167,9 +177,31 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let directory = tempfile::tempdir().expect("temp dir");
         let path = directory.path().join("connections.json");
-        JsonProfileRepository::new(&path).save(&[]).expect("save");
+        JsonProfileRepository::new(&path)
+            .save(&SavedProfiles::default())
+            .expect("save");
         let mode = fs::metadata(&path).expect("metadata").permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn a_file_from_before_folders_loads() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("connections.json");
+        let id = violet_core::ConnectionId::new();
+        fs::write(
+            &path,
+            format!(
+                r#"{{"version":1,"connections":[{{"id":"{}","name":"Old","driver":"postgres","host":"localhost","port":5432,"database":"app","username":"app"}}]}}"#,
+                id.0
+            ),
+        )
+        .expect("write");
+        let saved = JsonProfileRepository::new(&path).load().expect("load");
+        assert!(saved.folders.is_empty());
+        assert_eq!(saved.connections.len(), 1);
+        assert_eq!(saved.connections[0].folder, "");
+        assert_eq!(saved.connections[0].name, "Old");
     }
 
     #[test]

@@ -41,10 +41,18 @@ pub trait QueryHistory: Send + Sync + 'static {
     fn clear(&self) -> Result<()>;
 }
 
+/// Saved connections and the folders they are filed in.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SavedProfiles {
+    pub connections: Vec<ConnectionProfile>,
+    /// Folders as `/`-separated paths, kept so empty ones survive.
+    pub folders: Vec<String>,
+}
+
 /// Where saved connections live.
 pub trait ProfileRepository: Send + Sync + 'static {
-    fn load(&self) -> Result<Vec<ConnectionProfile>>;
-    fn save(&self, profiles: &[ConnectionProfile]) -> Result<()>;
+    fn load(&self) -> Result<SavedProfiles>;
+    fn save(&self, profiles: &SavedProfiles) -> Result<()>;
 }
 
 /// Where passwords live. Never the profiles file.

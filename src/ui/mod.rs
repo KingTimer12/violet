@@ -484,7 +484,7 @@ impl VioletApp {
                 | NodeKey::Object(id, _, _),
             ) => Some(id),
             Some(NodeKey::Folder(id, _)) => Some(id),
-            Some(NodeKey::Scripts(_)) | None => None,
+            Some(NodeKey::Scripts(_) | NodeKey::ConnectionFolder(_)) | None => None,
         };
         let Some(session) = session else {
             return;
@@ -1759,6 +1759,22 @@ impl VioletApp {
                     ),
                 }
             }
+            Action::MoveToFolder(id, folder) => {
+                if let Err(error) = self.profiles.move_to_folder(id, &folder) {
+                    self.toasts.push(
+                        ctx,
+                        Toast::error("Could not move the connection", error.to_string()),
+                    );
+                }
+            }
+            Action::DeleteFolder(folder) => {
+                if let Err(error) = self.profiles.delete_folder(&folder) {
+                    self.toasts.push(
+                        ctx,
+                        Toast::error("Could not delete the folder", error.to_string()),
+                    );
+                }
+            }
             Action::Connect(id) => self.connect(id, None),
             Action::ConnectWithPassword(id, password) => self.connect(id, Some(password)),
             Action::Disconnect(id) => self.disconnect_asking(id),
@@ -2055,6 +2071,15 @@ impl VioletApp {
             )
         });
         let id = match &node {
+            NodeKey::ConnectionFolder(path) => {
+                if rename {
+                    self.actions
+                        .push(Action::AskRename(rename_flow::RenameTarget::Folder(
+                            path.clone(),
+                        )));
+                }
+                return true;
+            }
             NodeKey::Connection(id)
             | NodeKey::Database(id, _)
             | NodeKey::Scripts(id)
@@ -2085,7 +2110,7 @@ impl VioletApp {
                 | NodeKey::Object(id, schema, _) => Some(Action::LoadObjects(*id, schema.clone())),
                 NodeKey::Folder(id, state::Folder::Schemas) => Some(Action::Refresh(*id)),
                 NodeKey::Folder(id, folder) => Some(Action::LoadFolder(*id, *folder)),
-                NodeKey::Scripts(_) => None,
+                NodeKey::Scripts(_) | NodeKey::ConnectionFolder(_) => None,
             };
             self.actions.extend(action);
         }
@@ -2447,7 +2472,8 @@ impl VioletApp {
     fn modals(&mut self, ctx: &egui::Context) {
         if let Some(form) = &mut self.form {
             let drivers = self.providers.choices(self.backend.registry().infos());
-            if !connection_form::show(ctx, form, &drivers, &mut self.actions) {
+            let folders = self.profiles.folders();
+            if !connection_form::show(ctx, form, &drivers, &folders, &mut self.actions) {
                 self.form = None;
             }
         }
@@ -2670,6 +2696,7 @@ impl eframe::App for VioletApp {
                 sidebar::show(
                     ui,
                     self.profiles.all(),
+                    &self.profiles.folders(),
                     &self.script_list,
                     &mut self.explorer,
                     &mut self.actions,
