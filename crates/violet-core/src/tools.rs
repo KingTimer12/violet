@@ -919,21 +919,30 @@ impl Task {
         {
             return Err(invalid("the command is too long or holds a NUL".into()));
         }
+        let mut stdin_from_path = template.stdin_from_path;
+        let mut stdin_lines = Vec::new();
+        if template.program == "psql" && !template.stdout_to_path {
+            // Providers built before Violet swapped lines pass the dump as --file.
+            let file = format!("--file={}", request.path);
+            if let Some(arg) = args.iter_mut().find(|arg| **arg == file) {
+                "--file=-".clone_into(arg);
+                stdin_from_path = true;
+            }
+            if stdin_from_path {
+                stdin_lines = PSQL_SWAPS
+                    .iter()
+                    .map(|&(from, to)| (from.to_owned(), to.to_owned()))
+                    .collect();
+            }
+        }
         Ok(ToolCommand {
             program: template.program.clone(),
             args,
             env,
             password_env: self.connection.password_env.clone(),
             stdout_to_path: template.stdout_to_path,
-            stdin_from_path: template.stdin_from_path,
-            stdin_lines: if template.program == "psql" && template.stdin_from_path {
-                PSQL_SWAPS
-                    .iter()
-                    .map(|&(from, to)| (from.to_owned(), to.to_owned()))
-                    .collect()
-            } else {
-                Vec::new()
-            },
+            stdin_from_path,
+            stdin_lines,
         })
     }
 

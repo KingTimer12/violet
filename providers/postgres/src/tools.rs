@@ -406,8 +406,7 @@ fn backup_command() -> Command {
     tls(tail(command))
 }
 
-/// Plain SQL runs in psql, without ~/.psqlrc. Through standard input, so
-/// Violet can swap lines older servers reject.
+/// Plain SQL runs in psql, without ~/.psqlrc.
 fn psql_command() -> Command {
     let command = Command::new("psql")
         .when(is("format", &["plain"]))
@@ -416,10 +415,8 @@ fn psql_command() -> Command {
         .flag("exit-on-error", true, "--set=ON_ERROR_STOP=1")
         .flag("single-transaction", true, "--single-transaction")
         .flag("verbose", true, "--echo-errors")
-        // --single-transaction needs --file, so standard input goes as `-`.
-        .arg([text("--file=-")])
-        .extra("extra")
-        .stdin_from_path();
+        .arg([text("--file="), path()])
+        .extra("extra");
     tls(command)
 }
 
