@@ -67,6 +67,8 @@ pub struct Settings {
     /// Keyboard shortcuts changed from their defaults, by command name:
     /// `"format": "Command+Alt+L"`.
     pub shortcuts: BTreeMap<String, String>,
+    /// Rows a paged result reads at a time.
+    pub fetch_size: u64,
 }
 
 impl Default for Settings {
@@ -87,6 +89,7 @@ impl Default for Settings {
             database_filters: BTreeMap::new(),
             shortcuts: BTreeMap::new(),
             updates: true,
+            fetch_size: violet_core::Page::SIZE,
         }
     }
 }
