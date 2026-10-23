@@ -1572,9 +1572,22 @@ impl VioletApp {
         if tab.running.is_some() || !self.backend.is_connected(connection) {
             return;
         }
+        let language = tab.connection.map_or(Language::Sql, |id| self.language(id));
+        // A refresh reads again; a statement that writes (`CREATE DATABASE`,
+        // `INSERT`, a Redis `SET`) runs again only from the editor.
+        let reads = match language {
+            Language::Sql => crate::sql::plan(&executed.sql).reads_only,
+            _ => options.cache != CachePolicy::Off,
+        };
+        if !reads {
+            self.toasts.push(
+                ctx,
+                Toast::info("Not run again: it changes data. Run it from the editor."),
+            );
+            return;
+        }
         // Changing every row again is asked for from the editor, not
         // repeated by a refresh.
-        let language = tab.connection.map_or(Language::Sql, |id| self.language(id));
         if !crate::lang::dangers(language, &executed.sql).is_empty() {
             self.toasts.push(
                 ctx,
