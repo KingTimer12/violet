@@ -31,6 +31,8 @@ pub enum RenameTarget {
         schema: String,
         name: String,
     },
+    /// Not a rename: the name of a database to create.
+    NewDatabase(ConnectionId),
 }
 
 pub struct RenamePrompt {
@@ -53,6 +55,7 @@ enum Renamed {
     Relation,
     Schema,
     Database,
+    Created,
 }
 
 impl VioletApp {
@@ -115,6 +118,16 @@ impl VioletApp {
                     return;
                 }
                 name.clone()
+            }
+            RenameTarget::NewDatabase(connection) => {
+                if !matches!(self.family(*connection), Family::Postgres | Family::MySql) {
+                    self.toasts.push(
+                        ctx,
+                        Toast::info("Violet creates databases on PostgreSQL and MySQL only"),
+                    );
+                    return;
+                }
+                String::new()
             }
         };
         self.rename_prompt = Some(RenamePrompt {
@@ -242,6 +255,35 @@ impl VioletApp {
                     },
                 );
             }
+            RenameTarget::NewDatabase(connection) => {
+                if !self.backend.is_connected(connection) {
+                    prompt.error = Some("Connect first.".into());
+                    return;
+                }
+                let name = match self.family(connection) {
+                    Family::MySql => format!("`{}`", to.replace('`', "``")),
+                    _ => format!("\"{}\"", to.replace('"', "\"\"")),
+                };
+                let request = self.backend.execute_in(
+                    connection,
+                    None,
+                    format!("CREATE DATABASE {name}"),
+                    ExecOptions {
+                        cache: CachePolicy::Off,
+                        page: None,
+                    },
+                );
+                self.rename_requests.insert(
+                    request,
+                    Pending {
+                        connection,
+                        schema: String::new(),
+                        from: String::new(),
+                        to,
+                        what: Renamed::Created,
+                    },
+                );
+            }
         }
         self.rename_prompt = None;
     }
@@ -347,13 +389,13 @@ impl VioletApp {
         result: &Result<QueryOutput>,
     ) {
         if let Err(error) = result {
-            self.toasts.push(
-                ctx,
-                Toast::error(
-                    format!("Could not rename {}", pending.from),
-                    error.message.clone(),
-                ),
-            );
+            let title = if pending.what == Renamed::Created {
+                format!("Could not create {}", pending.to)
+            } else {
+                format!("Could not rename {}", pending.from)
+            };
+            self.toasts
+                .push(ctx, Toast::error(title, error.message.clone()));
             return;
         }
         if pending.what == Renamed::Schema {
@@ -365,6 +407,12 @@ impl VioletApp {
                     view.schema = pending.to.clone();
                 }
             }
+        }
+        if pending.what == Renamed::Created {
+            self.toasts
+                .push(ctx, Toast::success(format!("Created {}", pending.to)));
+            self.actions.push(Action::Refresh(pending.connection));
+            return;
         }
         if pending.what != Renamed::Relation {
             self.toasts.push(
@@ -414,6 +462,14 @@ pub fn show(ctx: &egui::Context, prompt: &mut RenamePrompt, actions: &mut Vec<Ac
             "Rename",
             "Renamed on the server. Queries and views that use the old name stop working.",
         ),
+        RenameTarget::NewDatabase(_) => (
+            "New database",
+            "Created on the server with its default settings.",
+        ),
+    };
+    let (icon, verb) = match &prompt.target {
+        RenameTarget::NewDatabase(_) => (Icon::Plus, "Create"),
+        _ => (Icon::Pencil, "Rename"),
     };
     let modal = egui::Modal::new(egui::Id::new("rename-prompt"))
         .frame(
@@ -441,9 +497,7 @@ pub fn show(ctx: &egui::Context, prompt: &mut RenamePrompt, actions: &mut Vec<Ac
             }
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if widgets::button(ui, Tone::Primary, Some(Icon::Pencil), "Rename").clicked()
-                        || submit
-                    {
+                    if widgets::button(ui, Tone::Primary, Some(icon), verb).clicked() || submit {
                         actions.push(Action::RenameTo(prompt.text.clone()));
                     }
                     if widgets::button(ui, Tone::Ghost, None, "Cancel").clicked() {
