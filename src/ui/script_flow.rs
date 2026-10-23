@@ -14,7 +14,7 @@ use violet_storage::scripts;
 use super::VioletApp;
 use super::action::Action;
 use super::icons::Icon;
-use super::state::Link;
+use super::state::{Link, NodeKey};
 use super::theme::{self, Palette};
 use super::toasts::Toast;
 use super::widgets::{self, Tone};
@@ -242,6 +242,9 @@ impl VioletApp {
             }
             Action::OpenScript(path) => self.open_script(ctx, path),
             Action::MoveScript(path, folder) => self.move_script(ctx, &path, &folder),
+            Action::MoveScriptFolder(connection, database, folder, parent) => {
+                self.move_script_folder(ctx, connection, &database, &folder, &parent);
+            }
             _ => {}
         }
     }
@@ -281,6 +284,65 @@ impl VioletApp {
                 && file.path == path
             {
                 file.path.clone_from(&to);
+            }
+        }
+        self.reload_scripts(ctx);
+    }
+
+    /// Moves a script folder into `parent` of its database; editors open
+    /// on scripts in it follow.
+    fn move_script_folder(
+        &mut self,
+        ctx: &egui::Context,
+        connection: ConnectionId,
+        database: &str,
+        folder: &str,
+        parent: &str,
+    ) {
+        let Some(to) = violet_app::moved_folder(folder, parent) else {
+            return;
+        };
+        if self.scripts.folder_path(connection, database, &to).exists() {
+            self.toasts
+                .push(ctx, Toast::info("There is a folder with this name there"));
+            return;
+        }
+        let (from_dir, to_dir) = match self.scripts.move_folder(connection, database, folder, &to) {
+            Ok(moved) => moved,
+            Err(error) => {
+                self.toasts.push(
+                    ctx,
+                    Toast::error("Could not move the folder", error.to_string()),
+                );
+                return;
+            }
+        };
+        for tab in &mut self.workspace.tabs {
+            if let Some(file) = &mut tab.file
+                && let Ok(rest) = file.path.strip_prefix(&from_dir)
+            {
+                file.path = to_dir.join(rest);
+            }
+        }
+        let prefix = format!("{folder}/");
+        let moved: Vec<NodeKey> = self
+            .explorer
+            .expanded
+            .iter()
+            .filter(|key| {
+                matches!(key, NodeKey::ScriptFolder(id, db, path)
+                    if *id == connection && db == database
+                        && (path == folder || path.starts_with(&prefix)))
+            })
+            .cloned()
+            .collect();
+        for key in moved {
+            self.explorer.expanded.remove(&key);
+            if let NodeKey::ScriptFolder(id, db, path) = key {
+                let path = format!("{to}{}", &path[folder.len()..]);
+                self.explorer
+                    .expanded
+                    .insert(NodeKey::ScriptFolder(id, db, path));
             }
         }
         self.reload_scripts(ctx);

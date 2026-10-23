@@ -114,6 +114,27 @@ impl ScriptStore {
             .map_err(|error| storage_error(format!("Cannot create {}: {error}", path.display())))
     }
 
+    /// Moves `folder` of a database, with what it holds, to `to`; refuses
+    /// when `to` is taken. Returns the directories it moved from and to.
+    pub fn move_folder(
+        &self,
+        connection: ConnectionId,
+        database: &str,
+        folder: &str,
+        to: &str,
+    ) -> Result<(PathBuf, PathBuf)> {
+        let from = self.folder_path(connection, database, folder);
+        let target = self.folder_path(connection, database, to);
+        if target.exists() {
+            return Err(storage_error(format!(
+                "{} already exists",
+                target.display()
+            )));
+        }
+        rename(&from, &target)?;
+        Ok((from, target))
+    }
+
     /// The connection and database a file in the scripts folder belongs
     /// to; `None` for a file anywhere else.
     #[must_use]
@@ -384,6 +405,36 @@ mod tests {
         assert_eq!(script.folder, "");
         assert_eq!(read(&path)?, "SELECT 1;");
         assert_eq!(store.locate(Path::new("/elsewhere/x.sql")), None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_folder_moves_with_its_scripts() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(|error| storage_error(error.to_string()))?;
+        let store = ScriptStore::new(dir.path());
+        let connection = ConnectionId::new();
+        write(
+            &store.path_in(connection, "postgres", "a/b", "q", EXTENSION),
+            "SELECT 1;",
+        )?;
+        store.create_folder(connection, "postgres", "c")?;
+        store.create_folder(connection, "postgres", "taken/b")?;
+
+        assert!(
+            store
+                .move_folder(connection, "postgres", "a/b", "taken/b")
+                .is_err()
+        );
+        let (from, to) = store.move_folder(connection, "postgres", "a/b", "c/d/b")?;
+        assert!(!from.exists());
+        assert_eq!(to, store.folder_path(connection, "postgres", "c/d/b"));
+
+        let (scripts, folders) = store.list()?;
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(scripts[0].folder, "c/d/b");
+        assert_eq!(read(&scripts[0].path)?, "SELECT 1;");
+        let folders: Vec<&str> = folders.iter().map(|f| f.folder.as_str()).collect();
+        assert_eq!(folders, ["a", "c", "c/d", "c/d/b", "taken", "taken/b"]);
         Ok(())
     }
 

@@ -145,6 +145,9 @@ pub enum Action {
     /// Moves a saved script to a folder of its database; empty for the
     /// database's own.
     MoveScript(PathBuf, String),
+    /// Moves a script folder (connection, database, folder) into another
+    /// of its database; empty for the top level.
+    MoveScriptFolder(ConnectionId, String, String, String),
     /// Reads the shown result again, skipping the cache.
     RefreshTab(TabId),
     /// Applies a data tab's filter box.

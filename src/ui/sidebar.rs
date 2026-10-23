@@ -48,6 +48,11 @@ enum DragItem {
         name: String,
     },
     Folder(String),
+    ScriptFolder {
+        connection: ConnectionId,
+        database: String,
+        folder: String,
+    },
     Script {
         path: PathBuf,
         connection: ConnectionId,
@@ -61,7 +66,9 @@ impl DragItem {
     fn name(&self) -> &str {
         match self {
             Self::Connection { name, .. } | Self::Script { name, .. } => name,
-            Self::Folder(path) => path.rsplit('/').next().unwrap_or(path),
+            Self::Folder(path) | Self::ScriptFolder { folder: path, .. } => {
+                path.rsplit('/').next().unwrap_or(path)
+            }
         }
     }
 }
@@ -138,6 +145,21 @@ fn to_script_folder(
             && folder != target =>
         {
             Some(Action::MoveScript(path.clone(), target.to_owned()))
+        }
+        DragItem::ScriptFolder {
+            connection: from,
+            database: db,
+            folder,
+        } if *from == connection
+            && database.is_none_or(|database| database == db)
+            && violet_app::moved_folder(folder, target).is_some() =>
+        {
+            Some(Action::MoveScriptFolder(
+                connection,
+                db.clone(),
+                folder.clone(),
+                target.to_owned(),
+            ))
         }
         _ => None,
     }
@@ -908,7 +930,13 @@ impl ScriptLevel<'_> {
             );
             row.expanded = Some(expanded);
             row.detail = Some(&detail);
+            row.draggable = true;
             let response = row.show(ui);
+            response.dnd_set_drag_payload(DragItem::ScriptFolder {
+                connection: self.connection,
+                database: child.database.clone(),
+                folder: child.folder.clone(),
+            });
             drop_target(ui, &response, actions, |item| {
                 to_script_folder(item, self.connection, Some(&child.database), &child.folder)
             });

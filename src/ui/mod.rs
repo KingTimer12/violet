@@ -1915,7 +1915,8 @@ impl VioletApp {
             | Action::SaveScriptNamed(..)
             | Action::OpenScriptFile
             | Action::OpenScript(_)
-            | Action::MoveScript(..)) => self.script_action(ctx, action),
+            | Action::MoveScript(..)
+            | Action::MoveScriptFolder(..)) => self.script_action(ctx, action),
             action @ (Action::SwitchProject(_)
             | Action::AskDeleteProject(_)
             | Action::DeleteProject(_)) => self.project_action(ctx, action),
