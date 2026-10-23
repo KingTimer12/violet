@@ -138,6 +138,7 @@ pub struct VioletApp {
     chooser: Option<catalog_flow::Chooser>,
     key_dialog: Option<key_flow::KeyDialog>,
     rename_prompt: Option<rename_flow::RenamePrompt>,
+    drop_prompt: Option<rename_flow::DropPrompt>,
     rename_requests: HashMap<violet_app::RequestId, rename_flow::Pending>,
     /// Commands the tree ran on keys, waiting for their answer.
     key_requests: HashMap<violet_app::RequestId, key_flow::Pending>,
@@ -282,6 +283,7 @@ impl VioletApp {
             chooser: None,
             key_dialog: None,
             rename_prompt: None,
+            drop_prompt: None,
             rename_requests: HashMap::new(),
             key_requests: HashMap::new(),
             copy_choice: (crate::export::Format::Tsv, true),
@@ -1905,6 +1907,10 @@ impl VioletApp {
             }
             Action::AskRename(target) => self.ask_rename(ctx, target),
             Action::RenameTo(name) => self.rename(ctx, name),
+            Action::AskDropDatabase(connection, name) => {
+                self.ask_drop_database(ctx, connection, name);
+            }
+            Action::DropDatabase => self.drop_database(ctx),
             Action::SetAutoRefresh(id, every) => {
                 if let Some(tab) = self.workspace.get_mut(id) {
                     tab.auto_refresh = every.map(|every| (every, Instant::now() + every));
@@ -2193,7 +2199,8 @@ impl VioletApp {
             || self.task_dialog.is_some()
             || self.keys_dialog.is_some()
             || self.key_dialog.is_some()
-            || self.rename_prompt.is_some();
+            || self.rename_prompt.is_some()
+            || self.drop_prompt.is_some();
         if modal_open {
             return;
         }
@@ -2463,6 +2470,11 @@ impl VioletApp {
             && !rename_flow::show(ctx, prompt, &mut self.actions)
         {
             self.rename_prompt = None;
+        }
+        if let Some(prompt) = &mut self.drop_prompt
+            && !rename_flow::show_drop(ctx, prompt, &mut self.actions)
+        {
+            self.drop_prompt = None;
         }
         if let Some(chooser) = &mut self.chooser
             && !catalog_flow::show_chooser(ctx, chooser, &mut self.actions)

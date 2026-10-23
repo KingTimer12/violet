@@ -731,6 +731,12 @@ fn database_node(
         if menu_item(ui, Icon::Copy, "Copy name") {
             actions.push(Action::Copy(database.to_owned()));
         }
+        if matches!(family, Family::Postgres | Family::MySql)
+            && !own
+            && menu_item(ui, Icon::Trash, "Delete database…")
+        {
+            actions.push(Action::AskDropDatabase(parent, database.to_owned()));
+        }
     });
 
     if !expanded {
