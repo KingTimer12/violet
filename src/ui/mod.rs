@@ -1478,7 +1478,9 @@ impl VioletApp {
         let limit = if all {
             max_rows.saturating_sub(paging.loaded)
         } else {
-            self.settings.fetch_size.min(max_rows.saturating_sub(paging.loaded))
+            self.settings
+                .fetch_size
+                .min(max_rows.saturating_sub(paging.loaded))
         };
         if limit == 0 {
             return;
@@ -2346,7 +2348,15 @@ impl VioletApp {
             egui::CentralPanel::default()
                 .frame(Frame::NONE.fill(palette.window))
                 .show(ui, |ui| {
-                    results::show(ui, tab, &editing, &links.columns, reference, fetch_size, actions)
+                    results::show(
+                        ui,
+                        tab,
+                        &editing,
+                        &links.columns,
+                        reference,
+                        fetch_size,
+                        actions,
+                    )
                 });
             return;
         }
@@ -2367,7 +2377,15 @@ impl VioletApp {
                 // The panel remembers the height its contents take: they
                 // fill it, or it would shrink to a smaller result each run.
                 ui.set_min_height(ui.available_height());
-                results::show(ui, tab, &editing, &links.columns, reference, fetch_size, actions);
+                results::show(
+                    ui,
+                    tab,
+                    &editing,
+                    &links.columns,
+                    reference,
+                    fetch_size,
+                    actions,
+                );
             });
         self.layout.results = (total > 0.0).then(|| results.response.rect.height() / total);
 
