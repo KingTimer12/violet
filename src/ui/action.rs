@@ -35,6 +35,17 @@ pub enum Action {
     DuplicateConnection(ConnectionId),
     AskDeleteConnection(ConnectionId),
     DeleteConnection(ConnectionId),
+    /// Files a connection in a folder; empty for the top level.
+    MoveToFolder(ConnectionId, String),
+    /// Moves a connection folder, with what it holds, into another; empty
+    /// for the top level.
+    MoveFolder(String, String),
+    /// Deletes a connection folder, moving what it holds up a level.
+    DeleteFolder(String),
+    /// Opens a workspace; `None` for the default one.
+    SwitchProject(Option<String>),
+    AskDeleteProject(String),
+    DeleteProject(String),
     Connect(ConnectionId),
     /// Disconnects, asking first about an open transaction.
     Disconnect(ConnectionId),
@@ -131,6 +142,12 @@ pub enum Action {
     OpenScriptFile,
     /// Opens a script, on the database it was saved for.
     OpenScript(PathBuf),
+    /// Moves a saved script to a folder of its database; empty for the
+    /// database's own.
+    MoveScript(PathBuf, String),
+    /// Moves a script folder (connection, database, folder) into another
+    /// of its database; empty for the top level.
+    MoveScriptFolder(ConnectionId, String, String, String),
     /// Reads the shown result again, skipping the cache.
     RefreshTab(TabId),
     /// Applies a data tab's filter box.

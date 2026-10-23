@@ -14,7 +14,7 @@ use violet_storage::scripts;
 use super::VioletApp;
 use super::action::Action;
 use super::icons::Icon;
-use super::state::Link;
+use super::state::{Link, NodeKey};
 use super::theme::{self, Palette};
 use super::toasts::Toast;
 use super::widgets::{self, Tone};
@@ -171,7 +171,10 @@ impl VioletApp {
     /// Lists the saved scripts again.
     pub(super) fn reload_scripts(&mut self, ctx: &egui::Context) {
         match self.scripts.list() {
-            Ok(list) => self.script_list = list,
+            Ok((list, folders)) => {
+                self.script_list = list;
+                self.script_folders = folders;
+            }
             Err(error) => self.toasts.push(
                 ctx,
                 Toast::error("The saved scripts could not be listed", error.to_string()),
@@ -238,8 +241,124 @@ impl VioletApp {
                 }
             }
             Action::OpenScript(path) => self.open_script(ctx, path),
+            Action::MoveScript(path, folder) => self.move_script(ctx, &path, &folder),
+            Action::MoveScriptFolder(connection, database, folder, parent) => {
+                self.move_script_folder(ctx, connection, &database, &folder, &parent);
+            }
             _ => {}
         }
+    }
+
+    /// Moves a script of the scripts folder to another folder of its
+    /// database; an editor open on it follows.
+    fn move_script(&mut self, ctx: &egui::Context, path: &Path, folder: &str) {
+        let Some(saved) = self.scripts.locate(path) else {
+            return;
+        };
+        let Some(file_name) = path.file_name() else {
+            return;
+        };
+        let to = self
+            .scripts
+            .folder_path(saved.connection, &saved.database, folder)
+            .join(file_name);
+        if to.exists() {
+            self.toasts.push(
+                ctx,
+                Toast::error(
+                    "Could not move the script",
+                    format!("That folder already has a script named {}.", saved.name),
+                ),
+            );
+            return;
+        }
+        if let Err(error) = scripts::rename(path, &to) {
+            self.toasts.push(
+                ctx,
+                Toast::error("Could not move the script", error.to_string()),
+            );
+            return;
+        }
+        for tab in &mut self.workspace.tabs {
+            if let Some(file) = &mut tab.file
+                && file.path == path
+            {
+                file.path.clone_from(&to);
+            }
+        }
+        self.reload_scripts(ctx);
+    }
+
+    /// Moves a script folder into `parent` of its database; editors open
+    /// on scripts in it follow.
+    fn move_script_folder(
+        &mut self,
+        ctx: &egui::Context,
+        connection: ConnectionId,
+        database: &str,
+        folder: &str,
+        parent: &str,
+    ) {
+        let Some(to) = violet_app::moved_folder(folder, parent) else {
+            return;
+        };
+        if self.scripts.folder_path(connection, database, &to).exists() {
+            self.toasts
+                .push(ctx, Toast::info("There is a folder with this name there"));
+            return;
+        }
+        let (from_dir, to_dir) = match self.scripts.move_folder(connection, database, folder, &to) {
+            Ok(moved) => moved,
+            Err(error) => {
+                self.toasts.push(
+                    ctx,
+                    Toast::error("Could not move the folder", error.to_string()),
+                );
+                return;
+            }
+        };
+        for tab in &mut self.workspace.tabs {
+            if let Some(file) = &mut tab.file
+                && let Ok(rest) = file.path.strip_prefix(&from_dir)
+            {
+                file.path = to_dir.join(rest);
+            }
+        }
+        let prefix = format!("{folder}/");
+        let moved: Vec<NodeKey> = self
+            .explorer
+            .expanded
+            .iter()
+            .filter(|key| {
+                matches!(key, NodeKey::ScriptFolder(id, db, path)
+                    if *id == connection && db == database
+                        && (path == folder || path.starts_with(&prefix)))
+            })
+            .cloned()
+            .collect();
+        for key in moved {
+            self.explorer.expanded.remove(&key);
+            if let NodeKey::ScriptFolder(id, db, path) = key {
+                let path = format!("{to}{}", &path[folder.len()..]);
+                self.explorer
+                    .expanded
+                    .insert(NodeKey::ScriptFolder(id, db, path));
+            }
+        }
+        self.reload_scripts(ctx);
+    }
+
+    /// Makes a folder of scripts below `parent` of a database.
+    pub(super) fn create_script_folder(
+        &mut self,
+        ctx: &egui::Context,
+        connection: ConnectionId,
+        database: &str,
+        folder: &str,
+    ) -> violet_core::Result<()> {
+        self.scripts.create_folder(connection, database, folder)?;
+        self.reload_scripts(ctx);
+        Ok(())
     }
 
     fn save_script(&mut self, ctx: &egui::Context, tab_id: TabId) {
@@ -266,9 +385,13 @@ impl VioletApp {
                             .and_then(|e| e.to_str())
                             .unwrap_or(scripts::EXTENSION)
                             .to_owned();
-                        let moved =
-                            self.scripts
-                                .path_for(connection, &database, &saved.name, &extension);
+                        let moved = self.scripts.path_in(
+                            connection,
+                            &database,
+                            &saved.folder,
+                            &saved.name,
+                            &extension,
+                        );
                         if moved.exists() {
                             self.toasts.push(
                                 ctx,

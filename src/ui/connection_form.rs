@@ -163,6 +163,7 @@ pub fn show(
     ctx: &egui::Context,
     form: &mut ConnectionForm,
     drivers: &[DriverChoice],
+    folders: &[String],
     actions: &mut Vec<Action>,
 ) -> bool {
     let chosen = drivers
@@ -436,6 +437,38 @@ pub fn show(
                         }
                     });
                 });
+                if !folders.is_empty() {
+                    ui.add_space(16.0);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 5.0;
+                        ui.label(
+                            RichText::new("Folder")
+                                .font(theme::medium(12.0))
+                                .color(palette.secondary),
+                        );
+                        let shown = if form.profile.folder.is_empty() {
+                            "(root)"
+                        } else {
+                            form.profile.folder.as_str()
+                        };
+                        egui::ComboBox::from_id_salt("connection-folder")
+                            .selected_text(shown.to_owned())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut form.profile.folder,
+                                    String::new(),
+                                    "(root)",
+                                );
+                                for folder in folders {
+                                    ui.selectable_value(
+                                        &mut form.profile.folder,
+                                        folder.clone(),
+                                        folder,
+                                    );
+                                }
+                            });
+                    });
+                }
             });
             if form.profile.ssl == SslMode::Disable && tls && !is_loopback(&form.profile.host) {
                 notice(
@@ -728,6 +761,17 @@ pub fn show_prompt(
 /// Asks before deleting a connection. Returns `Some(true)` to delete,
 /// `Some(false)` to cancel, `None` while open.
 pub fn confirm_delete(ctx: &egui::Context, name: &str) -> Option<bool> {
+    confirm(
+        ctx,
+        "Delete connection?",
+        &format!(
+            "\u{201C}{name}\u{201D} and its saved password will be removed. The database itself is not touched."
+        ),
+    )
+}
+
+/// Asks before deleting something: `Some(true)` once confirmed.
+pub fn confirm(ctx: &egui::Context, title: &str, body: &str) -> Option<bool> {
     let palette = Palette::current(ctx);
     let mut answer = None;
     let modal = egui::Modal::new(egui::Id::new("confirm-delete"))
@@ -741,16 +785,12 @@ pub fn confirm_delete(ctx: &egui::Context, name: &str) -> Option<bool> {
         .show(ctx, |ui| {
             ui.set_width(380.0);
             ui.spacing_mut().item_spacing.y = 12.0;
-            ui.label(RichText::new("Delete connection?").font(theme::semibold(16.0)).color(palette.text));
-            ui.add(
-                egui::Label::new(
-                    RichText::new(format!(
-                        "\u{201C}{name}\u{201D} and its saved password will be removed. The database itself is not touched."
-                    ))
-                    .color(palette.secondary),
-                )
-                .wrap(),
+            ui.label(
+                RichText::new(title)
+                    .font(theme::semibold(16.0))
+                    .color(palette.text),
             );
+            ui.add(egui::Label::new(RichText::new(body).color(palette.secondary)).wrap());
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if widgets::button(ui, Tone::Danger, Some(Icon::Trash), "Delete").clicked() {

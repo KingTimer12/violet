@@ -19,6 +19,7 @@ mod history;
 pub mod icons;
 mod key_flow;
 mod keys_flow;
+mod project_flow;
 mod providers;
 mod reference;
 mod rename_flow;
@@ -47,7 +48,7 @@ use egui::{Frame, Id, Panel, Stroke};
 use violet_app::{Backend, CachePolicy, Event, ExecOptions, ProfileService, TaskId};
 use violet_core::ports::{HistoryEntry, QueryHistory};
 use violet_core::{ConnectionId, ConnectionProfile, DriverId, ErrorKind, Language, Page};
-use violet_storage::{JsonFile, SavedScript, ScriptStore};
+use violet_storage::{JsonFile, SavedScript, ScriptFolder, ScriptStore};
 
 use crate::completion::{self, Need};
 use crate::settings::Settings;
@@ -87,6 +88,8 @@ pub struct Services {
     /// The editors open last time.
     pub session: JsonFile<SavedSession>,
     pub scripts: ScriptStore,
+    /// Where each workspace keeps its files.
+    pub dirs: violet_storage::AppDirs,
     /// The update worker; `None` when updates are off.
     pub updates: Option<crate::update::Updates>,
     /// Set when this launch is a just-installed update, to confirm once
@@ -109,6 +112,8 @@ pub struct VioletApp {
     scripts: ScriptStore,
     /// The scripts saved for connections, as last listed.
     script_list: Vec<SavedScript>,
+    /// The folders below databases' scripts, as last listed.
+    script_folders: Vec<ScriptFolder>,
     script_prompt: Option<script_flow::ScriptPrompt>,
     /// Asks about unsaved scripts before their tabs close.
     close_confirm: Option<script_flow::CloseConfirm>,
@@ -147,6 +152,9 @@ pub struct VioletApp {
     /// The format and header choice advanced copy starts with.
     copy_choice: (crate::export::Format, bool),
     confirm_delete: Option<ConnectionId>,
+    /// A workspace waiting for the user to confirm its deletion.
+    confirm_project_delete: Option<String>,
+    dirs: violet_storage::AppDirs,
     /// A connection string typed on the welcome screen.
     welcome_uri: String,
     /// Runs waiting for their tab's connection to open.
@@ -263,6 +271,7 @@ impl VioletApp {
             prompt: None,
             scripts: services.scripts,
             script_list: Vec::new(),
+            script_folders: Vec::new(),
             script_prompt: None,
             close_confirm: None,
             quitting: false,
@@ -288,6 +297,8 @@ impl VioletApp {
             key_requests: HashMap::new(),
             copy_choice: (crate::export::Format::Tsv, true),
             confirm_delete: None,
+            confirm_project_delete: None,
+            dirs: services.dirs,
             welcome_uri: String::new(),
             queued: Vec::new(),
             actions: Vec::new(),
@@ -484,7 +495,10 @@ impl VioletApp {
                 | NodeKey::Object(id, _, _),
             ) => Some(id),
             Some(NodeKey::Folder(id, _)) => Some(id),
-            Some(NodeKey::Scripts(_)) | None => None,
+            Some(
+                NodeKey::Scripts(_) | NodeKey::ScriptFolder(..) | NodeKey::ConnectionFolder(_),
+            )
+            | None => None,
         };
         let Some(session) = session else {
             return;
@@ -1759,6 +1773,38 @@ impl VioletApp {
                     ),
                 }
             }
+            Action::MoveToFolder(id, folder) => {
+                if let Err(error) = self.profiles.move_to_folder(id, &folder) {
+                    self.toasts.push(
+                        ctx,
+                        Toast::error("Could not move the connection", error.to_string()),
+                    );
+                }
+            }
+            Action::MoveFolder(folder, parent) => {
+                let to = violet_app::moved_folder(&folder, &parent);
+                if let Some(to) = &to
+                    && self.profiles.folders().contains(to)
+                {
+                    self.toasts
+                        .push(ctx, Toast::info("There is a folder with this name there"));
+                } else if let Some(to) = to
+                    && let Err(error) = self.profiles.rename_folder(&folder, &to)
+                {
+                    self.toasts.push(
+                        ctx,
+                        Toast::error("Could not move the folder", error.to_string()),
+                    );
+                }
+            }
+            Action::DeleteFolder(folder) => {
+                if let Err(error) = self.profiles.delete_folder(&folder) {
+                    self.toasts.push(
+                        ctx,
+                        Toast::error("Could not delete the folder", error.to_string()),
+                    );
+                }
+            }
             Action::Connect(id) => self.connect(id, None),
             Action::ConnectWithPassword(id, password) => self.connect(id, Some(password)),
             Action::Disconnect(id) => self.disconnect_asking(id),
@@ -1868,7 +1914,12 @@ impl VioletApp {
             | Action::SaveScriptAs(_)
             | Action::SaveScriptNamed(..)
             | Action::OpenScriptFile
-            | Action::OpenScript(_)) => self.script_action(ctx, action),
+            | Action::OpenScript(_)
+            | Action::MoveScript(..)
+            | Action::MoveScriptFolder(..)) => self.script_action(ctx, action),
+            action @ (Action::SwitchProject(_)
+            | Action::AskDeleteProject(_)
+            | Action::DeleteProject(_)) => self.project_action(ctx, action),
             Action::RefreshTab(tab) => self.refresh(ctx, tab),
             Action::ApplyFilter(tab) => self.run_data(ctx, tab, CachePolicy::Use),
             Action::ClearFilter(tab) => {
@@ -2055,9 +2106,19 @@ impl VioletApp {
             )
         });
         let id = match &node {
+            NodeKey::ConnectionFolder(path) => {
+                if rename {
+                    self.actions
+                        .push(Action::AskRename(rename_flow::RenameTarget::Folder(
+                            path.clone(),
+                        )));
+                }
+                return true;
+            }
             NodeKey::Connection(id)
             | NodeKey::Database(id, _)
             | NodeKey::Scripts(id)
+            | NodeKey::ScriptFolder(id, ..)
             | NodeKey::Schema(id, _)
             | NodeKey::Group(id, ..)
             | NodeKey::Object(id, ..)
@@ -2085,7 +2146,9 @@ impl VioletApp {
                 | NodeKey::Object(id, schema, _) => Some(Action::LoadObjects(*id, schema.clone())),
                 NodeKey::Folder(id, state::Folder::Schemas) => Some(Action::Refresh(*id)),
                 NodeKey::Folder(id, folder) => Some(Action::LoadFolder(*id, *folder)),
-                NodeKey::Scripts(_) => None,
+                NodeKey::Scripts(_) | NodeKey::ScriptFolder(..) | NodeKey::ConnectionFolder(_) => {
+                    None
+                }
             };
             self.actions.extend(action);
         }
@@ -2203,6 +2266,7 @@ impl VioletApp {
             || self.edit_review.is_some()
             || self.run_review.is_some()
             || self.confirm_delete.is_some()
+            || self.confirm_project_delete.is_some()
             || self.close_confirm.is_some()
             || self.tx_confirm.is_some()
             || self.history_view.is_some()
@@ -2447,7 +2511,8 @@ impl VioletApp {
     fn modals(&mut self, ctx: &egui::Context) {
         if let Some(form) = &mut self.form {
             let drivers = self.providers.choices(self.backend.registry().infos());
-            if !connection_form::show(ctx, form, &drivers, &mut self.actions) {
+            let folders = self.profiles.folders();
+            if !connection_form::show(ctx, form, &drivers, &folders, &mut self.actions) {
                 self.form = None;
             }
         }
@@ -2546,6 +2611,29 @@ impl VioletApp {
         {
             self.answer_transactions(ctx, confirm, answer);
         }
+        if let Some(id) = self.confirm_project_delete.clone() {
+            let name = self
+                .settings
+                .projects
+                .iter()
+                .find(|project| project.id == id)
+                .map_or_else(String::new, |project| project.name.clone());
+            match connection_form::confirm(
+                ctx,
+                "Delete workspace?",
+                &format!(
+                    "\u{201C}{name}\u{201D}, its connections, their saved passwords and its \
+                     scripts will be removed. The databases themselves are not touched."
+                ),
+            ) {
+                Some(true) => {
+                    self.actions.push(Action::DeleteProject(id));
+                    self.confirm_project_delete = None;
+                }
+                Some(false) => self.confirm_project_delete = None,
+                None => {}
+            }
+        }
         if let Some(id) = self.confirm_delete {
             let name = self.profile_name(id);
             match connection_form::confirm_delete(ctx, &name) {
@@ -2632,6 +2720,7 @@ impl eframe::App for VioletApp {
                 chrome::title_bar(
                     ui,
                     &title,
+                    &self.settings,
                     self.settings.theme.into(),
                     &update,
                     &mut self.actions,
@@ -2670,7 +2759,9 @@ impl eframe::App for VioletApp {
                 sidebar::show(
                     ui,
                     self.profiles.all(),
+                    &self.profiles.folders(),
                     &self.script_list,
+                    &self.script_folders,
                     &mut self.explorer,
                     &mut self.actions,
                 );

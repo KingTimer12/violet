@@ -136,6 +136,10 @@ pub struct ConnectionProfile {
     /// Driver specific settings the generic form does not cover.
     #[serde(default)]
     pub options: BTreeMap<String, String>,
+    /// The folder the tree files it in, as `Prod/Clients`; empty for the
+    /// top level.
+    #[serde(default)]
+    pub folder: String,
 }
 
 impl ConnectionProfile {
@@ -159,6 +163,7 @@ impl ConnectionProfile {
             color: None,
             show_all_databases: false,
             options: BTreeMap::new(),
+            folder: String::new(),
         }
     }
 

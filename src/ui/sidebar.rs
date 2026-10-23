@@ -1,11 +1,13 @@
 //! The connections tree: connections, schemas, object groups, objects and
 //! columns, loaded as they are expanded.
 
-use egui::{Align2, Color32, CornerRadius, Response, Sense, Ui, Vec2};
+use std::path::PathBuf;
+
+use egui::{Align2, Color32, CornerRadius, CursorIcon, DragAndDrop, Response, Sense, Ui, Vec2};
 use violet_core::{
     ConnectionId, ConnectionProfile, DbObject, Language, ObjectKind, ObjectRef, TaskKind,
 };
-use violet_storage::SavedScript;
+use violet_storage::{SavedScript, ScriptFolder};
 
 use super::action::Action;
 use super::catalog_flow;
@@ -33,6 +35,165 @@ struct Row<'a> {
     /// A dot before the icon, for connection status.
     status: Option<Color32>,
     strong: bool,
+    /// Whether the row can be dragged onto another.
+    draggable: bool,
+}
+
+/// What is being dragged across the tree.
+#[derive(Clone)]
+enum DragItem {
+    Connection {
+        id: ConnectionId,
+        folder: String,
+        name: String,
+    },
+    Folder(String),
+    ScriptFolder {
+        connection: ConnectionId,
+        database: String,
+        folder: String,
+    },
+    Script {
+        path: PathBuf,
+        connection: ConnectionId,
+        database: String,
+        folder: String,
+        name: String,
+    },
+}
+
+impl DragItem {
+    fn name(&self) -> &str {
+        match self {
+            Self::Connection { name, .. } | Self::Script { name, .. } => name,
+            Self::Folder(path) | Self::ScriptFolder { folder: path, .. } => {
+                path.rsplit('/').next().unwrap_or(path)
+            }
+        }
+    }
+}
+
+/// Highlights the row while something `accept` has an action for hovers
+/// it, and pushes that action when it is dropped there.
+fn drop_target(
+    ui: &Ui,
+    response: &Response,
+    actions: &mut Vec<Action>,
+    accept: impl Fn(&DragItem) -> Option<Action>,
+) {
+    let Some(item) = response.dnd_hover_payload::<DragItem>() else {
+        return;
+    };
+    if accept(&item).is_none() {
+        return;
+    }
+    let palette = Palette::current(ui.ctx());
+    ui.painter().rect_stroke(
+        response.rect.shrink2(Vec2::new(6.0, 1.0)),
+        CornerRadius::same(6),
+        egui::Stroke::new(1.5, palette.accent),
+        egui::StrokeKind::Inside,
+    );
+    if let Some(item) = response.dnd_release_payload::<DragItem>()
+        && let Some(action) = accept(&item)
+    {
+        actions.push(action);
+    }
+}
+
+/// Moves to the top level what may go there.
+fn to_root(item: &DragItem) -> Option<Action> {
+    match item {
+        DragItem::Connection { id, folder, .. } if !folder.is_empty() => {
+            Some(Action::MoveToFolder(*id, String::new()))
+        }
+        DragItem::Folder(path) => violet_app::moved_folder(path, "")
+            .map(|_| Action::MoveFolder(path.clone(), String::new())),
+        _ => None,
+    }
+}
+
+/// Moves into connection folder `target` what may go there.
+fn to_folder(item: &DragItem, target: &str) -> Option<Action> {
+    match item {
+        DragItem::Connection { id, folder, .. } if folder != target => {
+            Some(Action::MoveToFolder(*id, target.to_owned()))
+        }
+        DragItem::Folder(path) => violet_app::moved_folder(path, target)
+            .map(|_| Action::MoveFolder(path.clone(), target.to_owned())),
+        _ => None,
+    }
+}
+
+/// Moves into script folder `target` of `database` (any, at the top level)
+/// what may go there: a script never leaves its database.
+fn to_script_folder(
+    item: &DragItem,
+    connection: ConnectionId,
+    database: Option<&str>,
+    target: &str,
+) -> Option<Action> {
+    match item {
+        DragItem::Script {
+            path,
+            connection: from,
+            database: db,
+            folder,
+            ..
+        } if *from == connection
+            && database.is_none_or(|database| database == db)
+            && folder != target =>
+        {
+            Some(Action::MoveScript(path.clone(), target.to_owned()))
+        }
+        DragItem::ScriptFolder {
+            connection: from,
+            database: db,
+            folder,
+        } if *from == connection
+            && database.is_none_or(|database| database == db)
+            && violet_app::moved_folder(folder, target).is_some() =>
+        {
+            Some(Action::MoveScriptFolder(
+                connection,
+                db.clone(),
+                folder.clone(),
+                target.to_owned(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Follows the pointer with the dragged item's name.
+fn drag_preview(ui: &Ui) {
+    let Some(item) = DragAndDrop::payload::<DragItem>(ui.ctx()) else {
+        return;
+    };
+    let Some(pointer) = ui.ctx().pointer_latest_pos() else {
+        return;
+    };
+    ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+    let palette = Palette::current(ui.ctx());
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(
+        egui::Order::Tooltip,
+        egui::Id::new("sidebar-drag"),
+    ));
+    let galley = painter.layout_no_wrap(
+        item.name().to_owned(),
+        egui::FontId::proportional(13.0),
+        palette.text,
+    );
+    let rect = egui::Rect::from_min_size(pointer + Vec2::new(14.0, 6.0), galley.size())
+        .expand2(Vec2::new(8.0, 4.0));
+    painter.rect_filled(rect, CornerRadius::same(6), palette.surface);
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(6),
+        egui::Stroke::new(1.0, palette.accent),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley(rect.min + Vec2::new(8.0, 4.0), galley, palette.text);
 }
 
 impl<'a> Row<'a> {
@@ -48,6 +209,7 @@ impl<'a> Row<'a> {
             loading: false,
             status: None,
             strong: false,
+            draggable: false,
         }
     }
 
@@ -60,8 +222,13 @@ impl<'a> Row<'a> {
     /// anywhere else.
     fn show_with_toggle(self, ui: &mut Ui) -> (Response, bool) {
         let palette = Palette::current(ui.ctx());
+        let sense = if self.draggable {
+            Sense::click_and_drag()
+        } else {
+            Sense::click()
+        };
         let (rect, response) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_HEIGHT), Sense::click());
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_HEIGHT), sense);
         let chevron_end = rect.left() + 6.0 + 6.0 + self.depth as f32 * INDENT + 18.0;
         let toggled = self.expanded.is_some()
             && response.clicked()
@@ -156,13 +323,15 @@ impl<'a> Row<'a> {
 pub fn show(
     ui: &mut Ui,
     profiles: &[ConnectionProfile],
+    folders: &[String],
     scripts: &[SavedScript],
+    script_folders: &[ScriptFolder],
     explorer: &mut Explorer,
     actions: &mut Vec<Action>,
 ) {
     let palette = Palette::current(ui.ctx());
     ui.add_space(10.0);
-    ui.horizontal(|ui| {
+    let header = ui.horizontal(|ui| {
         ui.add_space(14.0);
         widgets::caption(ui, "Connections");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -170,8 +339,17 @@ pub fn show(
             if widgets::icon_button_sized(ui, Icon::Plus, "New connection", 24.0, 15.0).clicked() {
                 actions.push(Action::NewConnection);
             }
+            if widgets::icon_button_sized(ui, Icon::Folder, "New folder", 24.0, 15.0).clicked() {
+                actions.push(new_folder(""));
+            }
         });
     });
+    let header = ui.interact(
+        header.response.rect,
+        ui.id().with("connections-header"),
+        Sense::hover(),
+    );
+    drop_target(ui, &header, actions, to_root);
     ui.add_space(6.0);
 
     // Filter.
@@ -200,7 +378,7 @@ pub fn show(
     });
     ui.add_space(8.0);
 
-    if profiles.is_empty() {
+    if profiles.is_empty() && folders.is_empty() {
         ui.add_space(24.0);
         widgets::empty_state(
             ui,
@@ -228,17 +406,166 @@ pub fn show(
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            for profile in profiles {
-                connection(ui, profile, scripts, explorer, actions);
-            }
-            ui.add_space(12.0);
+            let tree = Tree {
+                profiles,
+                folders,
+                scripts,
+                script_folders,
+                filter: explorer.filter.trim().to_lowercase(),
+            };
+            tree.contents(ui, "", 0, explorer, actions);
+            // The space below the tree takes the tree-wide menu.
+            let rest = ui.available_size_before_wrap().max(Vec2::new(0.0, 12.0));
+            let (_, response) = ui.allocate_exact_size(rest, Sense::click());
+            drop_target(ui, &response, actions, to_root);
+            response.context_menu(|ui| {
+                if menu_item(ui, Icon::Plus, "New connection") {
+                    actions.push(Action::NewConnection);
+                }
+                if menu_item(ui, Icon::Folder, "New folder…") {
+                    actions.push(new_folder(""));
+                }
+            });
         });
+    drag_preview(ui);
+}
+
+fn new_folder(parent: &str) -> Action {
+    Action::AskRename(super::rename_flow::RenameTarget::NewFolder(
+        parent.to_owned(),
+    ))
+}
+
+/// The saved connections, filed in their folders.
+struct Tree<'a> {
+    profiles: &'a [ConnectionProfile],
+    folders: &'a [String],
+    scripts: &'a [SavedScript],
+    script_folders: &'a [ScriptFolder],
+    /// The filter box, lower case.
+    filter: String,
+}
+
+impl Tree<'_> {
+    /// Whether a connection shows while filtering: its name matches, or it
+    /// is online and may hold objects that do.
+    fn shown(&self, profile: &ConnectionProfile, explorer: &Explorer) -> bool {
+        self.filter.is_empty()
+            || matches_filter(&profile.display_name(), &self.filter)
+            || explorer.link(profile.id).is_online()
+    }
+
+    /// The connections in `folder` and the folders below it that show.
+    fn count(&self, folder: &str, explorer: &Explorer) -> usize {
+        let prefix = format!("{folder}/");
+        self.profiles
+            .iter()
+            .filter(|profile| profile.folder == folder || profile.folder.starts_with(&prefix))
+            .filter(|profile| self.shown(profile, explorer))
+            .count()
+    }
+
+    /// The folders in `parent`, then its connections, at `depth`.
+    fn contents(
+        &self,
+        ui: &mut Ui,
+        parent: &str,
+        depth: usize,
+        explorer: &mut Explorer,
+        actions: &mut Vec<Action>,
+    ) {
+        let filtering = !self.filter.is_empty();
+        for folder in self
+            .folders
+            .iter()
+            .filter(|folder| violet_app::parent_folder(folder) == parent)
+        {
+            let count = self.count(folder, explorer);
+            if filtering && count == 0 {
+                continue;
+            }
+            let key = NodeKey::ConnectionFolder(folder.clone());
+            let expanded = filtering || explorer.is_expanded(&key);
+            let name = folder.rsplit('/').next().unwrap_or(folder);
+            let detail = count.to_string();
+            let mut row = Row::new(
+                depth,
+                if expanded {
+                    Icon::FolderOpen
+                } else {
+                    Icon::Folder
+                },
+                name,
+            );
+            row.expanded = Some(expanded);
+            row.selected = explorer.selected.as_ref() == Some(&key);
+            row.detail = Some(&detail);
+            row.draggable = true;
+            let response = row.show(ui).on_hover_text(folder);
+            response.dnd_set_drag_payload(DragItem::Folder(folder.clone()));
+            drop_target(ui, &response, actions, |item| to_folder(item, folder));
+            if response.clicked() {
+                explorer.pick(key.clone());
+                explorer.toggle(key);
+            }
+            response.context_menu(|ui| {
+                if menu_item(ui, Icon::Folder, "New subfolder…") {
+                    actions.push(new_folder(folder));
+                }
+                if menu_item(ui, Icon::Pencil, "Rename…") {
+                    actions.push(Action::AskRename(super::rename_flow::RenameTarget::Folder(
+                        folder.clone(),
+                    )));
+                }
+                if menu_item(ui, Icon::Trash, "Delete") {
+                    actions.push(Action::DeleteFolder(folder.clone()));
+                }
+            });
+            if expanded {
+                self.contents(ui, folder, depth + 1, explorer, actions);
+            }
+        }
+        for profile in self
+            .profiles
+            .iter()
+            .filter(|profile| profile.folder == parent)
+        {
+            if !self.shown(profile, explorer) {
+                continue;
+            }
+            // The connection's own rows count depth from 0: the frame
+            // shifts them under their folder.
+            let indent = (depth as f32 * INDENT).min(f32::from(i8::MAX)) as i8;
+            egui::Frame::new()
+                .inner_margin(egui::Margin {
+                    left: indent,
+                    ..egui::Margin::ZERO
+                })
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    let scripts = Scripts {
+                        all: self
+                            .scripts
+                            .iter()
+                            .filter(|script| script.connection == profile.id)
+                            .collect(),
+                        folders: self
+                            .script_folders
+                            .iter()
+                            .filter(|folder| folder.connection == profile.id)
+                            .collect(),
+                    };
+                    connection(ui, profile, self.folders, &scripts, explorer, actions);
+                });
+        }
+    }
 }
 
 fn connection(
     ui: &mut Ui,
     profile: &ConnectionProfile,
-    scripts: &[SavedScript],
+    all_folders: &[String],
+    scripts: &Scripts<'_>,
     explorer: &mut Explorer,
     actions: &mut Vec<Action>,
 ) {
@@ -266,7 +593,17 @@ fn connection(
     row.loading = matches!(link, Link::Connecting);
     row.strong = true;
     row.detail = Some(&detail);
+    row.draggable = true;
     let response = row.show(ui);
+    response.dnd_set_drag_payload(DragItem::Connection {
+        id,
+        folder: profile.folder.clone(),
+        name: name.clone(),
+    });
+    // Dropped on a connection, an item joins it in its folder.
+    drop_target(ui, &response, actions, |item| {
+        to_folder(item, &profile.folder)
+    });
     let response = match &link {
         Link::Online(server) => response.on_hover_text(format!(
             "{} · {} as {}",
@@ -360,6 +697,22 @@ fn connection(
         if menu_item(ui, Icon::Copy, "Duplicate") {
             actions.push(Action::DuplicateConnection(id));
         }
+        ui.menu_button("Move to folder", |ui| {
+            if !profile.folder.is_empty() && menu_item(ui, Icon::Database, "(root)") {
+                actions.push(Action::MoveToFolder(id, String::new()));
+            }
+            for folder in all_folders
+                .iter()
+                .filter(|folder| **folder != profile.folder)
+            {
+                if menu_item(ui, Icon::Folder, folder) {
+                    actions.push(Action::MoveToFolder(id, folder.clone()));
+                }
+            }
+            if menu_item(ui, Icon::Plus, "New folder…") {
+                actions.push(new_folder(""));
+            }
+        });
         if menu_item(ui, Icon::Trash, "Delete…") {
             actions.push(Action::AskDeleteConnection(id));
         }
@@ -368,12 +721,8 @@ fn connection(
     if !expanded {
         return;
     }
-    let scripts: Vec<&SavedScript> = scripts
-        .iter()
-        .filter(|script| script.connection == id)
-        .collect();
-    if !scripts.is_empty() {
-        scripts_node(ui, profile, &scripts, explorer, actions);
+    if !scripts.all.is_empty() || !scripts.folders.is_empty() {
+        scripts_node(ui, profile, scripts, explorer, actions);
     }
     if language == Language::Redis {
         match explorer.schemas.get(&id).cloned().unwrap_or_default() {
@@ -449,11 +798,17 @@ fn picked_databases<'a>(
         .collect()
 }
 
+/// A connection's saved scripts and the folders they are kept in.
+struct Scripts<'a> {
+    all: Vec<&'a SavedScript>,
+    folders: Vec<&'a ScriptFolder>,
+}
+
 /// The scripts saved for a connection, each opening on its database.
 fn scripts_node(
     ui: &mut Ui,
     profile: &ConnectionProfile,
-    scripts: &[&SavedScript],
+    scripts: &Scripts<'_>,
     explorer: &mut Explorer,
     actions: &mut Vec<Action>,
 ) {
@@ -461,22 +816,12 @@ fn scripts_node(
     let filter = explorer.filter.trim().to_lowercase();
     let filtering = !filter.is_empty();
     let shown: Vec<&SavedScript> = scripts
+        .all
         .iter()
         .copied()
         .filter(|script| !filtering || matches_filter(&script.name, &filter))
         .collect();
     if filtering && shown.is_empty() {
-        return;
-    }
-    let expanded = filtering || explorer.is_expanded(&key);
-    let count = shown.len().to_string();
-    let mut row = Row::new(1, Icon::Folder, "Scripts");
-    row.expanded = Some(expanded);
-    row.detail = Some(&count);
-    if row.show(ui).clicked() {
-        explorer.toggle(key);
-    }
-    if !expanded {
         return;
     }
     // The database shows only for scripts of another one than the
@@ -485,28 +830,198 @@ fn scripts_node(
         Link::Online(server) => server.database.clone(),
         _ => profile.database.clone(),
     };
-    for script in shown {
-        let mut row = Row::new(2, Icon::FileCode, &script.name);
-        if script.database != own {
-            row.detail = Some(&script.database);
+    let expanded = filtering || explorer.is_expanded(&key);
+    let count = shown.len().to_string();
+    let mut row = Row::new(1, Icon::Folder, "Scripts");
+    row.expanded = Some(expanded);
+    row.detail = Some(&count);
+    let response = row.show(ui);
+    drop_target(ui, &response, actions, |item| {
+        to_script_folder(item, profile.id, None, "")
+    });
+    if response.clicked() {
+        explorer.toggle(key);
+    }
+    response.context_menu(|ui| {
+        if !own.is_empty() && menu_item(ui, Icon::Folder, "New folder…") {
+            actions.push(new_script_folder(profile.id, &own, ""));
         }
-        let response =
-            row.show(ui)
-                .on_hover_text(format!("{}\n{}", script.database, script.path.display()));
-        if response.clicked() {
-            actions.push(Action::OpenScript(script.path.clone()));
+    });
+    if !expanded {
+        return;
+    }
+    let level = ScriptLevel {
+        connection: profile.id,
+        own: &own,
+        shown: &shown,
+        folders: &scripts.folders,
+        filtering,
+    };
+    level.show(ui, None, "", 2, explorer, actions);
+}
+
+fn new_script_folder(connection: ConnectionId, database: &str, parent: &str) -> Action {
+    Action::AskRename(super::rename_flow::RenameTarget::NewScriptFolder {
+        connection,
+        database: database.to_owned(),
+        parent: parent.to_owned(),
+    })
+}
+
+/// What drawing a level of a connection's scripts needs.
+struct ScriptLevel<'a> {
+    connection: ConnectionId,
+    /// The connection's own database.
+    own: &'a str,
+    /// The scripts the filter lets through.
+    shown: &'a [&'a SavedScript],
+    folders: &'a [&'a ScriptFolder],
+    filtering: bool,
+}
+
+impl ScriptLevel<'_> {
+    /// The folders, then the scripts, in `folder` of `database` (of every
+    /// database at the top).
+    fn show(
+        &self,
+        ui: &mut Ui,
+        database: Option<&str>,
+        folder: &str,
+        depth: usize,
+        explorer: &mut Explorer,
+        actions: &mut Vec<Action>,
+    ) {
+        let here = |db: &str| database.is_none_or(|database| database == db);
+        for child in self.folders.iter().filter(|child| {
+            here(&child.database) && violet_app::parent_folder(&child.folder) == folder
+        }) {
+            let prefix = format!("{}/", child.folder);
+            let count = self
+                .shown
+                .iter()
+                .filter(|script| {
+                    script.database == child.database
+                        && (script.folder == child.folder || script.folder.starts_with(&prefix))
+                })
+                .count();
+            if self.filtering && count == 0 {
+                continue;
+            }
+            let key = NodeKey::ScriptFolder(
+                self.connection,
+                child.database.clone(),
+                child.folder.clone(),
+            );
+            let expanded = self.filtering || explorer.is_expanded(&key);
+            let name = child.folder.rsplit('/').next().unwrap_or(&child.folder);
+            let detail = if child.database == self.own {
+                count.to_string()
+            } else {
+                format!("{} · {count}", child.database)
+            };
+            let mut row = Row::new(
+                depth,
+                if expanded {
+                    Icon::FolderOpen
+                } else {
+                    Icon::Folder
+                },
+                name,
+            );
+            row.expanded = Some(expanded);
+            row.detail = Some(&detail);
+            row.draggable = true;
+            let response = row.show(ui);
+            response.dnd_set_drag_payload(DragItem::ScriptFolder {
+                connection: self.connection,
+                database: child.database.clone(),
+                folder: child.folder.clone(),
+            });
+            drop_target(ui, &response, actions, |item| {
+                to_script_folder(item, self.connection, Some(&child.database), &child.folder)
+            });
+            if response.clicked() {
+                explorer.toggle(key);
+            }
+            response.context_menu(|ui| {
+                if menu_item(ui, Icon::Folder, "New folder…") {
+                    actions.push(new_script_folder(
+                        self.connection,
+                        &child.database,
+                        &child.folder,
+                    ));
+                }
+            });
+            if expanded {
+                self.show(
+                    ui,
+                    Some(&child.database),
+                    &child.folder,
+                    depth + 1,
+                    explorer,
+                    actions,
+                );
+            }
         }
-        response.context_menu(|ui| {
-            if menu_item(ui, Icon::FileCode, "Open") {
+        for script in self
+            .shown
+            .iter()
+            .filter(|script| here(&script.database) && script.folder == folder)
+        {
+            let mut row = Row::new(depth, Icon::FileCode, &script.name);
+            if script.database != self.own {
+                row.detail = Some(&script.database);
+            }
+            row.draggable = true;
+            let response = row.show(ui).on_hover_text(format!(
+                "{}\n{}",
+                script.database,
+                script.path.display()
+            ));
+            response.dnd_set_drag_payload(DragItem::Script {
+                path: script.path.clone(),
+                connection: script.connection,
+                database: script.database.clone(),
+                folder: script.folder.clone(),
+                name: script.name.clone(),
+            });
+            if response.clicked() {
                 actions.push(Action::OpenScript(script.path.clone()));
             }
-            if menu_item(ui, Icon::FolderOpen, "Show in folder") {
-                actions.push(Action::Reveal(script.path.clone()));
-            }
-            if menu_item(ui, Icon::Copy, "Copy path") {
-                actions.push(Action::Copy(script.path.display().to_string()));
-            }
-        });
+            response.context_menu(|ui| {
+                if menu_item(ui, Icon::FileCode, "Open") {
+                    actions.push(Action::OpenScript(script.path.clone()));
+                }
+                ui.menu_button("Move to folder", |ui| {
+                    if !script.folder.is_empty() && menu_item(ui, Icon::Folder, "(top level)") {
+                        actions.push(Action::MoveScript(script.path.clone(), String::new()));
+                    }
+                    for target in self.folders.iter().filter(|target| {
+                        target.database == script.database && target.folder != script.folder
+                    }) {
+                        if menu_item(ui, Icon::Folder, &target.folder) {
+                            actions.push(Action::MoveScript(
+                                script.path.clone(),
+                                target.folder.clone(),
+                            ));
+                        }
+                    }
+                    if menu_item(ui, Icon::Plus, "New folder…") {
+                        actions.push(new_script_folder(
+                            self.connection,
+                            &script.database,
+                            &script.folder,
+                        ));
+                    }
+                });
+                if menu_item(ui, Icon::FolderOpen, "Show in folder") {
+                    actions.push(Action::Reveal(script.path.clone()));
+                }
+                if menu_item(ui, Icon::Copy, "Copy path") {
+                    actions.push(Action::Copy(script.path.display().to_string()));
+                }
+            });
+        }
     }
 }
 

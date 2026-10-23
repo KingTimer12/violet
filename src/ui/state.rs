@@ -52,8 +52,12 @@ pub enum NodeKey {
     Connection(ConnectionId),
     /// A database of a connection that shows them all.
     Database(ConnectionId, String),
+    /// A folder of saved connections, by its `/`-separated path.
+    ConnectionFolder(String),
     /// The scripts saved for a connection.
     Scripts(ConnectionId),
+    /// A folder of a connection's scripts: its database and path.
+    ScriptFolder(ConnectionId, String, String),
     Schema(ConnectionId, String),
     Group(ConnectionId, String, ObjectKind),
     Object(ConnectionId, String, String),
@@ -293,22 +297,28 @@ impl Explorer {
     pub fn remove(&mut self, id: ConnectionId) {
         self.forget(id);
         self.links.remove(&id);
-        self.expanded.retain(|key| owner(key) != id);
-        if self.selected.as_ref().is_some_and(|key| owner(key) == id) {
+        self.expanded.retain(|key| owner(key) != Some(id));
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|key| owner(key) == Some(id))
+        {
             self.selected = None;
         }
     }
 }
 
-fn owner(key: &NodeKey) -> ConnectionId {
+fn owner(key: &NodeKey) -> Option<ConnectionId> {
     match key {
         NodeKey::Connection(id)
         | NodeKey::Database(id, _)
         | NodeKey::Scripts(id)
+        | NodeKey::ScriptFolder(id, ..)
         | NodeKey::Schema(id, _)
         | NodeKey::Group(id, _, _)
         | NodeKey::Object(id, _, _)
-        | NodeKey::Folder(id, _) => *id,
+        | NodeKey::Folder(id, _) => Some(*id),
+        NodeKey::ConnectionFolder(_) => None,
     }
 }
 
