@@ -31,6 +31,7 @@ pub fn show(
     editing: &Editing,
     links: &[bool],
     reference: Option<&Reference>,
+    fetch_size: u64,
     actions: &mut Vec<Action>,
 ) {
     let palette = Palette::current(ui.ctx());
@@ -227,7 +228,7 @@ pub fn show(
                                 .stroke(Stroke::new(1.0, palette.outline)),
                         )
                         .show_separator_line(false)
-                        .show(ui, |ui| paging_bar(ui, tab.id, paging, fetching, actions));
+                        .show(ui, |ui| paging_bar(ui, tab.id, paging, fetching, fetch_size, actions));
                 }
                 let sort = match &tab.kind {
                     // Redis returns a key's elements in its own order.
@@ -253,6 +254,10 @@ pub fn show(
                     deleted: &tab.deleted,
                 };
                 let reveal = tab.reveal_row.take();
+                // Scrolling to the end reads the next page, as DBeaver does.
+                let more = tab.paging.as_ref().is_some_and(|paging| paging.has_more)
+                    && tab.running.is_none()
+                    && tab.added == 0;
                 grid(
                     ui,
                     tab.id,
@@ -262,6 +267,7 @@ pub fn show(
                     &changes,
                     &mut tab.inline,
                     reveal,
+                    more,
                     links,
                     reference,
                     actions,
@@ -287,7 +293,14 @@ pub fn show(
 
 /// DBeaver's result footer: how much is loaded, and buttons to read more
 /// or count the rest.
-fn paging_bar(ui: &mut Ui, tab: u64, paging: &Paging, fetching: bool, actions: &mut Vec<Action>) {
+fn paging_bar(
+    ui: &mut Ui,
+    tab: u64,
+    paging: &Paging,
+    fetching: bool,
+    fetch_size: u64,
+    actions: &mut Vec<Action>,
+) {
     let palette = Palette::current(ui.ctx());
     ui.horizontal_centered(|ui| {
         ui.add_space(10.0);
@@ -341,7 +354,7 @@ fn paging_bar(ui: &mut Ui, tab: u64, paging: &Paging, fetching: bool, actions: &
             {
                 actions.push(Action::FetchAll(tab));
             }
-            let next = format!("Next {}", violet_core::Page::SIZE);
+            let next = format!("Next {}", thousands(usize::try_from(fetch_size).unwrap_or(usize::MAX)));
             if ui
                 .add_enabled_ui(idle && paging.has_more, |ui| {
                     widgets::button(ui, Tone::Secondary, Some(Icon::ChevronDown), &next)
@@ -352,8 +365,45 @@ fn paging_bar(ui: &mut Ui, tab: u64, paging: &Paging, fetching: bool, actions: &
             {
                 actions.push(Action::FetchMore(tab));
             }
+            fetch_size_picker(ui, tab, fetch_size, actions);
         });
     });
+}
+
+const FETCH_SIZES: [u64; 6] = [50, 100, 200, 500, 1_000, 5_000];
+
+/// The rows a page reads: a preset, or any number typed in.
+fn fetch_size_picker(ui: &mut Ui, tab: u64, fetch_size: u64, actions: &mut Vec<Action>) {
+    let mut size = fetch_size;
+    egui::ComboBox::from_id_salt(("fetch-size", tab))
+        .selected_text(thousands(usize::try_from(size).unwrap_or(usize::MAX)))
+        .width(70.0)
+        // Clicking the custom field would close the list before typing.
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show_ui(ui, |ui| {
+            for preset in FETCH_SIZES {
+                if ui
+                    .selectable_value(
+                        &mut size,
+                        preset,
+                        thousands(usize::try_from(preset).unwrap_or(usize::MAX)),
+                    )
+                    .clicked()
+                {
+                    ui.close();
+                }
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Custom");
+                ui.add(egui::DragValue::new(&mut size).range(1..=100_000));
+            });
+        })
+        .response
+        .on_hover_text("Rows read at a time");
+    if size != fetch_size {
+        actions.push(Action::SetFetchSize(size));
+    }
 }
 
 /// `just now`, `42 s ago`, `3 min ago`.
@@ -376,6 +426,7 @@ fn grid(
     changes: &GridChanges<'_>,
     inline: &mut Option<InlineCell>,
     reveal: Option<usize>,
+    more: bool,
     links: &[bool],
     reference: Option<&Reference>,
     actions: &mut Vec<Action>,
@@ -474,7 +525,7 @@ fn grid(
                         .clip(true),
                 );
             }
-            table
+            let output = table
                 .header(30.0, |mut header| {
                     header.col(|ui| {
                         ui.painter().rect_filled(ui.max_rect(), 0.0, palette.panel);
@@ -874,6 +925,10 @@ fn grid(
                         }
                     });
                 });
+            let bottom = output.state.offset.y + output.inner_rect.height();
+            if more && bottom >= output.content_size.y - 4.0 * ROW_HEIGHT {
+                actions.push(Action::FetchMore(tab));
+            }
         });
 }
 

@@ -141,6 +141,8 @@ pub enum Action {
     /// index, descending or not; `None` takes the sort off.
     SortBy(TabId, usize, Option<bool>),
     FetchMore(TabId),
+    /// Sets how many rows a paged result reads at a time.
+    SetFetchSize(u64),
     FetchAll(TabId),
     CountRows(TabId),
     Cancel(TabId),

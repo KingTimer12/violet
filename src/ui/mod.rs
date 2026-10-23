@@ -1179,7 +1179,7 @@ impl VioletApp {
             CachePolicy::Off
         };
         let (text, page) = match plan.pageable {
-            Some(single) => (single, Some(Page::first())),
+            Some(single) => (single, Some(self.first_page())),
             None => (text, None),
         };
         let options = ExecOptions { cache, page };
@@ -1253,7 +1253,10 @@ impl VioletApp {
         };
         let options = ExecOptions {
             cache: CachePolicy::Use,
-            page: Some(Page::first()),
+            page: Some(Page {
+                offset: 0,
+                limit: self.settings.fetch_size,
+            }),
         };
         tab.sort = descending.map(|descending| (column, descending));
         tab.unsorted = descending.is_some().then_some(base);
@@ -1436,9 +1439,16 @@ impl VioletApp {
         };
         let options = ExecOptions {
             cache,
-            page: Some(Page::first()),
+            page: Some(self.first_page()),
         };
         self.start(tab_id, connection, executed, options, false);
+    }
+
+    fn first_page(&self) -> Page {
+        Page {
+            offset: 0,
+            limit: self.settings.fetch_size,
+        }
     }
 
     /// Reads the next page of a paged result, or all that remains up to the
@@ -1468,7 +1478,7 @@ impl VioletApp {
         let limit = if all {
             max_rows.saturating_sub(paging.loaded)
         } else {
-            Page::SIZE.min(max_rows.saturating_sub(paging.loaded))
+            self.settings.fetch_size.min(max_rows.saturating_sub(paging.loaded))
         };
         if limit == 0 {
             return;
@@ -1581,7 +1591,7 @@ impl VioletApp {
         };
         let options = ExecOptions {
             cache,
-            page: options.page.map(|_| Page::first()),
+            page: options.page.map(|_| self.first_page()),
         };
         self.start(tab_id, connection, executed, options, false);
     }
@@ -1853,6 +1863,10 @@ impl VioletApp {
             Action::SortBy(tab, column, descending) => self.sort(ctx, tab, column, descending),
             Action::FetchMore(tab) => self.fetch_more(ctx, tab, false),
             Action::FetchAll(tab) => self.fetch_more(ctx, tab, true),
+            Action::SetFetchSize(size) => {
+                self.settings.fetch_size = size.max(1);
+                self.save_settings(ctx);
+            }
             Action::CountRows(tab) => self.count_rows(tab),
             Action::Cancel(tab_id) => {
                 if let Some(tab) = self.workspace.get_mut(tab_id)
@@ -2254,6 +2268,7 @@ impl VioletApp {
     }
 
     fn central(&mut self, ui: &mut egui::Ui) {
+        let fetch_size = self.settings.fetch_size;
         let palette = Palette::current(ui.ctx());
         if self.workspace.tabs.is_empty() {
             chrome::welcome(
@@ -2318,7 +2333,7 @@ impl VioletApp {
             egui::CentralPanel::default()
                 .frame(Frame::NONE.fill(palette.window))
                 .show(ui, |ui| {
-                    results::show(ui, tab, &editing, &links.columns, reference, actions)
+                    results::show(ui, tab, &editing, &links.columns, reference, fetch_size, actions)
                 });
             return;
         }
@@ -2339,7 +2354,7 @@ impl VioletApp {
                 // The panel remembers the height its contents take: they
                 // fill it, or it would shrink to a smaller result each run.
                 ui.set_min_height(ui.available_height());
-                results::show(ui, tab, &editing, &links.columns, reference, actions);
+                results::show(ui, tab, &editing, &links.columns, reference, fetch_size, actions);
             });
         self.layout.results = (total > 0.0).then(|| results.response.rect.height() / total);
 
