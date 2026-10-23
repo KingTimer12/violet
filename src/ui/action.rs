@@ -37,6 +37,9 @@ pub enum Action {
     DeleteConnection(ConnectionId),
     /// Files a connection in a folder; empty for the top level.
     MoveToFolder(ConnectionId, String),
+    /// Moves a connection folder, with what it holds, into another; empty
+    /// for the top level.
+    MoveFolder(String, String),
     /// Deletes a connection folder, moving what it holds up a level.
     DeleteFolder(String),
     /// Opens a workspace; `None` for the default one.

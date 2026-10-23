@@ -183,6 +183,17 @@ fn within<'a>(path: &'a str, folder: &str) -> Option<&'a str> {
     }
 }
 
+/// Where `folder` lands when dropped in `parent`; `None` when it would go
+/// into itself or stay put.
+#[must_use]
+pub fn moved_folder(folder: &str, parent: &str) -> Option<String> {
+    if within(parent, folder).is_some() || parent_folder(folder) == parent {
+        return None;
+    }
+    let name = folder.rsplit('/').next().unwrap_or(folder);
+    Some(join(parent, name))
+}
+
 fn join(folder: &str, rest: &str) -> String {
     match (folder.is_empty(), rest.is_empty()) {
         (true, _) => rest.to_owned(),
@@ -290,5 +301,17 @@ mod tests {
         service.move_to_folder(profile.id, "").expect("move");
         assert_eq!(service.all()[0].folder, "");
         assert_eq!(service.folders(), ["Live", "Live/Empty"]);
+    }
+
+    #[test]
+    fn a_dropped_folder_keeps_its_name_under_the_new_parent() {
+        assert_eq!(moved_folder("A/B", "C").as_deref(), Some("C/B"));
+        assert_eq!(moved_folder("A/B", "").as_deref(), Some("B"));
+        assert_eq!(moved_folder("A", "C/D").as_deref(), Some("C/D/A"));
+        assert_eq!(moved_folder("A", "AB").as_deref(), Some("AB/A"));
+        assert_eq!(moved_folder("A", "A"), None);
+        assert_eq!(moved_folder("A", "A/B"), None);
+        assert_eq!(moved_folder("A/B", "A"), None);
+        assert_eq!(moved_folder("A", ""), None);
     }
 }

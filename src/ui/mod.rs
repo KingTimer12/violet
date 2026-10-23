@@ -1781,6 +1781,22 @@ impl VioletApp {
                     );
                 }
             }
+            Action::MoveFolder(folder, parent) => {
+                let to = violet_app::moved_folder(&folder, &parent);
+                if let Some(to) = &to
+                    && self.profiles.folders().contains(to)
+                {
+                    self.toasts
+                        .push(ctx, Toast::info("There is a folder with this name there"));
+                } else if let Some(to) = to
+                    && let Err(error) = self.profiles.rename_folder(&folder, &to)
+                {
+                    self.toasts.push(
+                        ctx,
+                        Toast::error("Could not move the folder", error.to_string()),
+                    );
+                }
+            }
             Action::DeleteFolder(folder) => {
                 if let Err(error) = self.profiles.delete_folder(&folder) {
                     self.toasts.push(

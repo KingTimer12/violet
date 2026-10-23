@@ -1,7 +1,9 @@
 //! The connections tree: connections, schemas, object groups, objects and
 //! columns, loaded as they are expanded.
 
-use egui::{Align2, Color32, CornerRadius, Response, Sense, Ui, Vec2};
+use std::path::PathBuf;
+
+use egui::{Align2, Color32, CornerRadius, CursorIcon, DragAndDrop, Response, Sense, Ui, Vec2};
 use violet_core::{
     ConnectionId, ConnectionProfile, DbObject, Language, ObjectKind, ObjectRef, TaskKind,
 };
@@ -33,6 +35,143 @@ struct Row<'a> {
     /// A dot before the icon, for connection status.
     status: Option<Color32>,
     strong: bool,
+    /// Whether the row can be dragged onto another.
+    draggable: bool,
+}
+
+/// What is being dragged across the tree.
+#[derive(Clone)]
+enum DragItem {
+    Connection {
+        id: ConnectionId,
+        folder: String,
+        name: String,
+    },
+    Folder(String),
+    Script {
+        path: PathBuf,
+        connection: ConnectionId,
+        database: String,
+        folder: String,
+        name: String,
+    },
+}
+
+impl DragItem {
+    fn name(&self) -> &str {
+        match self {
+            Self::Connection { name, .. } | Self::Script { name, .. } => name,
+            Self::Folder(path) => path.rsplit('/').next().unwrap_or(path),
+        }
+    }
+}
+
+/// Highlights the row while something `accept` has an action for hovers
+/// it, and pushes that action when it is dropped there.
+fn drop_target(
+    ui: &Ui,
+    response: &Response,
+    actions: &mut Vec<Action>,
+    accept: impl Fn(&DragItem) -> Option<Action>,
+) {
+    let Some(item) = response.dnd_hover_payload::<DragItem>() else {
+        return;
+    };
+    if accept(&item).is_none() {
+        return;
+    }
+    let palette = Palette::current(ui.ctx());
+    ui.painter().rect_stroke(
+        response.rect.shrink2(Vec2::new(6.0, 1.0)),
+        CornerRadius::same(6),
+        egui::Stroke::new(1.5, palette.accent),
+        egui::StrokeKind::Inside,
+    );
+    if let Some(item) = response.dnd_release_payload::<DragItem>()
+        && let Some(action) = accept(&item)
+    {
+        actions.push(action);
+    }
+}
+
+/// Moves to the top level what may go there.
+fn to_root(item: &DragItem) -> Option<Action> {
+    match item {
+        DragItem::Connection { id, folder, .. } if !folder.is_empty() => {
+            Some(Action::MoveToFolder(*id, String::new()))
+        }
+        DragItem::Folder(path) => violet_app::moved_folder(path, "")
+            .map(|_| Action::MoveFolder(path.clone(), String::new())),
+        _ => None,
+    }
+}
+
+/// Moves into connection folder `target` what may go there.
+fn to_folder(item: &DragItem, target: &str) -> Option<Action> {
+    match item {
+        DragItem::Connection { id, folder, .. } if folder != target => {
+            Some(Action::MoveToFolder(*id, target.to_owned()))
+        }
+        DragItem::Folder(path) => violet_app::moved_folder(path, target)
+            .map(|_| Action::MoveFolder(path.clone(), target.to_owned())),
+        _ => None,
+    }
+}
+
+/// Moves into script folder `target` of `database` (any, at the top level)
+/// what may go there: a script never leaves its database.
+fn to_script_folder(
+    item: &DragItem,
+    connection: ConnectionId,
+    database: Option<&str>,
+    target: &str,
+) -> Option<Action> {
+    match item {
+        DragItem::Script {
+            path,
+            connection: from,
+            database: db,
+            folder,
+            ..
+        } if *from == connection
+            && database.is_none_or(|database| database == db)
+            && folder != target =>
+        {
+            Some(Action::MoveScript(path.clone(), target.to_owned()))
+        }
+        _ => None,
+    }
+}
+
+/// Follows the pointer with the dragged item's name.
+fn drag_preview(ui: &Ui) {
+    let Some(item) = DragAndDrop::payload::<DragItem>(ui.ctx()) else {
+        return;
+    };
+    let Some(pointer) = ui.ctx().pointer_latest_pos() else {
+        return;
+    };
+    ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+    let palette = Palette::current(ui.ctx());
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(
+        egui::Order::Tooltip,
+        egui::Id::new("sidebar-drag"),
+    ));
+    let galley = painter.layout_no_wrap(
+        item.name().to_owned(),
+        egui::FontId::proportional(13.0),
+        palette.text,
+    );
+    let rect = egui::Rect::from_min_size(pointer + Vec2::new(14.0, 6.0), galley.size())
+        .expand2(Vec2::new(8.0, 4.0));
+    painter.rect_filled(rect, CornerRadius::same(6), palette.surface);
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(6),
+        egui::Stroke::new(1.0, palette.accent),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley(rect.min + Vec2::new(8.0, 4.0), galley, palette.text);
 }
 
 impl<'a> Row<'a> {
@@ -48,6 +187,7 @@ impl<'a> Row<'a> {
             loading: false,
             status: None,
             strong: false,
+            draggable: false,
         }
     }
 
@@ -60,8 +200,13 @@ impl<'a> Row<'a> {
     /// anywhere else.
     fn show_with_toggle(self, ui: &mut Ui) -> (Response, bool) {
         let palette = Palette::current(ui.ctx());
+        let sense = if self.draggable {
+            Sense::click_and_drag()
+        } else {
+            Sense::click()
+        };
         let (rect, response) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_HEIGHT), Sense::click());
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_HEIGHT), sense);
         let chevron_end = rect.left() + 6.0 + 6.0 + self.depth as f32 * INDENT + 18.0;
         let toggled = self.expanded.is_some()
             && response.clicked()
@@ -164,7 +309,7 @@ pub fn show(
 ) {
     let palette = Palette::current(ui.ctx());
     ui.add_space(10.0);
-    ui.horizontal(|ui| {
+    let header = ui.horizontal(|ui| {
         ui.add_space(14.0);
         widgets::caption(ui, "Connections");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -177,6 +322,12 @@ pub fn show(
             }
         });
     });
+    let header = ui.interact(
+        header.response.rect,
+        ui.id().with("connections-header"),
+        Sense::hover(),
+    );
+    drop_target(ui, &header, actions, to_root);
     ui.add_space(6.0);
 
     // Filter.
@@ -244,6 +395,7 @@ pub fn show(
             // The space below the tree takes the tree-wide menu.
             let rest = ui.available_size_before_wrap().max(Vec2::new(0.0, 12.0));
             let (_, response) = ui.allocate_exact_size(rest, Sense::click());
+            drop_target(ui, &response, actions, to_root);
             response.context_menu(|ui| {
                 if menu_item(ui, Icon::Plus, "New connection") {
                     actions.push(Action::NewConnection);
@@ -253,6 +405,7 @@ pub fn show(
                 }
             });
         });
+    drag_preview(ui);
 }
 
 fn new_folder(parent: &str) -> Action {
@@ -325,7 +478,10 @@ impl Tree<'_> {
             row.expanded = Some(expanded);
             row.selected = explorer.selected.as_ref() == Some(&key);
             row.detail = Some(&detail);
+            row.draggable = true;
             let response = row.show(ui).on_hover_text(folder);
+            response.dnd_set_drag_payload(DragItem::Folder(folder.clone()));
+            drop_target(ui, &response, actions, |item| to_folder(item, folder));
             if response.clicked() {
                 explorer.pick(key.clone());
                 explorer.toggle(key);
@@ -415,7 +571,17 @@ fn connection(
     row.loading = matches!(link, Link::Connecting);
     row.strong = true;
     row.detail = Some(&detail);
+    row.draggable = true;
     let response = row.show(ui);
+    response.dnd_set_drag_payload(DragItem::Connection {
+        id,
+        folder: profile.folder.clone(),
+        name: name.clone(),
+    });
+    // Dropped on a connection, an item joins it in its folder.
+    drop_target(ui, &response, actions, |item| {
+        to_folder(item, &profile.folder)
+    });
     let response = match &link {
         Link::Online(server) => response.on_hover_text(format!(
             "{} · {} as {}",
@@ -648,6 +814,9 @@ fn scripts_node(
     row.expanded = Some(expanded);
     row.detail = Some(&count);
     let response = row.show(ui);
+    drop_target(ui, &response, actions, |item| {
+        to_script_folder(item, profile.id, None, "")
+    });
     if response.clicked() {
         explorer.toggle(key);
     }
@@ -740,6 +909,9 @@ impl ScriptLevel<'_> {
             row.expanded = Some(expanded);
             row.detail = Some(&detail);
             let response = row.show(ui);
+            drop_target(ui, &response, actions, |item| {
+                to_script_folder(item, self.connection, Some(&child.database), &child.folder)
+            });
             if response.clicked() {
                 explorer.toggle(key);
             }
@@ -772,11 +944,19 @@ impl ScriptLevel<'_> {
             if script.database != self.own {
                 row.detail = Some(&script.database);
             }
+            row.draggable = true;
             let response = row.show(ui).on_hover_text(format!(
                 "{}\n{}",
                 script.database,
                 script.path.display()
             ));
+            response.dnd_set_drag_payload(DragItem::Script {
+                path: script.path.clone(),
+                connection: script.connection,
+                database: script.database.clone(),
+                folder: script.folder.clone(),
+                name: script.name.clone(),
+            });
             if response.clicked() {
                 actions.push(Action::OpenScript(script.path.clone()));
             }

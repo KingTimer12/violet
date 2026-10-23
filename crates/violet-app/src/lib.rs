@@ -17,5 +17,5 @@ pub use backend::{
     Backend, CachePolicy, Event, ExecOptions, Notify, Offer, RequestId, TaskId, Transaction,
     TxCommand, TxControl,
 };
-pub use profiles::{ProfileService, parent_folder};
+pub use profiles::{ProfileService, moved_folder, parent_folder};
 pub use registry::DriverRegistry;
