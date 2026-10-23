@@ -138,6 +138,7 @@ pub struct VioletApp {
     chooser: Option<catalog_flow::Chooser>,
     key_dialog: Option<key_flow::KeyDialog>,
     rename_prompt: Option<rename_flow::RenamePrompt>,
+    drop_prompt: Option<rename_flow::DropPrompt>,
     rename_requests: HashMap<violet_app::RequestId, rename_flow::Pending>,
     /// Commands the tree ran on keys, waiting for their answer.
     key_requests: HashMap<violet_app::RequestId, key_flow::Pending>,
@@ -282,6 +283,7 @@ impl VioletApp {
             chooser: None,
             key_dialog: None,
             rename_prompt: None,
+            drop_prompt: None,
             rename_requests: HashMap::new(),
             key_requests: HashMap::new(),
             copy_choice: (crate::export::Format::Tsv, true),
@@ -1478,7 +1480,9 @@ impl VioletApp {
         let limit = if all {
             max_rows.saturating_sub(paging.loaded)
         } else {
-            self.settings.fetch_size.min(max_rows.saturating_sub(paging.loaded))
+            self.settings
+                .fetch_size
+                .min(max_rows.saturating_sub(paging.loaded))
         };
         if limit == 0 {
             return;
@@ -1572,9 +1576,22 @@ impl VioletApp {
         if tab.running.is_some() || !self.backend.is_connected(connection) {
             return;
         }
+        let language = tab.connection.map_or(Language::Sql, |id| self.language(id));
+        // A refresh reads again; a statement that writes (`CREATE DATABASE`,
+        // `INSERT`, a Redis `SET`) runs again only from the editor.
+        let reads = match language {
+            Language::Sql => crate::sql::plan(&executed.sql).reads_only,
+            _ => options.cache != CachePolicy::Off,
+        };
+        if !reads {
+            self.toasts.push(
+                ctx,
+                Toast::info("Not run again: it changes data. Run it from the editor."),
+            );
+            return;
+        }
         // Changing every row again is asked for from the editor, not
         // repeated by a refresh.
-        let language = tab.connection.map_or(Language::Sql, |id| self.language(id));
         if !crate::lang::dangers(language, &executed.sql).is_empty() {
             self.toasts.push(
                 ctx,
@@ -1890,6 +1907,10 @@ impl VioletApp {
             }
             Action::AskRename(target) => self.ask_rename(ctx, target),
             Action::RenameTo(name) => self.rename(ctx, name),
+            Action::AskDropDatabase(connection, name) => {
+                self.ask_drop_database(ctx, connection, name);
+            }
+            Action::DropDatabase => self.drop_database(ctx),
             Action::SetAutoRefresh(id, every) => {
                 if let Some(tab) = self.workspace.get_mut(id) {
                     tab.auto_refresh = every.map(|every| (every, Instant::now() + every));
@@ -2025,11 +2046,12 @@ impl VioletApp {
         let Some(node) = self.explorer.selected.clone() else {
             return false;
         };
-        let (refresh, rename, edit) = ctx.input_mut(|input| {
+        let (refresh, rename, edit, delete) = ctx.input_mut(|input| {
             (
                 shortcuts::consume(input, Command::Refresh),
                 shortcuts::consume(input, Command::Rename),
                 shortcuts::consume(input, Command::EditConnection),
+                input.consume_key(egui::Modifiers::NONE, egui::Key::Delete),
             )
         });
         let id = match &node {
@@ -2098,6 +2120,15 @@ impl VioletApp {
                         }));
                 }
                 NodeKey::Connection(id) => self.actions.push(Action::EditConnection(*id)),
+                _ => {}
+            }
+        }
+        if delete {
+            match &node {
+                NodeKey::Database(parent, name) => self
+                    .actions
+                    .push(Action::AskDropDatabase(*parent, name.clone())),
+                NodeKey::Connection(id) => self.actions.push(Action::AskDeleteConnection(*id)),
                 _ => {}
             }
         }
@@ -2178,7 +2209,8 @@ impl VioletApp {
             || self.task_dialog.is_some()
             || self.keys_dialog.is_some()
             || self.key_dialog.is_some()
-            || self.rename_prompt.is_some();
+            || self.rename_prompt.is_some()
+            || self.drop_prompt.is_some();
         if modal_open {
             return;
         }
@@ -2333,7 +2365,15 @@ impl VioletApp {
             egui::CentralPanel::default()
                 .frame(Frame::NONE.fill(palette.window))
                 .show(ui, |ui| {
-                    results::show(ui, tab, &editing, &links.columns, reference, fetch_size, actions)
+                    results::show(
+                        ui,
+                        tab,
+                        &editing,
+                        &links.columns,
+                        reference,
+                        fetch_size,
+                        actions,
+                    )
                 });
             return;
         }
@@ -2354,7 +2394,15 @@ impl VioletApp {
                 // The panel remembers the height its contents take: they
                 // fill it, or it would shrink to a smaller result each run.
                 ui.set_min_height(ui.available_height());
-                results::show(ui, tab, &editing, &links.columns, reference, fetch_size, actions);
+                results::show(
+                    ui,
+                    tab,
+                    &editing,
+                    &links.columns,
+                    reference,
+                    fetch_size,
+                    actions,
+                );
             });
         self.layout.results = (total > 0.0).then(|| results.response.rect.height() / total);
 
@@ -2432,6 +2480,11 @@ impl VioletApp {
             && !rename_flow::show(ctx, prompt, &mut self.actions)
         {
             self.rename_prompt = None;
+        }
+        if let Some(prompt) = &mut self.drop_prompt
+            && !rename_flow::show_drop(ctx, prompt, &mut self.actions)
+        {
+            self.drop_prompt = None;
         }
         if let Some(chooser) = &mut self.chooser
             && !catalog_flow::show_chooser(ctx, chooser, &mut self.actions)

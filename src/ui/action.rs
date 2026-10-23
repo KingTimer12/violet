@@ -153,6 +153,9 @@ pub enum Action {
     AskRename(super::rename_flow::RenameTarget),
     /// The name typed in the rename prompt.
     RenameTo(String),
+    /// Asks to confirm deleting a database of a connection.
+    AskDropDatabase(ConnectionId, String),
+    DropDatabase,
     /// Closes several tabs at once, asking once about unsaved scripts.
     CloseTabs(Vec<TabId>),
     SelectTab(TabId),

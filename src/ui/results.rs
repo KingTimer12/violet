@@ -228,7 +228,9 @@ pub fn show(
                                 .stroke(Stroke::new(1.0, palette.outline)),
                         )
                         .show_separator_line(false)
-                        .show(ui, |ui| paging_bar(ui, tab.id, paging, fetching, fetch_size, actions));
+                        .show(ui, |ui| {
+                            paging_bar(ui, tab.id, paging, fetching, fetch_size, actions)
+                        });
                 }
                 let sort = match &tab.kind {
                     // Redis returns a key's elements in its own order.
@@ -354,7 +356,10 @@ fn paging_bar(
             {
                 actions.push(Action::FetchAll(tab));
             }
-            let next = format!("Next {}", thousands(usize::try_from(fetch_size).unwrap_or(usize::MAX)));
+            let next = format!(
+                "Next {}",
+                thousands(usize::try_from(fetch_size).unwrap_or(usize::MAX))
+            );
             if ui
                 .add_enabled_ui(idle && paging.has_more, |ui| {
                     widgets::button(ui, Tone::Secondary, Some(Icon::ChevronDown), &next)

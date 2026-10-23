@@ -31,6 +31,8 @@ pub enum RenameTarget {
         schema: String,
         name: String,
     },
+    /// Not a rename: the name of a database to create.
+    NewDatabase(ConnectionId),
 }
 
 pub struct RenamePrompt {
@@ -53,6 +55,18 @@ enum Renamed {
     Relation,
     Schema,
     Database,
+    Created,
+    Dropped,
+}
+
+/// Deleting a database: typed out in full, name and a random number, so
+/// it never happens by a slip.
+pub struct DropPrompt {
+    connection: ConnectionId,
+    name: String,
+    phrase: String,
+    text: String,
+    copied: Option<std::time::Instant>,
 }
 
 impl VioletApp {
@@ -115,6 +129,16 @@ impl VioletApp {
                     return;
                 }
                 name.clone()
+            }
+            RenameTarget::NewDatabase(connection) => {
+                if !matches!(self.family(*connection), Family::Postgres | Family::MySql) {
+                    self.toasts.push(
+                        ctx,
+                        Toast::info("Violet creates databases on PostgreSQL and MySQL only"),
+                    );
+                    return;
+                }
+                String::new()
             }
         };
         self.rename_prompt = Some(RenamePrompt {
@@ -242,8 +266,120 @@ impl VioletApp {
                     },
                 );
             }
+            RenameTarget::NewDatabase(connection) => {
+                if !self.backend.is_connected(connection) {
+                    prompt.error = Some("Connect first.".into());
+                    return;
+                }
+                let name = match self.family(connection) {
+                    Family::MySql => format!("`{}`", to.replace('`', "``")),
+                    _ => format!("\"{}\"", to.replace('"', "\"\"")),
+                };
+                let request = self.backend.execute_in(
+                    connection,
+                    None,
+                    format!("CREATE DATABASE {name}"),
+                    ExecOptions {
+                        cache: CachePolicy::Off,
+                        page: None,
+                    },
+                );
+                self.rename_requests.insert(
+                    request,
+                    Pending {
+                        connection,
+                        schema: String::new(),
+                        from: String::new(),
+                        to,
+                        what: Renamed::Created,
+                    },
+                );
+            }
         }
         self.rename_prompt = None;
+    }
+
+    pub(super) fn ask_drop_database(
+        &mut self,
+        ctx: &egui::Context,
+        connection: ConnectionId,
+        name: String,
+    ) {
+        if !matches!(self.family(connection), Family::Postgres | Family::MySql) {
+            self.toasts.push(
+                ctx,
+                Toast::info("Violet deletes databases on PostgreSQL and MySQL only"),
+            );
+            return;
+        }
+        if matches!(self.explorer.link(connection), Link::Online(server) if server.database == name)
+        {
+            self.toasts.push(
+                ctx,
+                Toast::error(
+                    "Cannot delete the database Violet is connected to",
+                    "Point the connection at another database, then delete this one.",
+                ),
+            );
+            return;
+        }
+        let number = std::hash::BuildHasher::hash_one(
+            &std::collections::hash_map::RandomState::new(),
+            &name,
+        ) % 900_000
+            + 100_000;
+        self.drop_prompt = Some(DropPrompt {
+            phrase: format!("{name}-{number}"),
+            connection,
+            name,
+            text: String::new(),
+            copied: None,
+        });
+    }
+
+    pub(super) fn drop_database(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = self.drop_prompt.take() else {
+            return;
+        };
+        if prompt.text != prompt.phrase {
+            self.drop_prompt = Some(prompt);
+            return;
+        }
+        let DropPrompt {
+            connection, name, ..
+        } = prompt;
+        if !self.backend.is_connected(connection) {
+            self.toasts
+                .push(ctx, Toast::error("Not connected", "Connect first."));
+            return;
+        }
+        // PostgreSQL refuses while a session is on it, Violet's too.
+        if let Some(session) = self.explorer.opened(connection, &name) {
+            self.actions.push(Action::Disconnect(session));
+        }
+        let quoted = match self.family(connection) {
+            Family::MySql => format!("`{}`", name.replace('`', "``")),
+            _ => format!("\"{}\"", name.replace('"', "\"\"")),
+        };
+        let request = self.backend.execute_in(
+            connection,
+            None,
+            format!("DROP DATABASE {quoted}"),
+            ExecOptions {
+                cache: CachePolicy::Off,
+                page: None,
+            },
+        );
+        self.rename_requests.insert(
+            request,
+            Pending {
+                connection,
+                schema: String::new(),
+                from: name,
+                to: String::new(),
+                what: Renamed::Dropped,
+            },
+        );
     }
 
     /// Retitles a tab; a saved script's file is renamed with it.
@@ -347,13 +483,13 @@ impl VioletApp {
         result: &Result<QueryOutput>,
     ) {
         if let Err(error) = result {
-            self.toasts.push(
-                ctx,
-                Toast::error(
-                    format!("Could not rename {}", pending.from),
-                    error.message.clone(),
-                ),
-            );
+            let title = match pending.what {
+                Renamed::Created => format!("Could not create {}", pending.to),
+                Renamed::Dropped => format!("Could not delete {}", pending.from),
+                _ => format!("Could not rename {}", pending.from),
+            };
+            self.toasts
+                .push(ctx, Toast::error(title, error.message.clone()));
             return;
         }
         if pending.what == Renamed::Schema {
@@ -365,6 +501,18 @@ impl VioletApp {
                     view.schema = pending.to.clone();
                 }
             }
+        }
+        if pending.what == Renamed::Dropped {
+            self.toasts
+                .push(ctx, Toast::success(format!("Deleted {}", pending.from)));
+            self.actions.push(Action::Refresh(pending.connection));
+            return;
+        }
+        if pending.what == Renamed::Created {
+            self.toasts
+                .push(ctx, Toast::success(format!("Created {}", pending.to)));
+            self.actions.push(Action::Refresh(pending.connection));
+            return;
         }
         if pending.what != Renamed::Relation {
             self.toasts.push(
@@ -414,6 +562,14 @@ pub fn show(ctx: &egui::Context, prompt: &mut RenamePrompt, actions: &mut Vec<Ac
             "Rename",
             "Renamed on the server. Queries and views that use the old name stop working.",
         ),
+        RenameTarget::NewDatabase(_) => (
+            "New database",
+            "Created on the server with its default settings.",
+        ),
+    };
+    let (icon, verb) = match &prompt.target {
+        RenameTarget::NewDatabase(_) => (Icon::Plus, "Create"),
+        _ => (Icon::Pencil, "Rename"),
     };
     let modal = egui::Modal::new(egui::Id::new("rename-prompt"))
         .frame(
@@ -434,17 +590,90 @@ pub fn show(ctx: &egui::Context, prompt: &mut RenamePrompt, actions: &mut Vec<Ac
             ui.label(RichText::new(body).color(palette.secondary));
             let response = ui.add(widgets::text_input(&mut prompt.text, "Name"));
             response.request_focus();
-            let submit =
-                response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            // The field asks for focus each frame, so it never reports
+            // losing it to Enter.
+            let submit = ui.input(|input| input.key_pressed(egui::Key::Enter));
             if let Some(error) = &prompt.error {
                 ui.label(RichText::new(error).color(palette.danger));
             }
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if widgets::button(ui, Tone::Primary, Some(Icon::Pencil), "Rename").clicked()
+                    if widgets::button(ui, Tone::Primary, Some(icon), verb).clicked() || submit {
+                        actions.push(Action::RenameTo(prompt.text.clone()));
+                    }
+                    if widgets::button(ui, Tone::Ghost, None, "Cancel").clicked() {
+                        open = false;
+                    }
+                });
+            });
+        });
+    open && !modal.should_close()
+}
+
+/// Asks to type the confirmation phrase. Returns whether it is still open.
+pub fn show_drop(ctx: &egui::Context, prompt: &mut DropPrompt, actions: &mut Vec<Action>) -> bool {
+    let palette = Palette::current(ctx);
+    let mut open = true;
+    let modal = egui::Modal::new(egui::Id::new("drop-database"))
+        .frame(
+            egui::Frame::new()
+                .fill(palette.surface)
+                .stroke(Stroke::new(1.0, palette.outline))
+                .corner_radius(CornerRadius::same(14))
+                .inner_margin(egui::Margin::same(22)),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(400.0);
+            ui.spacing_mut().item_spacing.y = 12.0;
+            ui.label(
+                RichText::new(format!("Delete database {}", prompt.name))
+                    .font(theme::semibold(16.0))
+                    .color(palette.danger),
+            );
+            ui.label(
+                RichText::new(
+                    "Every table and row in it is gone for good. Its open sessions are closed first.",
+                )
+                .color(palette.secondary),
+            );
+            ui.label(RichText::new("Type this to confirm:").color(palette.secondary));
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(&prompt.phrase)
+                        .font(theme::mono(13.5))
+                        .color(palette.text),
+                );
+                let copied = prompt
+                    .copied
+                    .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(1500));
+                if copied {
+                    ui.ctx().request_repaint();
+                }
+                let (icon, label) = if copied {
+                    (Icon::CircleCheck, "Copied")
+                } else {
+                    (Icon::Copy, "Copy")
+                };
+                if widgets::button(ui, Tone::Ghost, Some(icon), label).clicked() {
+                    prompt.copied = Some(std::time::Instant::now());
+                    actions.push(Action::Copy(prompt.phrase.clone()));
+                }
+            });
+            let response = ui.add(widgets::text_input(&mut prompt.text, &prompt.phrase));
+            response.request_focus();
+            let matches = prompt.text == prompt.phrase;
+            let submit = matches && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled_ui(matches, |ui| {
+                            widgets::button(ui, Tone::Danger, Some(Icon::Trash), "Delete")
+                        })
+                        .inner
+                        .clicked()
                         || submit
                     {
-                        actions.push(Action::RenameTo(prompt.text.clone()));
+                        actions.push(Action::DropDatabase);
                     }
                     if widgets::button(ui, Tone::Ghost, None, "Cancel").clicked() {
                         open = false;

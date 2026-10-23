@@ -306,6 +306,13 @@ fn connection(
             if menu_item(ui, Icon::Refresh, "Refresh") {
                 actions.push(Action::Refresh(id));
             }
+            if matches!(family, Family::Postgres | Family::MySql)
+                && menu_item(ui, Icon::Plus, "New database…")
+            {
+                actions.push(Action::AskRename(
+                    super::rename_flow::RenameTarget::NewDatabase(id),
+                ));
+            }
             if language == Language::Redis || profile.show_all_databases {
                 if menu_item(ui, Icon::Funnel, "Choose databases…") {
                     actions.push(Action::ChooseDatabases(id));
@@ -723,6 +730,12 @@ fn database_node(
         }
         if menu_item(ui, Icon::Copy, "Copy name") {
             actions.push(Action::Copy(database.to_owned()));
+        }
+        if matches!(family, Family::Postgres | Family::MySql)
+            && !own
+            && menu_item(ui, Icon::Trash, "Delete database…  (Del)")
+        {
+            actions.push(Action::AskDropDatabase(parent, database.to_owned()));
         }
     });
 
