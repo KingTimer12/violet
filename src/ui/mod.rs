@@ -2046,11 +2046,12 @@ impl VioletApp {
         let Some(node) = self.explorer.selected.clone() else {
             return false;
         };
-        let (refresh, rename, edit) = ctx.input_mut(|input| {
+        let (refresh, rename, edit, delete) = ctx.input_mut(|input| {
             (
                 shortcuts::consume(input, Command::Refresh),
                 shortcuts::consume(input, Command::Rename),
                 shortcuts::consume(input, Command::EditConnection),
+                input.consume_key(egui::Modifiers::NONE, egui::Key::Delete),
             )
         });
         let id = match &node {
@@ -2119,6 +2120,15 @@ impl VioletApp {
                         }));
                 }
                 NodeKey::Connection(id) => self.actions.push(Action::EditConnection(*id)),
+                _ => {}
+            }
+        }
+        if delete {
+            match &node {
+                NodeKey::Database(parent, name) => self
+                    .actions
+                    .push(Action::AskDropDatabase(*parent, name.clone())),
+                NodeKey::Connection(id) => self.actions.push(Action::AskDeleteConnection(*id)),
                 _ => {}
             }
         }

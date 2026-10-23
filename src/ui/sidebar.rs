@@ -733,7 +733,7 @@ fn database_node(
         }
         if matches!(family, Family::Postgres | Family::MySql)
             && !own
-            && menu_item(ui, Icon::Trash, "Delete database…")
+            && menu_item(ui, Icon::Trash, "Delete database…  (Del)")
         {
             actions.push(Action::AskDropDatabase(parent, database.to_owned()));
         }
