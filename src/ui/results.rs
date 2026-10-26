@@ -709,6 +709,7 @@ fn grid(
                             let mut cell = None;
                             // A foreign key value's link.
                             let mut chip = None;
+                            let mut check = None;
                             // Set when the field in the cell lets go of
                             // the keyboard: whether by Escape, by Tab, and
                             // with Shift.
@@ -775,15 +776,16 @@ fn grid(
                                 let link = links.get(column).copied().unwrap_or(false)
                                     && !added
                                     && !deleted;
-                                chip = cells::paint(
+                                let painted = cells::paint(
                                     ui,
                                     cell_text,
                                     looks[column],
                                     meta.numeric,
                                     color,
                                     link,
-                                )
-                                .link;
+                                );
+                                chip = painted.link;
+                                check = painted.check;
                                 // The cell is painted, not laid out, and the
                                 // table's own response for it has no area:
                                 // it takes clicks itself.
@@ -830,6 +832,23 @@ fn grid(
                                     .is_some_and(|(pointer, chip)| chip.contains(pointer));
                                 if on_link && mode == Mode::Replace {
                                     actions.push(Action::FollowKey(tab, index, column));
+                                }
+                                let on_check = response
+                                    .interact_pointer_pos()
+                                    .zip(check)
+                                    .is_some_and(|(pointer, check)| check.contains(pointer));
+                                if on_check
+                                    && editable
+                                    && !deleted
+                                    && mode == Mode::Replace
+                                    && let Some(flipped) = value.and_then(cells::toggled)
+                                {
+                                    actions.push(Action::SetCell(
+                                        tab,
+                                        index,
+                                        column,
+                                        Some(flipped.to_owned()),
+                                    ));
                                 }
                             }
                             if chip.is_some_and(|chip| {

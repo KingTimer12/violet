@@ -65,6 +65,22 @@ pub fn boolean(text: &str) -> Option<bool> {
     }
 }
 
+/// `text` flipped, written the way `text` was: `t`/`f`, `true`/`false`,
+/// `TRUE`/`FALSE` or `1`/`0`.
+pub fn toggled(text: &str) -> Option<&'static str> {
+    Some(match text {
+        "t" => "f",
+        "f" => "t",
+        "true" => "false",
+        "false" => "true",
+        "TRUE" => "FALSE",
+        "FALSE" => "TRUE",
+        "1" => "0",
+        "0" => "1",
+        _ => return None,
+    })
+}
+
 /// The text a geometry value shows: its well-known text, or the value
 /// itself when it does not read as geometry.
 pub fn geometry_text(text: &str) -> Cow<'_, str> {
@@ -75,6 +91,8 @@ pub fn geometry_text(text: &str) -> Cow<'_, str> {
 pub struct Painted {
     /// The link's area, when the cell is a foreign key's value.
     pub link: Option<Rect>,
+    /// The checkbox's area, when the cell is a boolean's value.
+    pub check: Option<Rect>,
 }
 
 /// Paints `cell` in the cell `ui` stands for, the way `look` shows it, cut
@@ -88,14 +106,17 @@ pub fn paint(
     color: Color32,
     link: bool,
 ) -> Painted {
-    let mut painted = Painted { link: None };
+    let mut painted = Painted {
+        link: None,
+        check: None,
+    };
     let Cell::Value(text) = cell else {
         paint_text(ui, cell, right_aligned, color);
         return painted;
     };
     match look {
         Look::Boolean => match boolean(text) {
-            Some(value) => paint_check(ui, value, color),
+            Some(value) => painted.check = paint_check(ui, value, color),
             None => paint_text(ui, cell, right_aligned, color),
         },
         Look::Geometry => {
@@ -146,13 +167,13 @@ pub fn paint_text(ui: &Ui, cell: Cell<'_>, right_aligned: bool, color: Color32) 
 }
 
 /// A check box, ticked for true; `color` dims it with the row.
-fn paint_check(ui: &Ui, value: bool, color: Color32) {
+fn paint_check(ui: &Ui, value: bool, color: Color32) -> Option<Rect> {
     let palette = Palette::current(ui.ctx());
     let rect = ui.max_rect();
     let size = 14.0;
     let left = rect.left() + CELL_PADDING;
     if rect.right() - left < size {
-        return;
+        return None;
     }
     let dim = color == palette.dim;
     let accent = if dim {
@@ -177,6 +198,7 @@ fn paint_check(ui: &Ui, value: bool, color: Color32) {
             egui::StrokeKind::Inside,
         );
     }
+    Some(check)
 }
 
 /// A foreign key's value: accent text on a soft chip with an arrow, which
@@ -297,5 +319,14 @@ mod tests {
         assert_eq!(boolean("t"), Some(true));
         assert_eq!(boolean("0"), Some(false));
         assert_eq!(boolean("2"), None);
+    }
+
+    #[test]
+    fn toggles_keep_the_spelling() {
+        assert_eq!(toggled("t"), Some("f"));
+        assert_eq!(toggled("false"), Some("true"));
+        assert_eq!(toggled("TRUE"), Some("FALSE"));
+        assert_eq!(toggled("1"), Some("0"));
+        assert_eq!(toggled("yes"), None);
     }
 }
