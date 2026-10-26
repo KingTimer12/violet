@@ -641,12 +641,18 @@ pub fn toolbar(
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.add_space(10.0);
             connection_picker(ui, tab, profiles, explorer, actions);
-            ui.label(RichText::new("Connection").color(palette.dim));
+            // A narrow editor, beside the agent panel say, keeps the picker
+            // and drops its label rather than draw over the buttons.
+            if ui.available_width() > 120.0 {
+                ui.label(RichText::new("Connection").color(palette.dim));
+            }
             let history_tip = format!(
                 "Query history ({})",
                 ui.ctx().format_shortcut(&shortcuts::get(Command::History))
             );
-            if widgets::icon_button(ui, Icon::Clock, &history_tip).clicked() {
+            if ui.available_width() > 36.0
+                && widgets::icon_button(ui, Icon::Clock, &history_tip).clicked()
+            {
                 actions.push(Action::OpenHistory);
             }
         });
