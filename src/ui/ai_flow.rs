@@ -194,7 +194,7 @@ impl VioletApp {
     }
 
     /// The name of a connection's driver, such as `PostgreSQL`.
-    fn driver_name(&self, id: violet_core::ConnectionId) -> String {
+    pub(super) fn driver_name(&self, id: violet_core::ConnectionId) -> String {
         self.profiles
             .get(self.profile_of(id))
             .and_then(|profile| self.backend.registry().get(&profile.driver))

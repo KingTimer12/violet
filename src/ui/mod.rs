@@ -3,6 +3,7 @@
 //! against the application layer.
 
 mod action;
+mod agent_flow;
 mod ai_flow;
 mod catalog_flow;
 mod cells;
@@ -20,6 +21,7 @@ mod history;
 pub mod icons;
 mod key_flow;
 mod keys_flow;
+mod mcp_flow;
 mod project_flow;
 mod providers;
 mod reference;
@@ -128,6 +130,7 @@ pub struct VioletApp {
     tx_settled: bool,
     keys_dialog: Option<keys_flow::KeysDialog>,
     ai_dialog: Option<ai_flow::AiDialog>,
+    agent: agent_flow::AgentPanel,
     cell_editor: Option<edit_flow::CellEditor>,
     edit_review: Option<edit_flow::EditReview>,
     run_review: Option<edit_flow::RunReview>,
@@ -282,6 +285,7 @@ impl VioletApp {
             tx_settled: false,
             keys_dialog: None,
             ai_dialog: None,
+            agent: agent_flow::AgentPanel::default(),
             cell_editor: None,
             edit_review: None,
             run_review: None,
@@ -2039,6 +2043,13 @@ impl VioletApp {
             Action::AiInsert => self.ai_insert(ctx),
             Action::SaveAiSettings(settings, key) => self.save_ai_settings(ctx, settings, key),
             Action::ForgetAiKey(provider) => self.forget_ai_key(ctx, provider),
+            Action::ToggleAgent => self.toggle_agent(ctx),
+            Action::StartAgent => self.start_agent(ctx),
+            Action::StopAgent => self.stop_agent(),
+            Action::ClearAgent => self.clear_agent(ctx),
+            Action::SendToAgent => self.send_to_agent(),
+            Action::CancelAgent => self.cancel_agent(),
+            Action::SetAgentCommand(command) => self.set_agent_command(ctx, command),
             action @ (Action::OpenTask { .. }
             | Action::TrustTools(_)
             | Action::TaskFindPrograms
@@ -2368,6 +2379,9 @@ impl VioletApp {
             {
                 self.actions.push(Action::AskAi(tab, ai_flow::Mode::Write));
             }
+            if shortcuts::consume(input, Command::ToggleAgent) {
+                self.actions.push(Action::ToggleAgent);
+            }
             if shortcuts::consume(input, Command::NewConnection) {
                 self.actions.push(Action::NewConnection);
             }
@@ -2681,6 +2695,7 @@ impl eframe::App for VioletApp {
             .map(|info| (info.id.as_str().to_owned(), info.language))
             .collect();
         self.handle_events(ctx);
+        self.poll_agent(ctx);
         self.capture_shortcut(ctx);
         self.shortcuts(ctx);
         self.auto_refresh(ctx);
@@ -2799,6 +2814,27 @@ impl eframe::App for VioletApp {
         self.layout.sidebar = sidebar.map(|sidebar| sidebar.response.rect.width());
         if sidebar_open != self.settings.sidebar {
             self.actions.push(Action::ToggleSidebar);
+        }
+
+        if self.agent.open {
+            let command = if self.settings.agent_command.trim().is_empty() {
+                crate::agent::DEFAULT_COMMAND
+            } else {
+                self.settings.agent_command.as_str()
+            };
+            Panel::right("agent")
+                .resizable(true)
+                .default_size(380.0)
+                .size_range(300.0..=720.0)
+                .frame(
+                    Frame::NONE
+                        .fill(palette.panel)
+                        .stroke(Stroke::new(1.0, palette.outline)),
+                )
+                .show(ui, |ui| {
+                    ui.set_min_height(ui.available_height());
+                    agent_flow::show(ui, &mut self.agent, command, &mut self.actions);
+                });
         }
 
         self.layout.results = None;

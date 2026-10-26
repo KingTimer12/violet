@@ -84,6 +84,9 @@ pub struct Settings {
     pub active_project: Option<String>,
     /// The language model Ask AI uses.
     pub ai: crate::ai::AiSettings,
+    /// The command that starts the agent panel's agent; empty for Claude
+    /// Code's ACP adapter.
+    pub agent_command: String,
 }
 
 impl Default for Settings {
@@ -108,6 +111,7 @@ impl Default for Settings {
             projects: Vec::new(),
             active_project: None,
             ai: crate::ai::AiSettings::default(),
+            agent_command: String::new(),
         }
     }
 }

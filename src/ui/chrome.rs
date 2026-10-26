@@ -86,6 +86,14 @@ pub fn title_bar(
                     sql: String::new(),
                 });
             }
+            let agent_tip = format!(
+                "Agent ({})",
+                ui.ctx()
+                    .format_shortcut(&shortcuts::get(Command::ToggleAgent))
+            );
+            if widgets::icon_button(ui, Icon::Bot, &agent_tip).clicked() {
+                actions.push(Action::ToggleAgent);
+            }
             if widgets::icon_button(ui, Icon::Package, "Database providers").clicked() {
                 actions.push(Action::OpenProviders);
             }

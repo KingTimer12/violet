@@ -22,7 +22,8 @@
 //! (manual commit, then a write into a temporary table, left
 //! uncommitted), `ai` (Ask AI on an editor; `VIOLET_SCENE_PROMPT` sends a
 //! request to `VIOLET_SCENE_AI_URL`; `VIOLET_SCENE_AI_MODE` is `explain` or
-//! `fix`, which runs `VIOLET_SCENE_SQL` first). A profile without
+//! `fix`, which runs `VIOLET_SCENE_SQL` first), `agent` (the agent panel: see
+//! the scene). A profile without
 //! a saved password connects with `VIOLET_SCENE_PASSWORD`. Add
 //! `VIOLET_THEME=light` for the light theme.
 
@@ -158,7 +159,7 @@ impl VioletApp {
             }
             (
                 "browse" | "error" | "data" | "menu" | "page" | "complete" | "explain" | "history"
-                | "task" | "edit" | "sort" | "keys" | "transaction" | "ai",
+                | "task" | "edit" | "sort" | "keys" | "transaction" | "ai" | "agent",
                 0,
             ) => {
                 if let Some(id) = first {
@@ -349,6 +350,38 @@ impl VioletApp {
                     return snapshot.step > 40;
                 }
                 (!apply && self.ai_scene_settled()) || elapsed > Duration::from_secs(15)
+            }
+            // The agent panel with `VIOLET_SCENE_AGENT_COMMAND` as the agent:
+            // sends `VIOLET_SCENE_PROMPT` and waits for the turn to end.
+            ("agent", 1) => {
+                let Some(id) = first else { return true };
+                if !self.explorer.link(id).is_online() {
+                    return false;
+                }
+                if let Ok(command) = std::env::var("VIOLET_SCENE_AGENT_COMMAND") {
+                    self.settings.agent_command = command;
+                }
+                self.actions.push(Action::OpenEditor {
+                    connection: Some(id),
+                    sql: "SELECT * FROM customers;\n".into(),
+                });
+                self.actions.push(Action::ToggleAgent);
+                snapshot.step += 1;
+                false
+            }
+            ("agent", 2) => {
+                // Nothing else wakes the window while waiting.
+                ctx.request_repaint_after(Duration::from_millis(100));
+                let prompt = std::env::var("VIOLET_SCENE_PROMPT")
+                    .unwrap_or_else(|_| "Write a query of orders per customer".into());
+                if elapsed > Duration::from_secs(3) && self.agent_scene_send(&prompt) {
+                    snapshot.step += 1;
+                }
+                elapsed > Duration::from_secs(30)
+            }
+            ("agent", _) => {
+                ctx.request_repaint_after(Duration::from_millis(100));
+                self.agent_scene_idle() || elapsed > Duration::from_secs(30)
             }
             ("sort", 1) => {
                 let Some(id) = first else { return true };

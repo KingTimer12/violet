@@ -7,6 +7,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agent;
 mod ai;
 mod completion;
 mod editing;
@@ -14,6 +15,7 @@ mod export;
 mod format;
 mod geometry;
 mod lang;
+mod mcp;
 mod settings;
 mod sql;
 mod ui;

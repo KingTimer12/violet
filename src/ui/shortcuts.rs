@@ -40,11 +40,12 @@ pub enum Command {
     Rename,
     EditConnection,
     AskAi,
+    ToggleAgent,
 }
 
 impl Command {
     /// Every command, in the order the shortcuts dialog lists them.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::RunStatement,
         Self::RunScript,
         Self::Cancel,
@@ -66,6 +67,7 @@ impl Command {
         Self::Rename,
         Self::EditConnection,
         Self::AskAi,
+        Self::ToggleAgent,
     ];
 
     /// The name its shortcut is kept under in the settings.
@@ -92,6 +94,7 @@ impl Command {
             Self::Rename => "rename",
             Self::EditConnection => "edit-connection",
             Self::AskAi => "ask-ai",
+            Self::ToggleAgent => "toggle-agent",
         }
     }
 
@@ -118,6 +121,7 @@ impl Command {
             Self::Rename => "Rename",
             Self::EditConnection => "Edit connection",
             Self::AskAi => "Ask AI for a query",
+            Self::ToggleAgent => "Toggle agent panel",
         }
     }
 
@@ -144,6 +148,7 @@ impl Command {
             Self::Rename => (Modifiers::NONE, Key::F2),
             Self::EditConnection => (Modifiers::NONE, Key::F4),
             Self::AskAi => (Modifiers::COMMAND, Key::K),
+            Self::ToggleAgent => (Modifiers::COMMAND, Key::I),
         };
         KeyboardShortcut::new(modifiers, key)
     }
