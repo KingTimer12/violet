@@ -139,11 +139,12 @@ impl VioletApp {
                 let range = executed.offset..executed.offset + original.len();
                 let target = (tab.sql.get(range.clone()) == Some(original.as_str()))
                     .then(|| (range, original.clone()));
+                // The detail stays here: servers put row values in it, such as
+                // `Key (email)=(a@b.c) already exists` or `Failing row
+                // contains (…)`, and no row leaves without the user's say.
                 let mut why = error.message.clone();
-                for (label, value) in [("Detail", &error.detail), ("Hint", &error.hint)] {
-                    if let Some(value) = value {
-                        why.push_str(&format!("\n{label}: {value}"));
-                    }
+                if let Some(hint) = &error.hint {
+                    why.push_str(&format!("\nHint: {hint}"));
                 }
                 if let Some(code) = &error.code {
                     why.push_str(&format!("\nCode: {code}"));
