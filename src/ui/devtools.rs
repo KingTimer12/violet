@@ -20,7 +20,9 @@
 //! item at `VIOLET_SCENE_APPLY_X`, `_Y`), `keys` (a key-value store's
 //! keys in the tree, and `VIOLET_SCENE_KEY`'s data tab), `transaction`
 //! (manual commit, then a write into a temporary table, left
-//! uncommitted). A profile without
+//! uncommitted), `ai` (Ask AI on an editor; `VIOLET_SCENE_PROMPT` sends a
+//! request to `VIOLET_SCENE_AI_URL`; `VIOLET_SCENE_AI_MODE` is `explain` or
+//! `fix`, which runs `VIOLET_SCENE_SQL` first). A profile without
 //! a saved password connects with `VIOLET_SCENE_PASSWORD`. Add
 //! `VIOLET_THEME=light` for the light theme.
 
@@ -156,7 +158,7 @@ impl VioletApp {
             }
             (
                 "browse" | "error" | "data" | "menu" | "page" | "complete" | "explain" | "history"
-                | "task" | "edit" | "sort" | "keys" | "transaction",
+                | "task" | "edit" | "sort" | "keys" | "transaction" | "ai",
                 0,
             ) => {
                 if let Some(id) = first {
@@ -271,6 +273,82 @@ impl VioletApp {
                     snapshot.step += 1;
                 }
                 false
+            }
+            ("ai", 1) => {
+                let Some(id) = first else { return true };
+                if self.explorer.link(id).is_online() {
+                    let sql = std::env::var("VIOLET_SCENE_SQL")
+                        .unwrap_or_else(|_| "-- orders per customer\n".into());
+                    self.actions.push(Action::OpenEditor {
+                        connection: Some(id),
+                        sql,
+                    });
+                    snapshot.step += 1;
+                }
+                false
+            }
+            ("ai", 2) => {
+                // `VIOLET_SCENE_AI_URL` points Ask AI at an OpenAI-compatible
+                // server, such as a local stand-in.
+                if let Ok(url) = std::env::var("VIOLET_SCENE_AI_URL") {
+                    self.settings.ai = crate::ai::AiSettings {
+                        provider: crate::ai::Provider::OpenAi,
+                        openai_url: url,
+                        openai_model: "stand-in".into(),
+                        ..crate::ai::AiSettings::default()
+                    };
+                }
+                // Fixing needs a failed run first.
+                let fix = std::env::var("VIOLET_SCENE_AI_MODE").as_deref() == Ok("fix");
+                if fix && let Some(tab) = self.workspace.active() {
+                    if tab.running.is_some() {
+                        return false;
+                    }
+                    if tab.outcome.is_none() {
+                        self.actions.push(Action::Run(tab.id, RunScope::Statement));
+                        return false;
+                    }
+                }
+                if let Some(tab) = self.workspace.active {
+                    let mode = match std::env::var("VIOLET_SCENE_AI_MODE").as_deref() {
+                        Ok("explain") => super::ai_flow::Mode::Explain,
+                        Ok("fix") => super::ai_flow::Mode::Fix,
+                        _ => super::ai_flow::Mode::Write,
+                    };
+                    self.actions.push(Action::AskAi(tab, mode));
+                    snapshot.step += 1;
+                }
+                false
+            }
+            // With `VIOLET_SCENE_PROMPT`, sends it once the schema loaded.
+            ("ai", 3) => {
+                // Explaining and fixing send by themselves.
+                let Ok(prompt) = std::env::var("VIOLET_SCENE_PROMPT") else {
+                    snapshot.step += 1;
+                    return false;
+                };
+                if elapsed > Duration::from_secs(5) {
+                    self.ai_scene_prompt(&prompt);
+                    self.actions.push(Action::AiGenerate);
+                    snapshot.step += 1;
+                }
+                false
+            }
+            // `VIOLET_SCENE_AI_APPLY` then puts the answer in the editor.
+            ("ai", _) => {
+                let apply = std::env::var_os("VIOLET_SCENE_AI_APPLY").is_some();
+                if apply && self.ai_scene_settled() {
+                    self.actions.push(Action::AiInsert);
+                    snapshot.step = 10;
+                    return false;
+                }
+                // A few frames for the dialog to fade and the editor to show it.
+                if apply && snapshot.step >= 10 {
+                    snapshot.step += 1;
+                    ctx.request_repaint();
+                    return snapshot.step > 40;
+                }
+                (!apply && self.ai_scene_settled()) || elapsed > Duration::from_secs(15)
             }
             ("sort", 1) => {
                 let Some(id) = first else { return true };

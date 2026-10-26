@@ -577,6 +577,26 @@ pub fn toolbar(
         if widgets::icon_button(ui, Icon::Function, &format_tip).clicked() {
             actions.push(Action::FormatSql(tab.id));
         }
+        let ai = widgets::icon_button(ui, Icon::Sparkles, "Ask AI");
+        egui::Popup::menu(&ai).show(|ui| {
+            use super::ai_flow::Mode;
+            let failed = super::results::fixable(tab);
+            let write = ui.ctx().format_shortcut(&shortcuts::get(Command::AskAi));
+            if mode_item(ui, Icon::Sparkles, "Write a query…", &write) {
+                actions.push(Action::AskAi(tab.id, Mode::Write));
+            }
+            if mode_item(ui, Icon::Info, "Explain the statement", "") {
+                actions.push(Action::AskAi(tab.id, Mode::Explain));
+            }
+            if ui
+                .add_enabled_ui(failed, |ui| {
+                    mode_item(ui, Icon::CircleAlert, "Fix the failed statement", "")
+                })
+                .inner
+            {
+                actions.push(Action::AskAi(tab.id, Mode::Fix));
+            }
+        });
         let find_tip = format!(
             "Find ({}), replace ({})",
             ui.ctx().format_shortcut(&shortcuts::get(Command::Find)),

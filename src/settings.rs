@@ -82,6 +82,8 @@ pub struct Settings {
     pub projects: Vec<Project>,
     /// The workspace open; `None` for the default one.
     pub active_project: Option<String>,
+    /// The language model Ask AI uses.
+    pub ai: crate::ai::AiSettings,
 }
 
 impl Default for Settings {
@@ -105,6 +107,7 @@ impl Default for Settings {
             fetch_size: violet_core::Page::SIZE,
             projects: Vec::new(),
             active_project: None,
+            ai: crate::ai::AiSettings::default(),
         }
     }
 }

@@ -79,7 +79,8 @@ pub fn show(
             );
         }
         Some(Outcome::Failed { error, executed }) => {
-            error_card(ui, error, executed, tab.sql.as_str())
+            let fix = fixable(tab).then_some(tab.id);
+            error_card(ui, error, executed, tab.sql.as_str(), fix, actions);
         }
         Some(Outcome::Done { output, .. }) => {
             if output.sets.is_empty() {
@@ -1255,7 +1256,31 @@ pub(super) fn column_width(set: &ResultSet, index: usize, name: &str) -> f32 {
     (longest as f32 * 7.6 + 28.0).clamp(72.0, 380.0)
 }
 
-fn error_card(ui: &mut Ui, error: &DbError, executed: &Executed, editor: &str) {
+/// Whether an editor's last run failed in a way the AI may fix: the
+/// statement was refused, not cancelled or cut off.
+pub(super) fn fixable(tab: &QueryTab) -> bool {
+    tab.data().is_none()
+        && matches!(
+            &tab.outcome,
+            Some(Outcome::Failed { error, .. }) if !matches!(
+                error.kind,
+                violet_core::ErrorKind::Cancelled
+                    | violet_core::ErrorKind::NotConnected
+                    | violet_core::ErrorKind::Connection
+            )
+        )
+}
+
+/// The error of a run; `fix` offers to have the AI fix the statement of
+/// that tab.
+fn error_card(
+    ui: &mut Ui,
+    error: &DbError,
+    executed: &Executed,
+    editor: &str,
+    fix: Option<super::workspace::TabId>,
+    actions: &mut Vec<Action>,
+) {
     let palette = Palette::current(ui.ctx());
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
@@ -1288,6 +1313,20 @@ fn error_card(ui: &mut Ui, error: &DbError, executed: &Executed, editor: &str) {
                         );
                         if let Some(code) = &error.code {
                             widgets::pill(ui, code, palette.secondary, palette.surface_hover);
+                        }
+                        if let Some(tab) = fix {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if widgets::button(
+                                    ui,
+                                    Tone::Secondary,
+                                    Some(Icon::Sparkles),
+                                    "Fix with AI",
+                                )
+                                .clicked()
+                                {
+                                    actions.push(Action::AskAi(tab, super::ai_flow::Mode::Fix));
+                                }
+                            });
                         }
                     });
                     ui.add_space(6.0);

@@ -73,6 +73,7 @@ fastframe_icons::icons! {
         Link => "link",
         Keyboard => "keyboard",
         Undo => "undo-2",
+        Sparkles => "sparkles",
         PostgreSql => "postgresql",
         MySql => "mysql",
         MariaDb => "mariadb",

@@ -46,6 +46,41 @@ impl SecretStore for KeyringSecretStore {
     }
 }
 
+/// The keychain service API keys are filed under, apart from connections.
+const API_KEYS: &str = "dev.violet.ai";
+
+/// API keys of the AI providers, in the platform keychain, one entry per
+/// provider name.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KeyringApiKeys;
+
+impl KeyringApiKeys {
+    fn entry(provider: &str) -> Result<keyring::Entry> {
+        keyring::Entry::new(API_KEYS, provider).map_err(|error| keychain_error(&error))
+    }
+
+    pub fn get(self, provider: &str) -> Result<Option<Secret>> {
+        match Self::entry(provider)?.get_password() {
+            Ok(key) => Ok(Some(Secret::new(key))),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(error) => Err(keychain_error(&error)),
+        }
+    }
+
+    pub fn set(self, provider: &str, key: &Secret) -> Result<()> {
+        Self::entry(provider)?
+            .set_password(key.expose())
+            .map_err(|error| keychain_error(&error))
+    }
+
+    pub fn delete(self, provider: &str) -> Result<()> {
+        match Self::entry(provider)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(keychain_error(&error)),
+        }
+    }
+}
+
 /// Secrets held for this run only.
 #[derive(Debug, Default)]
 pub struct MemorySecretStore {

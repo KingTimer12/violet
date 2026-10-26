@@ -3,6 +3,7 @@
 //! against the application layer.
 
 mod action;
+mod ai_flow;
 mod catalog_flow;
 mod cells;
 mod chrome;
@@ -126,6 +127,7 @@ pub struct VioletApp {
     /// Open transactions were dealt with: the window may close.
     tx_settled: bool,
     keys_dialog: Option<keys_flow::KeysDialog>,
+    ai_dialog: Option<ai_flow::AiDialog>,
     cell_editor: Option<edit_flow::CellEditor>,
     edit_review: Option<edit_flow::EditReview>,
     run_review: Option<edit_flow::RunReview>,
@@ -279,6 +281,7 @@ impl VioletApp {
             ending: HashMap::new(),
             tx_settled: false,
             keys_dialog: None,
+            ai_dialog: None,
             cell_editor: None,
             edit_review: None,
             run_review: None,
@@ -2031,6 +2034,11 @@ impl VioletApp {
                 ),
             },
             Action::InsertSql(text) => self.insert_sql(ctx, &text),
+            Action::AskAi(tab, mode) => self.open_ai(ctx, tab, mode),
+            Action::AiGenerate => self.ai_generate(ctx),
+            Action::AiInsert => self.ai_insert(ctx),
+            Action::SaveAiSettings(settings, key) => self.save_ai_settings(ctx, settings, key),
+            Action::ForgetAiKey(provider) => self.forget_ai_key(ctx, provider),
             action @ (Action::OpenTask { .. }
             | Action::TrustTools(_)
             | Action::TaskFindPrograms
@@ -2272,6 +2280,7 @@ impl VioletApp {
             || self.history_view.is_some()
             || self.task_dialog.is_some()
             || self.keys_dialog.is_some()
+            || self.ai_dialog.is_some()
             || self.key_dialog.is_some()
             || self.rename_prompt.is_some()
             || self.drop_prompt.is_some();
@@ -2353,6 +2362,11 @@ impl VioletApp {
                 && let Some(tab) = active
             {
                 self.actions.push(Action::CloseTab(tab));
+            }
+            if shortcuts::consume(input, Command::AskAi)
+                && let Some(tab) = active
+            {
+                self.actions.push(Action::AskAi(tab, ai_flow::Mode::Write));
             }
             if shortcuts::consume(input, Command::NewConnection) {
                 self.actions.push(Action::NewConnection);
@@ -2595,6 +2609,7 @@ impl VioletApp {
         {
             self.keys_dialog = None;
         }
+        self.ai_modal(ctx);
         if let Some(answer) = self
             .close_confirm
             .as_ref()
