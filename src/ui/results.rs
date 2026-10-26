@@ -709,6 +709,8 @@ fn grid(
                             let mut cell = None;
                             // A foreign key value's link.
                             let mut chip = None;
+                            // A boolean's check box.
+                            let mut check = None;
                             // Set when the field in the cell lets go of
                             // the keyboard: whether by Escape, by Tab, and
                             // with Shift.
@@ -775,15 +777,16 @@ fn grid(
                                 let link = links.get(column).copied().unwrap_or(false)
                                     && !added
                                     && !deleted;
-                                chip = cells::paint(
+                                let painted = cells::paint(
                                     ui,
                                     cell_text,
                                     looks[column],
                                     meta.numeric,
                                     color,
                                     link,
-                                )
-                                .link;
+                                );
+                                chip = painted.link;
+                                check = painted.check;
                                 // The cell is painted, not laid out, and the
                                 // table's own response for it has no area:
                                 // it takes clicks itself.
@@ -831,10 +834,36 @@ fn grid(
                                 if on_link && mode == Mode::Replace {
                                     actions.push(Action::FollowKey(tab, index, column));
                                 }
+                                // Clicking a boolean's check box flips it,
+                                // as editing the value would.
+                                let on_check =
+                                    response.interact_pointer_pos().zip(check).is_some_and(
+                                        |(pointer, check)| check.expand(3.0).contains(pointer),
+                                    );
+                                if on_check
+                                    && editable
+                                    && mode == Mode::Replace
+                                    && let Some(flipped) = value.and_then(cells::toggled)
+                                {
+                                    actions.push(Action::SetCell(
+                                        tab,
+                                        index,
+                                        column,
+                                        Some(flipped.to_owned()),
+                                    ));
+                                }
                             }
-                            if chip.is_some_and(|chip| {
-                                response.hover_pos().is_some_and(|p| chip.contains(p))
-                            }) {
+                            let on_check = editable
+                                && check.is_some_and(|check| {
+                                    response
+                                        .hover_pos()
+                                        .is_some_and(|p| check.expand(3.0).contains(p))
+                                });
+                            if on_check
+                                || chip.is_some_and(|chip| {
+                                    response.hover_pos().is_some_and(|p| chip.contains(p))
+                                })
+                            {
                                 response.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                             }
                             // Right-clicking outside the selection picks the
@@ -842,7 +871,9 @@ fn grid(
                             if response.secondary_clicked() && !selected.contains((index, column)) {
                                 selected.click((index, column), Mode::Replace);
                             }
-                            if response.double_clicked() && editable {
+                            // A double click on the check box flips it
+                            // twice, rather than opening the text field.
+                            if response.double_clicked() && editable && !on_check {
                                 start_edit(tab, set, edits, index, column, inline, actions);
                             }
                             // Long values get a tooltip; only measured when hovered.

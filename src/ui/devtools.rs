@@ -15,7 +15,8 @@
 //! `history` (a run, then the history dialog), `restore` (the editors
 //! saved last time), `task` (the backup or restore dialog: see
 //! [`VioletApp::task_scene`]), `edit` (a data tab of `VIOLET_SCENE_TABLE`,
-//! double-clicked at `VIOLET_SCENE_X`, `VIOLET_SCENE_Y`), `sort` (runs
+//! double-clicked at `VIOLET_SCENE_X`, `VIOLET_SCENE_Y`, or clicked once
+//! with `VIOLET_SCENE_CLICKS=1`), `sort` (runs
 //! `VIOLET_SCENE_SQL`, clicks a header at `VIOLET_SCENE_X`, `_Y` and a menu
 //! item at `VIOLET_SCENE_APPLY_X`, `_Y`), `keys` (a key-value store's
 //! keys in the tree, and `VIOLET_SCENE_KEY`'s data tab), `transaction`
@@ -486,11 +487,13 @@ impl VioletApp {
                         .events
                         .push(egui::Event::PointerMoved(egui::pos2(x, y)));
                     snapshot.step += 1;
+                    ctx.request_repaint();
                 }
                 false
             }
             // Press, release, press, release: one a frame, as a hand would.
             ("edit", step @ 3..=6) => {
+                ctx.request_repaint();
                 let x: f32 = std::env::var("VIOLET_SCENE_X")
                     .ok()
                     .and_then(|x| x.parse().ok())
@@ -505,7 +508,13 @@ impl VioletApp {
                     pressed: step % 2 == 1,
                     modifiers: egui::Modifiers::NONE,
                 });
-                snapshot.step += 1;
+                // `VIOLET_SCENE_CLICKS=1`: one click, not a double click.
+                snapshot.step =
+                    if step == 4 && std::env::var("VIOLET_SCENE_CLICKS").as_deref() == Ok("1") {
+                        7
+                    } else {
+                        step + 1
+                    };
                 false
             }
             // With `VIOLET_SCENE_VALUE`: put it in the cell, review the
@@ -513,6 +522,8 @@ impl VioletApp {
             // review's apply button) when given.
             ("edit", 7) => {
                 let Ok(value) = std::env::var("VIOLET_SCENE_VALUE") else {
+                    // Nothing else may ask for a frame while waiting.
+                    ctx.request_repaint_after(Duration::from_millis(100));
                     return settle && elapsed > Duration::from_secs(6);
                 };
                 let Some(editor) = self.cell_editor.take() else {
