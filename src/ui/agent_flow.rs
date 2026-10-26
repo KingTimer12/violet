@@ -69,11 +69,11 @@ fn violet_tools() -> Vec<String> {
 }
 
 /// Whether a permission request is for one of Violet's own tools, which
-/// only read the catalog and the editor.
+/// only read the catalog and the editor. Only Claude Code's tool name
+/// counts: a title is free text, any tool can carry one that reads alike.
 fn asks_for_violet_tool(params: &Value) -> bool {
     let named = params
         .pointer("/toolCall/_meta/claudeCode/toolName")
-        .or_else(|| params.pointer("/toolCall/title"))
         .and_then(Value::as_str);
     named.is_some_and(|name| violet_tools().iter().any(|tool| tool == name))
 }
@@ -1053,6 +1053,10 @@ mod tests {
         assert!(!asks_for_violet_tool(&theirs));
         assert!(!asks_for_violet_tool(
             &json!({"toolCall": {"title": "Bash"}})
+        ));
+        // A title naming a Violet tool is not its name.
+        assert!(!asks_for_violet_tool(
+            &json!({"toolCall": {"title": "mcp__violet__describe_schema"}})
         ));
         let meta = session_meta();
         assert_eq!(meta["claudeCode"]["options"]["tools"], json!([]));
