@@ -234,6 +234,29 @@ pub enum Action {
     ClearHistory,
     /// Puts SQL at the active editor's cursor.
     InsertSql(String),
+    /// Opens Ask AI for an editor: to write, explain or fix a statement.
+    AskAi(TabId, super::ai_flow::Mode),
+    /// Sends Ask AI's request.
+    AiGenerate,
+    /// Puts Ask AI's answer in its editor.
+    AiInsert,
+    /// Keeps Ask AI's provider settings, with a new API key when typed.
+    SaveAiSettings(crate::ai::AiSettings, Option<Secret>),
+    /// Takes a provider's API key out of the keychain.
+    ForgetAiKey(crate::ai::Provider),
+    /// Shows or hides the agent panel, starting the agent the first time.
+    ToggleAgent,
+    /// Starts the agent again.
+    StartAgent,
+    StopAgent,
+    /// Clears the conversation and starts the agent again.
+    ClearAgent,
+    /// Sends the agent panel's message.
+    SendToAgent,
+    /// Stops the agent's turn.
+    CancelAgent,
+    /// Keeps the command that starts the agent, and restarts it.
+    SetAgentCommand(String),
     /// Opens the backup or restore dialog, with these objects picked.
     OpenTask {
         connection: ConnectionId,

@@ -86,6 +86,14 @@ pub fn title_bar(
                     sql: String::new(),
                 });
             }
+            let agent_tip = format!(
+                "Agent ({})",
+                ui.ctx()
+                    .format_shortcut(&shortcuts::get(Command::ToggleAgent))
+            );
+            if widgets::icon_button(ui, Icon::Bot, &agent_tip).clicked() {
+                actions.push(Action::ToggleAgent);
+            }
             if widgets::icon_button(ui, Icon::Package, "Database providers").clicked() {
                 actions.push(Action::OpenProviders);
             }
@@ -577,6 +585,26 @@ pub fn toolbar(
         if widgets::icon_button(ui, Icon::Function, &format_tip).clicked() {
             actions.push(Action::FormatSql(tab.id));
         }
+        let ai = widgets::icon_button(ui, Icon::Sparkles, "Ask AI");
+        egui::Popup::menu(&ai).show(|ui| {
+            use super::ai_flow::Mode;
+            let failed = super::results::fixable(tab);
+            let write = ui.ctx().format_shortcut(&shortcuts::get(Command::AskAi));
+            if mode_item(ui, Icon::Sparkles, "Write a query…", &write) {
+                actions.push(Action::AskAi(tab.id, Mode::Write));
+            }
+            if mode_item(ui, Icon::Info, "Explain the statement", "") {
+                actions.push(Action::AskAi(tab.id, Mode::Explain));
+            }
+            if ui
+                .add_enabled_ui(failed, |ui| {
+                    mode_item(ui, Icon::CircleAlert, "Fix the failed statement", "")
+                })
+                .inner
+            {
+                actions.push(Action::AskAi(tab.id, Mode::Fix));
+            }
+        });
         let find_tip = format!(
             "Find ({}), replace ({})",
             ui.ctx().format_shortcut(&shortcuts::get(Command::Find)),
@@ -621,12 +649,18 @@ pub fn toolbar(
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.add_space(10.0);
             connection_picker(ui, tab, profiles, explorer, actions);
-            ui.label(RichText::new("Connection").color(palette.dim));
+            // A narrow editor, beside the agent panel say, keeps the picker
+            // and drops its label rather than draw over the buttons.
+            if ui.available_width() > 120.0 {
+                ui.label(RichText::new("Connection").color(palette.dim));
+            }
             let history_tip = format!(
                 "Query history ({})",
                 ui.ctx().format_shortcut(&shortcuts::get(Command::History))
             );
-            if widgets::icon_button(ui, Icon::Clock, &history_tip).clicked() {
+            if ui.available_width() > 36.0
+                && widgets::icon_button(ui, Icon::Clock, &history_tip).clicked()
+            {
                 actions.push(Action::OpenHistory);
             }
         });

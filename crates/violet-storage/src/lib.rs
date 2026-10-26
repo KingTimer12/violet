@@ -5,6 +5,7 @@
 //! - [`KeyringSecretStore`]: passwords, in the operating system's keychain
 //!   (Keychain on macOS, Credential Manager on Windows, Secret Service on
 //!   Linux). They never touch the profiles file.
+//! - [`KeyringApiKeys`]: the AI providers' API keys, in the same keychain.
 //! - [`MemorySecretStore`]: for tests and for machines without a keychain.
 //! - [`JsonLinesHistory`]: the query history, one JSON line per query,
 //!   appended as queries finish and trimmed to the newest on load.
@@ -25,4 +26,4 @@ pub use dirs::{AppDirs, ProjectPaths};
 pub use history::JsonLinesHistory;
 pub use json::{JsonFile, JsonProfileRepository};
 pub use scripts::{SavedScript, ScriptFolder, ScriptStore};
-pub use secrets::{KeyringSecretStore, MemorySecretStore};
+pub use secrets::{KeyringApiKeys, KeyringSecretStore, MemorySecretStore};
