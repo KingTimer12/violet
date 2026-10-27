@@ -105,8 +105,10 @@ pub fn format(source: &str, family: Family) -> Result<String, Refused> {
     {
         return Err(Refused::Backslash);
     }
-    let mut writer = Writer::default();
-    writer.family = family;
+    let mut writer = Writer {
+        family,
+        ..Writer::default()
+    };
     writer.write(&tokens);
     let mut out = writer.out.trim_end().to_owned();
     if source.ends_with('\n') {
@@ -570,10 +572,16 @@ mod tests {
     #[test]
     fn mysql_quotes_and_comments_are_kept() {
         assert_eq!(
-            format("select `order`, @x from `my table` # note\nwhere a=1", Family::MySql),
+            format(
+                "select `order`, @x from `my table` # note\nwhere a=1",
+                Family::MySql
+            ),
             Ok("SELECT\n    `order`,\n    @x\nFROM `my table` # note\nWHERE a = 1".to_owned())
         );
-        assert_eq!(format("select 'it\\'s'", Family::MySql), Err(Refused::Backslash));
+        assert_eq!(
+            format("select 'it\\'s'", Family::MySql),
+            Err(Refused::Backslash)
+        );
         assert_eq!(
             format("select \"a\\\" , b\"", Family::MySql),
             Err(Refused::Backslash)

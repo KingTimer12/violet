@@ -779,7 +779,10 @@ fn hovered_word(
     let pointer = output.response.hover_pos()?;
     let local = pointer - output.galley_pos;
     let index = output.galley.cursor_from_pos(local).index.0;
-    let offset = sql.char_indices().nth(index).map_or(sql.len(), |(at, _)| at);
+    let offset = sql
+        .char_indices()
+        .nth(index)
+        .map_or(sql.len(), |(at, _)| at);
     let hint = match assist.language {
         Language::Redis => completion::redis_hover(sql, offset),
         Language::Sql => completion::hover(sql, offset, assist.catalog, &assist.options),
@@ -788,8 +791,12 @@ fn hovered_word(
     // The nearest character is not the one under the pointer past a row's
     // end or off its word.
     let chars = |at: usize| sql[..at].chars().count();
-    let from = output.galley.pos_from_cursor(CCursor::new(chars(hint.range.start)));
-    let to = output.galley.pos_from_cursor(CCursor::new(chars(hint.range.end)));
+    let from = output
+        .galley
+        .pos_from_cursor(CCursor::new(chars(hint.range.start)));
+    let to = output
+        .galley
+        .pos_from_cursor(CCursor::new(chars(hint.range.end)));
     let on_word = local.y >= from.top()
         && local.y <= from.bottom()
         && to.top() == from.top()

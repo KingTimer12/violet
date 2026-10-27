@@ -418,7 +418,12 @@ mod tests {
 
     #[test]
     fn reserved_words_are_sorted() {
-        for family in [Family::Postgres, Family::MySql, Family::Sqlite, Family::Other] {
+        for family in [
+            Family::Postgres,
+            Family::MySql,
+            Family::Sqlite,
+            Family::Other,
+        ] {
             assert!(family.reserved().windows(2).all(|pair| pair[0] < pair[1]));
         }
     }

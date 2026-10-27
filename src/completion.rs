@@ -1983,7 +1983,10 @@ impl Builder<'_> {
             "CTE"
         } else if relation.columns.is_some() {
             "subquery"
-        } else if self.created(relation.schema.as_deref(), &relation.name).is_some() {
+        } else if self
+            .created(relation.schema.as_deref(), &relation.name)
+            .is_some()
+        {
             "defined in this script"
         } else {
             "table"
@@ -2001,7 +2004,14 @@ impl Builder<'_> {
                 .iter()
                 .find(|c| c.name.eq_ignore_ascii_case(column))?;
             let mut detail = vec![info.data_type.clone()];
-            detail.push(if info.nullable { "nullable" } else { "not null" }.to_owned());
+            detail.push(
+                if info.nullable {
+                    "nullable"
+                } else {
+                    "not null"
+                }
+                .to_owned(),
+            );
             if info.primary_key {
                 detail.push("primary key".to_owned());
             }
@@ -2024,7 +2034,11 @@ impl Builder<'_> {
 /// ` · 3 columns: a, b, c`, the list cut short past a few.
 fn columns_summary(columns: &[ColumnInfo]) -> String {
     const SHOWN: usize = 8;
-    let names: Vec<&str> = columns.iter().take(SHOWN).map(|c| c.name.as_str()).collect();
+    let names: Vec<&str> = columns
+        .iter()
+        .take(SHOWN)
+        .map(|c| c.name.as_str())
+        .collect();
     let more = columns.len().saturating_sub(SHOWN);
     format!(
         " · {} columns: {}{}",
@@ -2112,7 +2126,9 @@ pub fn redis_hover(text: &str, offset: usize) -> Option<Hover> {
         return None;
     }
     let line_start = text[..offset].rfind('\n').map_or(0, |at| at + 1);
-    let line_end = text[offset..].find('\n').map_or(text.len(), |at| offset + at);
+    let line_end = text[offset..]
+        .find('\n')
+        .map_or(text.len(), |at| offset + at);
     let line = &text[line_start..line_end];
     let blank = |c: char| c.is_ascii_whitespace();
     let words: Vec<(usize, &str)> = line
@@ -3446,8 +3462,8 @@ mod tests {
         assert_eq!(title, "public.customers");
         assert_eq!(detail, "table · 3 columns: id, name, country");
         // An alias is its table.
-        let (title, _) = hovering(&shop, "SELECT c.name FROM customers c WHERE |c.id = 1")
-            .expect("alias");
+        let (title, _) =
+            hovering(&shop, "SELECT c.name FROM customers c WHERE |c.id = 1").expect("alias");
         assert_eq!(title, "public.customers");
         let (title, detail) =
             hovering(&shop, "SELECT c.na|me FROM customers c").expect("qualified column");
@@ -3456,11 +3472,17 @@ mod tests {
         // The primary key says so; a bare column is found among the tables.
         let (_, detail) = hovering(&shop, "SELECT i|d FROM customers").expect("column");
         assert_eq!(detail, "integer · not null · primary key");
-        let (title, detail) = hovering(&shop, "SELECT slug|ify(name) FROM customers")
-            .expect("function");
-        assert_eq!((title.as_str(), detail.as_str()), ("public.slugify", "function"));
+        let (title, detail) =
+            hovering(&shop, "SELECT slug|ify(name) FROM customers").expect("function");
+        assert_eq!(
+            (title.as_str(), detail.as_str()),
+            ("public.slugify", "function")
+        );
         let (title, detail) = hovering(&shop, "SELECT coal|esce(a, b)").expect("built-in");
-        assert_eq!((title.as_str(), detail.as_str()), ("coalesce()", "built-in function"));
+        assert_eq!(
+            (title.as_str(), detail.as_str()),
+            ("coalesce()", "built-in function")
+        );
         // Strings, comments, numbers and unknown words say nothing.
         assert_eq!(hovering(&shop, "SELECT 'cust|omers'"), None);
         assert_eq!(hovering(&shop, "-- cust|omers"), None);
