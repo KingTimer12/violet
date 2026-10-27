@@ -632,7 +632,8 @@ impl VioletApp {
             ctx,
             Toast::success(format!("Renamed {} to {}", pending.from, pending.to)),
         );
-        self.load_objects(pending.connection, pending.schema);
+        // Its columns and keys are known by the old name.
+        self.actions.push(Action::Refresh(pending.connection));
     }
 }
 

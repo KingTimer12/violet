@@ -646,6 +646,15 @@ pub fn changes_schema(source: &str) -> bool {
     })
 }
 
+/// Whether running `source` left the schema changed, or may have: a script
+/// that failed halfway ran the statements before the failing one, so DDL in
+/// a script of several statements counts; a lone statement that failed
+/// changed nothing.
+#[must_use]
+pub fn may_have_changed_schema(source: &str, succeeded: bool) -> bool {
+    changes_schema(source) && (succeeded || statements(source).len() > 1)
+}
+
 /// What `source`'s own transaction statements do: `BEGIN` and
 /// `START TRANSACTION` open one; `COMMIT`, `END`, `ROLLBACK` and `ABORT`
 /// end it, except a rollback to a savepoint, a prepared transaction's, or a
@@ -1174,6 +1183,26 @@ mod tests {
         assert!(!changes_schema("SELECT 1"));
         assert!(!changes_schema("INSERT INTO t VALUES (1)"));
         assert!(!changes_schema("SELECT 'drop table t'"));
+    }
+
+    #[test]
+    fn a_script_that_failed_halfway_may_have_changed_the_schema() {
+        assert!(may_have_changed_schema("CREATE TABLE t (a int)", true));
+        // Nothing of a lone statement that failed ran.
+        assert!(!may_have_changed_schema("CREATE TABLE t (a int)", false));
+        assert!(!may_have_changed_schema("DROP TABLE t", false));
+        // The statements before the failing one did.
+        assert!(may_have_changed_schema(
+            "CREATE TABLE t (a int);\nSELECT * FROM missing",
+            false
+        ));
+        assert!(may_have_changed_schema(
+            "SELECT 1; ALTER TABLE t ADD b int; INSERT INTO nope VALUES (1)",
+            false
+        ));
+        // No DDL, nothing to reload, whatever happened.
+        assert!(!may_have_changed_schema("SELECT 1; SELECT 2", false));
+        assert!(!may_have_changed_schema("INSERT INTO t VALUES (1)", true));
     }
 
     fn kinds(source: &str) -> Vec<(TokenKind, &str)> {

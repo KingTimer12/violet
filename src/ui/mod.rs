@@ -828,9 +828,11 @@ impl VioletApp {
                 });
                 // DDL that ran leaves the loaded catalog behind.
                 let ddl = connection.filter(|_| {
-                    result.is_ok()
-                        && language == Language::Sql
-                        && crate::sql::changes_schema(&running.executed.sql)
+                    catalog_flow::run_reloads_catalog(
+                        language,
+                        &running.executed.sql,
+                        result.is_ok(),
+                    )
                 });
                 // Runs from editors go to the history; pages and data tabs
                 // do not.
