@@ -310,8 +310,8 @@ pub struct Explorer {
     /// Counts what hints depend on that arrived since, so they are made
     /// again.
     pub hint_rev: u64,
-    /// Each connection's recent round trips.
-    pub latency: HashMap<ConnectionId, crate::metrics::Latency>,
+    /// What is known of each connection's health.
+    pub metrics: HashMap<ConnectionId, crate::metrics::Metrics>,
     /// A node was clicked since this was last cleared.
     pub picked: bool,
     /// The tree was clicked last, so F-key shortcuts act on its selection.

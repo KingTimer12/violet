@@ -671,7 +671,11 @@ impl VioletApp {
                     .extend(ready.into_iter().map(|(_, action)| action));
                 self.explorer.links.insert(id, Link::Online(server));
                 self.explorer.forget(id);
-                self.explorer.latency.remove(&id);
+                self.explorer
+                    .metrics
+                    .entry(id)
+                    .or_default()
+                    .connected(Instant::now());
                 self.ping(id);
                 self.explorer.schemas.insert(id, Loadable::Loading);
                 self.backend.load_schemas(id);
@@ -696,6 +700,9 @@ impl VioletApp {
                 }
             }
             Event::ConnectFailed { id, error } => {
+                if let Some(metrics) = self.explorer.metrics.get_mut(&id) {
+                    metrics.connect_failed();
+                }
                 self.waiting.retain(|(connection, _)| *connection != id);
                 self.queued.retain(|(tab, _)| {
                     !self
@@ -728,6 +735,9 @@ impl VioletApp {
                 }
             }
             Event::Disconnected { id } => {
+                if let Some(metrics) = self.explorer.metrics.get_mut(&id) {
+                    metrics.closed();
+                }
                 self.explorer.links.insert(id, Link::Offline);
                 self.explorer.forget(id);
             }
@@ -840,7 +850,7 @@ impl VioletApp {
                     return;
                 }
                 if let Some(connection) = self.ping_requests.remove(&request) {
-                    self.pinged(connection, &result);
+                    self.pinged(ctx, connection, &result);
                     return;
                 }
                 if let Some(pending) = self.key_requests.remove(&request) {
@@ -960,8 +970,8 @@ impl VioletApp {
                 tab.received = Some(Instant::now());
                 tab.render = None;
                 tab.rtt = connection
-                    .and_then(|id| self.explorer.latency.get(&id))
-                    .and_then(crate::metrics::Latency::last);
+                    .and_then(|id| self.explorer.metrics.get(&id))
+                    .and_then(|metrics| metrics.latency.last());
                 tab.outcome = Some(match result {
                     Ok(mut output) => {
                         // A key's profile is four answers: show it as one.
@@ -989,6 +999,7 @@ impl VioletApp {
                             && !self.backend.is_connected(id)
                         {
                             self.explorer.links.insert(id, Link::Offline);
+                            self.explorer.metrics.entry(id).or_default().dropped();
                         }
                         Outcome::Failed {
                             error,
@@ -1207,6 +1218,11 @@ impl VioletApp {
             return;
         }
         self.explorer.links.insert(id, Link::Connecting);
+        self.explorer
+            .metrics
+            .entry(id)
+            .or_default()
+            .connecting(Instant::now());
         self.backend.connect_to(id, profile, password);
     }
 
@@ -2987,6 +3003,7 @@ impl eframe::App for VioletApp {
         self.shortcuts(ctx);
         self.auto_refresh(ctx);
         self.health_tick(ctx);
+        self.ping_tick(ctx);
         if std::mem::take(&mut self.names_unchecked) {
             for profile in self.profiles.all() {
                 self.fonts.cover(ctx, &profile.name);

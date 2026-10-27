@@ -1,13 +1,16 @@
-//! Timing a connection's round trips, to split a run's time with.
+//! Timing a connection's round trips, to split a run's time with and to
+//! tell when a connection stops answering.
 
 use std::time::{Duration, Instant};
 
 use violet_app::{CachePolicy, ExecOptions};
-use violet_core::{ConnectionId, QueryOutput, Result};
+use violet_core::{ConnectionId, ErrorKind, QueryOutput, Result};
 
 use super::VioletApp;
+use super::state::Link;
+use super::toasts::Toast;
 
-/// A ping older than this is measured again after the next run.
+/// A ping older than this is measured again.
 const STALE: Duration = Duration::from_secs(30);
 
 impl VioletApp {
@@ -27,27 +30,72 @@ impl VioletApp {
         self.ping_requests.insert(request, connection);
     }
 
-    /// Pings `connection` when its last ping is old, after a run that left
-    /// the session idle.
+    /// Pings `connection` when its last ping is old.
     pub(super) fn ping_if_stale(&mut self, connection: ConnectionId) {
         let stale = self
             .explorer
-            .latency
+            .metrics
             .get(&connection)
-            .is_none_or(|latency| latency.stale(Instant::now(), STALE));
+            .is_none_or(|metrics| metrics.latency.stale(Instant::now(), STALE));
         if stale && self.backend.is_connected(connection) {
             self.ping(connection);
         }
     }
 
-    /// A ping answered: its round trip is the output's time.
-    pub(super) fn pinged(&mut self, connection: ConnectionId, result: &Result<QueryOutput>) {
-        if let Ok(output) = result {
-            self.explorer
-                .latency
-                .entry(connection)
-                .or_default()
-                .record(output.elapsed, Instant::now());
+    /// Pings the idle connections whose last ping is old, so a dropped one
+    /// shows in the status bar before the next query finds it.
+    pub(super) fn ping_tick(&mut self, ctx: &egui::Context) {
+        let online: Vec<ConnectionId> = self
+            .explorer
+            .links
+            .iter()
+            .filter(|(_, link)| matches!(link, Link::Online(_)))
+            .map(|(id, _)| *id)
+            .collect();
+        if online.is_empty() {
+            return;
+        }
+        ctx.request_repaint_after(Duration::from_secs(5));
+        for id in online {
+            let busy = self
+                .workspace
+                .tabs
+                .iter()
+                .any(|tab| tab.connection == Some(id) && tab.running.is_some());
+            if !busy {
+                self.ping_if_stale(id);
+            }
+        }
+    }
+
+    /// A ping answered, or did not.
+    pub(super) fn pinged(
+        &mut self,
+        ctx: &egui::Context,
+        connection: ConnectionId,
+        result: &Result<QueryOutput>,
+    ) {
+        let online = self.explorer.link(connection).is_online();
+        let metrics = self.explorer.metrics.entry(connection).or_default();
+        match result {
+            Ok(output) => metrics.ping_answered(output.elapsed, Instant::now()),
+            Err(error) => {
+                metrics.ping_failed();
+                let lost = matches!(error.kind, ErrorKind::Connection | ErrorKind::NotConnected)
+                    && !self.backend.is_connected(connection);
+                if lost && online {
+                    metrics.dropped();
+                    self.explorer.links.insert(connection, Link::Offline);
+                    self.explorer.forget(connection);
+                    self.toasts.push(
+                        ctx,
+                        Toast::error(
+                            format!("Lost the connection to {}", self.profile_name(connection)),
+                            error.message.clone(),
+                        ),
+                    );
+                }
+            }
         }
     }
 }

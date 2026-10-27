@@ -991,6 +991,42 @@ fn connection_picker(
         });
 }
 
+/// What the status bar's round trip stands for.
+fn health_card(metrics: &crate::metrics::Metrics, sessions: usize) -> String {
+    let ms = |duration: Option<std::time::Duration>| {
+        duration.map_or("-".to_owned(), |d| {
+            format!("{:.1} ms", d.as_secs_f64() * 1000.0)
+        })
+    };
+    let latency = &metrics.latency;
+    let mut lines = vec![
+        format!(
+            "Round trip: last {}, average {}, best {}, worst {}",
+            ms(latency.last()),
+            ms(latency.average()),
+            ms(latency.min()),
+            ms(latency.max())
+        ),
+        format!("Jitter: {}", ms(latency.jitter())),
+    ];
+    if let Some(connect) = metrics.connect_time {
+        lines.push(format!("Connected in {}", format_duration(connect)));
+    }
+    if let Some(online) = metrics.online_for(std::time::Instant::now()) {
+        lines.push(format!("Online for {}", format_duration(online)));
+    }
+    lines.push(format!(
+        "{} reconnects, {} lost connections this run",
+        metrics.reconnects(),
+        metrics.drops
+    ));
+    lines.push(format!(
+        "{sessions} open session{}; Violet keeps one per database and no pool",
+        if sessions == 1 { "" } else { "s" }
+    ));
+    lines.join("\n")
+}
+
 /// The strip along the bottom of the window.
 pub fn status_bar(
     ui: &mut Ui,
@@ -1017,9 +1053,42 @@ pub fn status_bar(
                     Link::Failed(_) => (palette.danger, "Connection failed".to_owned()),
                     Link::Offline => (palette.dim, "Disconnected".to_owned()),
                 };
+                let metrics = explorer.metrics.get(&id);
+                let stuck = metrics.is_some_and(crate::metrics::Metrics::not_answering);
+                let color = if stuck && explorer.link(id).is_online() {
+                    palette.warning
+                } else {
+                    color
+                };
                 widgets::dot(ui, color, 3.5);
                 ui.label(small(profile.display_name(), palette.secondary));
                 ui.label(small(state, palette.dim));
+                if explorer.link(id).is_online()
+                    && let Some(metrics) = metrics
+                {
+                    let (text, level) = if stuck {
+                        ("Not answering".to_owned(), palette.warning)
+                    } else {
+                        match metrics.latency.last() {
+                            Some(rtt) => (
+                                format!("{} ms", rtt.as_millis().max(1)),
+                                match rtt.as_millis() {
+                                    0..=99 => palette.dim,
+                                    100..=299 => palette.warning,
+                                    _ => palette.danger,
+                                },
+                            ),
+                            None => ("…".to_owned(), palette.dim),
+                        }
+                    };
+                    let sessions = 1 + explorer
+                        .opened
+                        .values()
+                        .filter(|(parent, _)| *parent == id)
+                        .count();
+                    ui.label(small(format!("· {text}"), level))
+                        .on_hover_text(health_card(metrics, sessions));
+                }
                 let transaction = explorer.transaction(id);
                 if transaction.open {
                     let text = match transaction.writes {
