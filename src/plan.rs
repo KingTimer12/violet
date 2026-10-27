@@ -199,7 +199,11 @@ impl Plan {
         let names: Vec<&str> = set.columns.iter().map(|c| c.name.as_str()).collect();
         if let [_] = names.as_slice() {
             let text = set.rows.get(0, 0)??;
-            return Self::from_json(text);
+            return if text.trim_start().starts_with("->") {
+                Self::from_mysql_text(text)
+            } else {
+                Self::from_json(text)
+            };
         }
         if names.first() == Some(&"id")
             && names.get(1) == Some(&"parent")
@@ -252,6 +256,49 @@ impl Plan {
         })
     }
 
+    /// Reads MySQL's `EXPLAIN ANALYZE`, or `EXPLAIN FORMAT=TREE`: one step
+    /// per `->` line, nested by four spaces, each with its estimate in
+    /// `(cost=.. rows=..)` and, once run, what happened in
+    /// `(actual time=first..last rows=.. loops=..)`.
+    pub fn from_mysql_text(text: &str) -> Option<Self> {
+        let mut roots: Vec<PlanNode> = Vec::new();
+        // The steps still open, outermost first, with their depth.
+        let mut open: Vec<(usize, PlanNode)> = Vec::new();
+        let close = |open: &mut Vec<(usize, PlanNode)>, roots: &mut Vec<PlanNode>, depth: usize| {
+            while open.last().is_some_and(|(at, _)| *at >= depth) {
+                let Some((_, node)) = open.pop() else { break };
+                match open.last_mut() {
+                    Some((_, parent)) => parent.children.push(node),
+                    None => roots.push(node),
+                }
+            }
+        };
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            let Some(body) = trimmed.strip_prefix("->") else {
+                continue;
+            };
+            let depth = (line.len() - trimmed.len()) / 4;
+            close(&mut open, &mut roots, depth);
+            open.push((depth, mysql_step(body.trim())));
+        }
+        close(&mut open, &mut roots, 0);
+        if roots.is_empty() {
+            return None;
+        }
+        let mut plan = Self {
+            execution_ms: roots[0]
+                .time_ms
+                .map(|ms| ms * roots[0].loops.unwrap_or(1.0)),
+            roots,
+            ..Self::default()
+        };
+        for root in &mut plan.roots {
+            root.inspect();
+        }
+        Some(plan)
+    }
+
     /// Reads the steps of `EXPLAIN QUERY PLAN` as `(id, parent, detail)`.
     pub fn from_sqlite(steps: &[(i64, i64, String)]) -> Option<Self> {
         if steps.is_empty() {
@@ -266,6 +313,16 @@ impl Plan {
         }
         Some(plan)
     }
+}
+
+/// Whether `sql` holds an `EXPLAIN` statement: alone, or among the ones an
+/// analyzed write is wrapped in.
+pub fn is_explain(sql: &str) -> bool {
+    sql.lines().any(|line| {
+        line.trim_start()
+            .get(..7)
+            .is_some_and(|start| start.eq_ignore_ascii_case("explain"))
+    })
 }
 
 fn number(value: &Value, key: &str) -> Option<f64> {
@@ -443,6 +500,74 @@ fn mysql_table(table: &Value) -> PlanNode {
     node
 }
 
+/// The text of the parenthesised group of `line` that starts with
+/// `marker`, the marker included.
+fn mysql_group<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
+    let start = line.find(&format!("({marker}"))? + 1;
+    let end = line[start..].find(')')? + start;
+    Some(&line[start..end])
+}
+
+/// The value after `name=` in a group's text.
+fn mysql_value(group: &str, name: &str) -> Option<f64> {
+    let after = &group[group.find(&format!("{name}="))? + name.len() + 1..];
+    let end = after
+        .find(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E' | '+' | '-')))
+        .unwrap_or(after.len());
+    after[..end].parse().ok()
+}
+
+/// One `EXPLAIN ANALYZE` line, without its arrow.
+fn mysql_step(body: &str) -> PlanNode {
+    let estimate = mysql_group(body, "cost=");
+    let actual = mysql_group(body, "actual time=");
+    let never = body.contains("(never executed)");
+    let cut = ["(cost=", "(actual time=", "(never executed)"]
+        .iter()
+        .filter_map(|marker| body.find(marker))
+        .min()
+        .unwrap_or(body.len());
+    let text = body[..cut].trim();
+    // `Index lookup on t using i (a=1)`: what it does, the table, the index.
+    let (action, rest) = text.split_once(" on ").unwrap_or((text, ""));
+    let mut node = PlanNode::new(action);
+    if !rest.is_empty() {
+        let (target, using) = rest.split_once(" using ").unwrap_or((rest, ""));
+        node.target = Some(target.to_owned());
+        if !using.is_empty() {
+            node.details.push(format!("Index: {using}"));
+        }
+    } else if let Some((name, condition)) = text.split_once(": ") {
+        // `Filter: (a > 1)`, `Sort: a.x`.
+        node.label = name.to_owned();
+        node.details.push(format!("{name}: {condition}"));
+    }
+    if never {
+        node.details.push("Never executed".to_owned());
+    }
+    if let Some(group) = estimate {
+        node.cost = mysql_value(group, "cost");
+        node.est_rows = mysql_value(group, "rows");
+    }
+    if let Some(group) = actual {
+        node.actual_rows = mysql_value(group, "rows");
+        node.loops = mysql_value(group, "loops");
+        // `first..last`: the time to the first row and to the last, per loop.
+        node.time_ms = group
+            .split_once("..")
+            .and_then(|(_, rest)| rest.split_whitespace().next()?.parse().ok());
+    }
+    let label = node.label.as_str();
+    if label == "Table scan" {
+        node.warnings.push(Warning::FullScan);
+    }
+    if label == "Sort" || label.starts_with("Sort row") {
+        node.warnings.push(Warning::Filesort);
+    }
+    node.join_loop = label.starts_with("Nested loop");
+    node
+}
+
 /// The steps whose parent is `parent`, each with its own children.
 fn sqlite_children(steps: &[(i64, i64, String)], parent: i64) -> Vec<PlanNode> {
     steps
@@ -600,6 +725,66 @@ mod tests {
         assert!(nested.warnings.contains(&Warning::ExpensiveLoop));
     }
 
+    const MYSQL_ANALYZE: &str = "\
+-> Sort: o.total DESC  (cost=500.5 rows=300) (actual time=40.1..41.0 rows=290 loops=1)
+    -> Nested loop inner join  (cost=400.2 rows=300) (actual time=0.2..38.0 rows=290 loops=1)
+        -> Table scan on o  (cost=50.3 rows=3000) (actual time=0.1..10.5 rows=3000 loops=1)
+        -> Single-row index lookup on c using PRIMARY (id=o.customer_id)  (cost=0.25 rows=1) (actual time=0.005..0.005 rows=1 loops=3000)
+        -> Index scan on x using idx_x  (never executed)
+";
+
+    #[test]
+    fn reads_mysql_analyze_text() {
+        let plan = Plan::from_mysql_text(MYSQL_ANALYZE).expect("a plan");
+        assert!(plan.analyzed());
+        assert_eq!(plan.execution_ms, Some(41.0));
+        let sort = &plan.roots[0];
+        assert_eq!(sort.label, "Sort");
+        assert_eq!(sort.warnings, [Warning::Filesort]);
+        assert_eq!(sort.est_rows, Some(300.0));
+        assert_eq!(sort.actual_rows, Some(290.0));
+        let join = &sort.children[0];
+        assert_eq!(join.label, "Nested loop inner join");
+        assert!(join.join_loop);
+        assert_eq!(join.children.len(), 3);
+        let scan = &join.children[0];
+        assert_eq!(
+            (scan.label.as_str(), scan.target.as_deref()),
+            ("Table scan", Some("o"))
+        );
+        assert_eq!(scan.warnings, [Warning::FullScan]);
+        assert_eq!(scan.time_ms, Some(10.5));
+        let lookup = &join.children[1];
+        assert_eq!(lookup.target.as_deref(), Some("c"));
+        assert_eq!(lookup.loops, Some(3000.0));
+        assert!(
+            lookup
+                .details
+                .contains(&"Index: PRIMARY (id=o.customer_id)".to_owned())
+        );
+        assert!(
+            join.children[2]
+                .details
+                .contains(&"Never executed".to_owned())
+        );
+        // 290 rows against a 300 estimate is no misestimate; 3000 outer
+        // rows over a scan are an expensive loop only with a scanned inner.
+        assert!(!join.warnings.contains(&Warning::Misestimate));
+    }
+
+    #[test]
+    fn reads_mysql_tree_without_analyze() {
+        let plan = Plan::from_mysql_text(
+            "-> Filter: (t.a > 1)  (cost=1.1 rows=3)\n    -> Table scan on t  (cost=1.1 rows=9)\n",
+        )
+        .expect("a plan");
+        assert!(!plan.analyzed());
+        assert_eq!(plan.roots[0].label, "Filter");
+        assert_eq!(plan.roots[0].details, ["Filter: (t.a > 1)"]);
+        assert_eq!(plan.roots[0].children[0].cost, Some(1.1));
+        assert!(Plan::from_mysql_text("nothing here").is_none());
+    }
+
     #[test]
     fn reads_sqlite_tree() {
         let steps = [
@@ -615,6 +800,15 @@ mod tests {
         assert_eq!(plan.roots[2].warnings, [Warning::Filesort]);
         assert!(plan.roots[2].children[0].warnings.is_empty());
         assert!(Plan::from_sqlite(&[]).is_none());
+    }
+
+    #[test]
+    fn finds_the_explain_in_a_wrapped_script() {
+        assert!(is_explain("EXPLAIN (FORMAT JSON) SELECT 1"));
+        assert!(is_explain(
+            "BEGIN;\nexplain analyze DELETE FROM t;\nROLLBACK"
+        ));
+        assert!(!is_explain("SELECT 'explain'"));
     }
 
     #[test]

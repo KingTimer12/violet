@@ -310,10 +310,7 @@ pub fn show(
 /// result is in a form Violet reads.
 fn explained(last_run: Option<&(Executed, ExecOptions)>, set: &ResultSet) -> Option<Plan> {
     let (executed, _) = last_run?;
-    let sql = executed.sql.trim_start();
-    sql.get(..7)
-        .is_some_and(|start| start.eq_ignore_ascii_case("explain"))
-        .then(|| Plan::from_result(set))?
+    crate::plan::is_explain(&executed.sql).then(|| Plan::from_result(set))?
 }
 
 /// DBeaver's result footer: how much is loaded, and buttons to read more

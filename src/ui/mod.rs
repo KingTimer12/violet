@@ -199,13 +199,14 @@ pub struct VioletApp {
 /// An analyzed write that failed halfway left its transaction, or the
 /// savepoint it ran in, open: closes it.
 fn undo_explain(backend: &violet_app::Backend, connection: ConnectionId, sent: &str) {
-    let undo = if sent.starts_with("BEGIN;\nEXPLAIN") {
-        "ROLLBACK"
-    } else if sent.starts_with("SAVEPOINT violet_explain;") {
-        "ROLLBACK TO SAVEPOINT violet_explain; RELEASE SAVEPOINT violet_explain"
-    } else {
-        return;
-    };
+    let undo =
+        if sent.starts_with("BEGIN;\nEXPLAIN") || sent.starts_with("START TRANSACTION;\nEXPLAIN") {
+            "ROLLBACK"
+        } else if sent.starts_with("SAVEPOINT violet_explain;") {
+            "ROLLBACK TO SAVEPOINT violet_explain; RELEASE SAVEPOINT violet_explain"
+        } else {
+            return;
+        };
     let options = ExecOptions {
         cache: CachePolicy::Refresh,
         page: None,
@@ -1451,7 +1452,7 @@ impl VioletApp {
                 ctx,
                 Toast::error(
                     "EXPLAIN ANALYZE runs the statement",
-                    "Violet only analyses statements that read, or Postgres writes it can roll back. Use Explain to see the plan of one that writes.",
+                    "Violet only analyses statements that read, or writes it can roll back (Postgres and MySQL). Use Explain to see the plan of one that writes.",
                 ),
             );
             return;

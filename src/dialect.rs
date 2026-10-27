@@ -85,9 +85,10 @@ impl Family {
     }
 
     /// The statement that explains `sql` in a form the plan view reads:
-    /// JSON on Postgres and MySQL, `QUERY PLAN` rows on SQLite. `None`
-    /// where the database has no such form: SQLite cannot analyze, MySQL
-    /// analyzes in text only, and other databases are not known.
+    /// JSON on Postgres and MySQL, a text tree for MySQL's analyze,
+    /// `QUERY PLAN` rows on SQLite. `None`
+    /// where the database has no such form: SQLite cannot analyze and
+    /// other databases are not known.
     pub fn explain_tree(self, sql: &str, explain: &Explain) -> Option<String> {
         match (self, explain.analyze) {
             (Self::Postgres, false) => Some(format!("EXPLAIN (FORMAT JSON) {sql}")),
@@ -103,6 +104,8 @@ impl Family {
                 Some(format!("EXPLAIN ({}) {sql}", options.join(", ")))
             }
             (Self::MySql, false) => Some(format!("EXPLAIN FORMAT=JSON {sql}")),
+            // Its only analyze is a text tree, which the plan view parses.
+            (Self::MySql, true) => Some(format!("EXPLAIN ANALYZE {sql}")),
             (Self::Sqlite, false) => Some(format!("EXPLAIN QUERY PLAN {sql}")),
             _ => None,
         }
@@ -113,16 +116,21 @@ impl Family {
     /// then stays as it was. `None` where analyzing a write is not
     /// possible: no tree form, or no way to undo.
     pub fn explain_rolled_back(self, sql: &str, explain: &Explain, open: bool) -> Option<String> {
-        if !explain.analyze || !matches!(self, Self::Postgres) {
+        if !explain.analyze || !matches!(self, Self::Postgres | Self::MySql) {
             return None;
         }
         let inner = self.explain_tree(sql, explain)?;
+        let begin = if self == Self::MySql {
+            "START TRANSACTION"
+        } else {
+            "BEGIN"
+        };
         Some(if open {
             format!(
                 "SAVEPOINT violet_explain;\n{inner};\nROLLBACK TO SAVEPOINT violet_explain;\nRELEASE SAVEPOINT violet_explain"
             )
         } else {
-            format!("BEGIN;\n{inner};\nROLLBACK")
+            format!("{begin};\n{inner};\nROLLBACK")
         })
     }
 
@@ -660,7 +668,10 @@ mod tests {
             explain(Family::Sqlite, false).as_deref(),
             Some("EXPLAIN QUERY PLAN SELECT 1")
         );
-        assert_eq!(explain(Family::MySql, true), None);
+        assert_eq!(
+            explain(Family::MySql, true).as_deref(),
+            Some("EXPLAIN ANALYZE SELECT 1")
+        );
         assert_eq!(explain(Family::Sqlite, true), None);
         assert_eq!(explain(Family::Other, false), None);
     }
@@ -701,7 +712,13 @@ mod tests {
         let inside = run(true).expect("a script");
         assert!(inside.starts_with("SAVEPOINT violet_explain;"));
         assert!(inside.contains("ROLLBACK TO SAVEPOINT violet_explain"));
-        // Nothing to undo without analyze, and only Postgres runs it.
+        assert_eq!(
+            Family::MySql
+                .explain_rolled_back("DELETE FROM t", &analyze, false)
+                .as_deref(),
+            Some("START TRANSACTION;\nEXPLAIN ANALYZE DELETE FROM t;\nROLLBACK")
+        );
+        // Nothing to undo without analyze, and SQLite has no analyze.
         assert_eq!(
             Family::Postgres.explain_rolled_back("DELETE FROM t", &Explain::PLAN, false),
             None
