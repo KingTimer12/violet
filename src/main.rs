@@ -26,6 +26,7 @@ mod mongo;
 mod plan;
 mod settings;
 mod sql;
+mod stats;
 mod timing;
 mod ui;
 mod update;

@@ -1639,6 +1639,17 @@ fn object_node(
                     ),
                 });
             }
+            if matches!(
+                object.kind,
+                ObjectKind::Table | ObjectKind::MaterializedView
+            ) && menu_item(ui, Icon::Activity, "Table statistics…")
+            {
+                actions.push(Action::TableStats(
+                    id,
+                    object.schema.clone(),
+                    object.name.clone(),
+                ));
+            }
         }
         let has_source = matches!(
             object.kind,

@@ -68,6 +68,8 @@ pub enum Action {
     Refresh(ConnectionId),
     LoadObjects(ConnectionId, String),
     LoadColumns(ConnectionId, String, String),
+    /// Opens a table's statistics: connection, schema and table.
+    TableStats(ConnectionId, String, String),
     /// Opens the server health panel for a connection.
     OpenHealth(ConnectionId),
     /// Reads the health panel again.

@@ -36,6 +36,7 @@ mod selection;
 mod shortcuts;
 mod sidebar;
 mod state;
+mod stats_flow;
 mod task_flow;
 mod tasks;
 pub mod theme;
@@ -157,6 +158,8 @@ pub struct VioletApp {
     rename_requests: HashMap<violet_app::RequestId, rename_flow::Pending>,
     /// Commands the tree ran on keys, waiting for their answer.
     key_requests: HashMap<violet_app::RequestId, key_flow::Pending>,
+    /// A table's statistics, when the dialog is open.
+    table_stats: Option<stats_flow::StatsView>,
     /// The server health panel, when open.
     health: Option<health_flow::Health>,
     /// What the panel asked, by request.
@@ -343,6 +346,7 @@ impl VioletApp {
             key_requests: HashMap::new(),
             ping_requests: HashMap::new(),
             index_requests: HashMap::new(),
+            table_stats: None,
             health: None,
             health_requests: HashMap::new(),
             copy_choice: (crate::export::Format::Tsv, true),
@@ -839,6 +843,9 @@ impl VioletApp {
             Event::QueryFinished { request, result } => {
                 if let Some(pending) = self.rename_requests.remove(&request) {
                     self.renamed(ctx, pending, &result);
+                    return;
+                }
+                if self.table_stats_read(request, &result) {
                     return;
                 }
                 if let Some(asked) = self.health_requests.remove(&request) {
@@ -2143,6 +2150,9 @@ impl VioletApp {
                 self.run_data(ctx, tab, CachePolicy::Use);
             }
             Action::Run(tab, scope) => self.run(ctx, tab, scope),
+            Action::TableStats(connection, schema, table) => {
+                self.open_table_stats(ctx, connection, schema, table);
+            }
             Action::OpenHealth(connection) => self.open_health(ctx, connection),
             Action::HealthRefresh => self.refresh_health(),
             Action::HealthSection(index) => {
@@ -2913,6 +2923,11 @@ impl VioletApp {
             if !history::show(ctx, view, &self.history, &target, &mut self.actions) {
                 self.history_view = None;
             }
+        }
+        if let Some(view) = &self.table_stats
+            && !stats_flow::show(ctx, view, &mut self.actions)
+        {
+            self.table_stats = None;
         }
         if let Some(view) = &mut self.health
             && !health_flow::show(ctx, view, &mut self.actions)
