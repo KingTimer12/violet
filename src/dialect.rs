@@ -348,6 +348,98 @@ impl Family {
         functions
     }
 
+    /// The arguments of a built-in `function`, as written between its
+    /// parentheses, when its signature is known here; empty when it takes
+    /// none.
+    pub fn signature(self, function: &str) -> Option<&'static str> {
+        let name = function.to_ascii_lowercase();
+        let own = match self {
+            Self::Postgres => match name.as_str() {
+                "age" => Some("timestamp, timestamp"),
+                "array_length" => Some("array, dimension"),
+                "current_setting" => Some("name"),
+                "date_trunc" => Some("field, source"),
+                "extract" => Some("field FROM source"),
+                "generate_series" => Some("start, stop, step"),
+                "json_agg" | "jsonb_agg" | "array_agg" => Some("expression"),
+                "json_build_object" | "jsonb_build_object" => Some("key, value"),
+                "regexp_replace" => Some("string, pattern, replacement"),
+                "split_part" => Some("string, delimiter, position"),
+                "string_agg" => Some("expression, delimiter"),
+                "substring" => Some("string FROM start FOR length"),
+                "to_char" => Some("value, format"),
+                "to_timestamp" => Some("text, format"),
+                "unnest" => Some("array"),
+                "gen_random_uuid" | "now" => Some(""),
+                _ => None,
+            },
+            Self::MySql => match name.as_str() {
+                "concat_ws" => Some("separator, string, string"),
+                "date_add" | "date_sub" => Some("date, INTERVAL value unit"),
+                "date_format" => Some("date, format"),
+                "datediff" => Some("date1, date2"),
+                "extract" => Some("unit FROM date"),
+                "group_concat" => Some("expression SEPARATOR ','"),
+                "if" => Some("condition, then, else"),
+                "ifnull" => Some("value, fallback"),
+                "json_arrayagg" => Some("expression"),
+                "json_extract" => Some("document, path"),
+                "json_object" => Some("key, value"),
+                "json_objectagg" => Some("key, value"),
+                "str_to_date" => Some("string, format"),
+                "substring" => Some("string, start, length"),
+                "unix_timestamp" => Some("date"),
+                "curdate" | "last_insert_id" | "now" | "uuid" => Some(""),
+                _ => None,
+            },
+            Self::Sqlite => match name.as_str() {
+                "date" | "datetime" | "julianday" => Some("time, modifier"),
+                "group_concat" => Some("expression, separator"),
+                "ifnull" => Some("value, fallback"),
+                "iif" => Some("condition, then, else"),
+                "instr" => Some("string, substring"),
+                "json_extract" => Some("document, path"),
+                "json_group_array" => Some("expression"),
+                "json_group_object" => Some("key, value"),
+                "printf" => Some("format, value"),
+                "strftime" => Some("format, time, modifier"),
+                "substr" => Some("string, start, length"),
+                "total" => Some("expression"),
+                "typeof" => Some("value"),
+                "last_insert_rowid" | "random" => Some(""),
+                _ => None,
+            },
+            Self::Other => match name.as_str() {
+                "array_agg" | "json_agg" => Some("expression"),
+                "date_trunc" => Some("field, source"),
+                "extract" => Some("field FROM source"),
+                "string_agg" => Some("expression, delimiter"),
+                "substring" => Some("string, start, length"),
+                "to_char" => Some("value, format"),
+                "greatest" | "least" | "concat" => Some("value, value"),
+                "ceil" | "floor" => Some("number"),
+                "now" => Some(""),
+                _ => None,
+            },
+        };
+        if own.is_some() {
+            return own;
+        }
+        Some(match name.as_str() {
+            "abs" | "ceil" | "floor" => "number",
+            "avg" | "count" | "max" | "min" | "sum" => "expression",
+            "cast" => "expression AS type",
+            "coalesce" | "concat" | "greatest" | "least" => "value, value",
+            "lag" | "lead" => "value, offset, default",
+            "length" | "lower" | "trim" | "upper" => "string",
+            "nullif" => "value1, value2",
+            "replace" => "string, from, to",
+            "round" => "number, decimals",
+            "dense_rank" | "rank" | "row_number" => "",
+            _ => return None,
+        })
+    }
+
     /// Column types, offered after `::` and in definitions.
     pub fn types(self) -> &'static [&'static str] {
         match self {
@@ -441,6 +533,37 @@ mod tests {
         assert!(Family::MySql.starts().contains(&"DESCRIBE"));
         assert!(Family::MySql.types().contains(&"DATETIME"));
         assert!(Family::Other.functions().contains(&"date_trunc"));
+    }
+
+    #[test]
+    fn built_in_functions_have_signatures_per_database() {
+        assert_eq!(
+            Family::Postgres.signature("DATE_TRUNC"),
+            Some("field, source")
+        );
+        assert_eq!(Family::MySql.signature("ifnull"), Some("value, fallback"));
+        assert_eq!(
+            Family::Sqlite.signature("substr"),
+            Some("string, start, length")
+        );
+        assert_eq!(Family::Postgres.signature("lower"), Some("string"));
+        // Takes no arguments, or is not known.
+        assert_eq!(Family::Postgres.signature("now"), Some(""));
+        assert_eq!(Family::MySql.signature("my_udf"), None);
+        // Every built-in the family lists has one but a few.
+        for family in [
+            Family::Postgres,
+            Family::MySql,
+            Family::Sqlite,
+            Family::Other,
+        ] {
+            for function in family.functions() {
+                assert!(
+                    family.signature(function).is_some(),
+                    "{family:?} {function}"
+                );
+            }
+        }
     }
 
     #[test]

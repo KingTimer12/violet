@@ -85,9 +85,12 @@ pub struct Item {
     pub insert: String,
     /// Where the cursor goes, as a byte offset into `insert`.
     pub caret: usize,
-    /// Where Tab moves on to after the caret, as byte offsets into
-    /// `insert`.
-    pub stops: Vec<usize>,
+    /// How many bytes from the caret are selected, a placeholder to type
+    /// over; zero for a bare caret.
+    pub caret_len: usize,
+    /// Where Tab moves on to after the caret, as byte ranges of `insert`:
+    /// a placeholder to type over, or an empty range for a bare caret.
+    pub stops: Vec<Range<usize>>,
     pub kind: Kind,
     /// Shown after the label: a type, a table, a schema.
     pub detail: String,
@@ -327,6 +330,7 @@ pub fn complete_redis(
     let command = |name: &str, syntax: &str, insert: String| Item {
         label: name.to_owned(),
         caret: insert.len(),
+        caret_len: 0,
         stops: Vec::new(),
         insert,
         kind: Kind::Keyword,
@@ -407,6 +411,7 @@ fn key_items(keys: &Keyspace<'_>, prefix: &str, items: &mut Vec<Item>, needs: &m
         items.push(Item {
             label: key.name.clone(),
             caret: insert.len(),
+            caret_len: 0,
             stops: Vec::new(),
             insert,
             kind: Kind::Key,
@@ -558,6 +563,7 @@ pub fn complete_mongo(
                 insert.len()
             },
             insert,
+            caret_len: 0,
             stops: Vec::new(),
             kind,
             detail: detail.to_owned(),
@@ -2270,6 +2276,7 @@ impl<'a> Builder<'a> {
             label,
             insert,
             caret,
+            caret_len: 0,
             stops: Vec::new(),
             kind,
             detail,
@@ -2342,7 +2349,7 @@ impl<'a> Builder<'a> {
         self.push(Kind::Keyword, label, insert, "template".to_owned());
         if let Some(item) = self.items.last_mut() {
             item.caret = caret;
-            item.stops = stops[1..].to_vec();
+            item.stops = stops[1..].iter().map(|stop| *stop..*stop).collect();
             item.key = "VALUES".to_owned();
         }
     }
@@ -2667,13 +2674,19 @@ impl<'a> Builder<'a> {
         }
         for function in self.options.family.functions() {
             let name = self.cased(function);
+            let call = call_template(&name, self.options.family.signature(function));
             self.push_keyed(
                 Kind::Function,
                 format!("{name}()"),
-                format!("{name}()"),
+                call.insert,
                 String::new(),
                 name,
             );
+            if let Some(item) = self.items.last_mut() {
+                item.caret = call.caret;
+                item.caret_len = call.caret_len;
+                item.stops = call.stops;
+            }
         }
         self.keywords(PHRASES);
         self.keywords(&self.options.family.keywords());
@@ -3028,6 +3041,51 @@ fn relation_kind(kind: ObjectKind) -> Option<Kind> {
         ObjectKind::Table | ObjectKind::ForeignTable => Some(Kind::Table),
         ObjectKind::View | ObjectKind::MaterializedView => Some(Kind::View),
         ObjectKind::Function | ObjectKind::Sequence | ObjectKind::Key => None,
+    }
+}
+
+/// A function call to insert: its text and where the caret and the stops
+/// of its arguments go.
+struct Call {
+    insert: String,
+    caret: usize,
+    caret_len: usize,
+    stops: Vec<Range<usize>>,
+}
+
+/// `name(arg, arg)` for a `signature` of arguments, the first one selected
+/// and Tab visiting the rest, then the end of the call. `name()` with the
+/// caret inside when the arguments are unknown or there are none.
+fn call_template(name: &str, signature: Option<&str>) -> Call {
+    let arguments: Vec<&str> = signature
+        .filter(|signature| !signature.is_empty())
+        .map_or_else(Vec::new, |signature| signature.split(", ").collect());
+    if arguments.is_empty() {
+        let insert = format!("{name}()");
+        return Call {
+            caret: insert.len() - 1,
+            caret_len: 0,
+            stops: Vec::new(),
+            insert,
+        };
+    }
+    let mut insert = format!("{name}(");
+    let mut places = Vec::new();
+    for (index, argument) in arguments.iter().enumerate() {
+        if index > 0 {
+            insert.push_str(", ");
+        }
+        places.push(insert.len()..insert.len() + argument.len());
+        insert.push_str(argument);
+    }
+    insert.push(')');
+    let first = places.remove(0);
+    places.push(insert.len()..insert.len());
+    Call {
+        caret: first.start,
+        caret_len: first.len(),
+        stops: places,
+        insert,
     }
 }
 
@@ -3537,6 +3595,43 @@ mod tests {
     }
 
     #[test]
+    fn a_function_inserts_its_arguments_as_placeholders() {
+        let call = call_template("round", Some("number, decimals"));
+        assert_eq!(call.insert, "round(number, decimals)");
+        assert_eq!(
+            &call.insert[call.caret..call.caret + call.caret_len],
+            "number"
+        );
+        let names: Vec<&str> = call.stops.iter().map(|s| &call.insert[s.clone()]).collect();
+        // The second argument, then the end of the call.
+        assert_eq!(names, ["decimals", ""]);
+        assert_eq!(call.stops[1].start, call.insert.len());
+        // None known, or none taken: the caret goes inside the parentheses.
+        for signature in [None, Some("")] {
+            let call = call_template("f", signature);
+            assert_eq!(
+                (call.insert.as_str(), call.caret, call.caret_len),
+                ("f()", 2, 0)
+            );
+            assert!(call.stops.is_empty());
+        }
+        let completion = at(&shop(), "SELECT rou|");
+        let item = completion
+            .items
+            .iter()
+            .find(|item| item.label == "round()")
+            .expect("round");
+        assert_eq!(item.insert, "round(number, decimals)");
+        let custom = at(&shop(), "SELECT slug|");
+        let item = custom
+            .items
+            .iter()
+            .find(|item| item.label == "slugify()")
+            .expect("slugify");
+        assert_eq!((item.insert.as_str(), item.caret), ("slugify()", 8));
+    }
+
+    #[test]
     fn insert_offers_a_template_with_a_stop_per_value() {
         let completion = at(&shop(), "INSERT INTO customers |");
         let template = completion
@@ -3547,7 +3642,7 @@ mod tests {
         assert_eq!(template.insert, "(id, name, country) VALUES (, , )");
         // The caret and the stops sit inside each value's place.
         let places: Vec<usize> = std::iter::once(template.caret)
-            .chain(template.stops.iter().copied())
+            .chain(template.stops.iter().map(|stop| stop.start))
             .collect();
         assert_eq!(places.len(), 3);
         for place in &places {
@@ -3787,9 +3882,9 @@ mod tests {
             complete(&text, cursor, &shop, &options).expect("a completion")
         };
         let mysql = with(Family::MySql, "SELECT ar| FROM orders");
-        assert!(!inserts(&mysql).contains(&"array_agg()"));
+        assert!(!inserts(&mysql).contains(&"array_agg(expression)"));
         let postgres = with(Family::Postgres, "SELECT ar| FROM orders");
-        assert!(inserts(&postgres).contains(&"array_agg()"));
+        assert!(inserts(&postgres).contains(&"array_agg(expression)"));
         assert!(inserts(&with(Family::Sqlite, "PR|")).contains(&"PRAGMA"));
         assert!(inserts(&with(Family::MySql, "DESC|")).contains(&"DESCRIBE"));
         assert!(!inserts(&with(Family::Sqlite, "EXPLAIN A|")).contains(&"EXPLAIN ANALYZE"));

@@ -13,8 +13,8 @@ pub struct Edited {
 /// The stops left in an inserted snippet, which Tab visits in turn.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Snippet {
-    /// Byte offsets in the text, ascending.
-    stops: Vec<usize>,
+    /// Byte ranges in the text, ascending; empty for a bare caret.
+    stops: Vec<Range<usize>>,
     /// The text's length when the stops were last placed.
     len: usize,
 }
@@ -22,9 +22,12 @@ pub struct Snippet {
 impl Snippet {
     /// The stops of an item inserted at byte `start` into a text now
     /// `len` long; none when the item has no more stops.
-    pub fn new(start: usize, stops: &[usize], len: usize) -> Option<Self> {
+    pub fn new(start: usize, stops: &[Range<usize>], len: usize) -> Option<Self> {
         (!stops.is_empty()).then(|| Self {
-            stops: stops.iter().map(|stop| start + stop).collect(),
+            stops: stops
+                .iter()
+                .map(|stop| start + stop.start..start + stop.end)
+                .collect(),
             len,
         })
     }
@@ -40,18 +43,19 @@ impl Snippet {
         }
         let at = cursor.saturating_sub(delta.max(0) as usize);
         for stop in &mut self.stops {
-            if *stop >= at {
-                *stop = stop.saturating_add_signed(delta);
+            if stop.start >= at {
+                stop.start = stop.start.saturating_add_signed(delta);
+                stop.end = stop.end.saturating_add_signed(delta);
             }
         }
-        self.stops.first().is_some_and(|stop| *stop >= cursor)
+        self.stops.first().is_some_and(|stop| stop.start >= cursor)
     }
 
     /// The next stop after `cursor`, which is dropped; `None` when the
     /// cursor is already past them all.
-    pub fn next(&mut self, cursor: usize) -> Option<usize> {
-        let index = self.stops.iter().position(|stop| *stop > cursor)?;
-        let stop = self.stops[index];
+    pub fn next(&mut self, cursor: usize) -> Option<Range<usize>> {
+        let index = self.stops.iter().position(|stop| stop.start > cursor)?;
+        let stop = self.stops[index].clone();
         self.stops.drain(..=index);
         Some(stop)
     }
@@ -226,18 +230,18 @@ mod tests {
     #[test]
     fn snippet_stops_are_visited_and_follow_typing() {
         // `(a, b) VALUES (|, |)` inserted at 10.
-        let mut snippet = Snippet::new(10, &[4, 6], 20).expect("stops");
-        assert_eq!(snippet.next(14), Some(16));
+        let mut snippet = Snippet::new(10, &[4..4, 6..6], 20).expect("stops");
+        assert_eq!(snippet.next(14), Some(16..16));
         assert_eq!(snippet.next(16), None);
         assert!(snippet.is_empty());
         assert!(Snippet::new(0, &[], 5).is_none());
 
         // Typing `42` at the first stop moves the second one along.
-        let mut snippet = Snippet::new(10, &[4, 6], 20).expect("stops");
+        let mut snippet = Snippet::new(10, &[4..4, 6..6], 20).expect("stops");
         assert!(snippet.follow(22, 16));
-        assert_eq!(snippet.next(16), Some(18));
+        assert_eq!(snippet.next(16), Some(18..18));
         // Moving the cursor past the stop with edits ends it.
-        let mut snippet = Snippet::new(0, &[2], 10).expect("stops");
+        let mut snippet = Snippet::new(0, &[2..2], 10).expect("stops");
         assert!(!snippet.follow(14, 9));
     }
 }

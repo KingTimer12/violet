@@ -543,8 +543,8 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
         && ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Tab))
     {
         if let Some(stop) = open.next(selection.start) {
-            select(ui.ctx(), text_id, sql, stop..stop);
-            *selection = stop..stop;
+            select(ui.ctx(), text_id, sql, stop.clone());
+            *selection = stop;
         }
         if open.is_empty() {
             *snippet = None;
@@ -1024,22 +1024,18 @@ fn insert(
     let range = completion.range.start.min(sql.len())..completion.range.end.min(sql.len());
     let (stops, caret) = place(sql, range, item);
     *snippet = stops;
-    let caret = sql[..caret].chars().count();
-    let mut state = egui::text_edit::TextEditState::load(ctx, text_id).unwrap_or_default();
-    state
-        .cursor
-        .set_char_range(Some(CCursorRange::one(CCursor::new(caret))));
-    state.store(ctx, text_id);
+    select(ctx, text_id, sql, caret);
     Some(item.clone())
 }
 
 /// Replaces `range` of `sql` with `item`, and returns the stops Tab visits
-/// after it and the byte offset of the caret.
-fn place(sql: &mut String, range: Range<usize>, item: &Item) -> (Option<Snippet>, usize) {
+/// after it and the byte range to select: the caret, or a placeholder.
+fn place(sql: &mut String, range: Range<usize>, item: &Item) -> (Option<Snippet>, Range<usize>) {
     sql.replace_range(range.clone(), &item.insert);
     // `caret` and `stops` are offsets into the inserted text.
     let stops = Snippet::new(range.start, &item.stops, sql.len());
-    (stops, range.start + item.caret)
+    let caret = range.start + item.caret;
+    (stops, caret..caret + item.caret_len)
 }
 
 fn kind_style(kind: Kind, palette: &Palette) -> (Icon, egui::Color32) {
@@ -1313,13 +1309,57 @@ mod tests {
             .find(|item| item.detail == "template")
             .expect("template");
         let (stops, caret) = place(&mut sql, completion.range.clone(), item);
-        assert_eq!(&sql[..caret], "INSERT INTO t (a, b, c) VALUES (");
+        assert_eq!(&sql[..caret.start], "INSERT INTO t (a, b, c) VALUES (");
         let mut stops = stops.expect("stops");
         // Each Tab lands at the next value, not shifted by the caret.
-        let second = stops.next(caret).expect("second");
-        assert_eq!(&sql[..second], "INSERT INTO t (a, b, c) VALUES (, ");
-        let third = stops.next(second).expect("third");
-        assert_eq!(&sql[..third], "INSERT INTO t (a, b, c) VALUES (, , ");
+        let second = stops.next(caret.start).expect("second");
+        assert_eq!(&sql[..second.start], "INSERT INTO t (a, b, c) VALUES (, ");
+        let third = stops.next(second.start).expect("third");
+        assert_eq!(&sql[..third.start], "INSERT INTO t (a, b, c) VALUES (, , ");
+        assert!(stops.is_empty());
+    }
+
+    #[test]
+    fn a_function_placeholder_is_typed_over_and_tab_moves_on() {
+        let item = |sql: &str, label: &str| {
+            let catalog = Table::new();
+            let history = History::default();
+            let search = vec!["public".to_owned()];
+            let quote = |name: &str| name.to_owned();
+            let options = Options {
+                search: &search,
+                database: None,
+                quote: &quote,
+                family: Family::Other,
+                case: KeywordCase::default(),
+                history: &history,
+            };
+            let completion =
+                completion::complete(sql, sql.len(), &catalog, &options).expect("completion");
+            let found = completion
+                .items
+                .iter()
+                .find(|item| item.label == label)
+                .expect("item")
+                .clone();
+            (completion.range, found)
+        };
+        let mut sql = "SELECT rou".to_owned();
+        let (range, round) = item(&sql, "round()");
+        let (stops, first) = place(&mut sql, range, &round);
+        assert_eq!(sql, "SELECT round(number, decimals)");
+        assert_eq!(&sql[first.clone()], "number");
+        let mut stops = stops.expect("stops");
+        // Typing over the placeholder moves the later ones along.
+        sql.replace_range(first.clone(), "price");
+        let cursor = first.start + "price".len();
+        assert!(stops.follow(sql.len(), cursor));
+        let second = stops.next(cursor).expect("second");
+        assert_eq!(&sql[second.clone()], "decimals");
+        sql.replace_range(second.clone(), "2");
+        assert!(stops.follow(sql.len(), second.start + 1));
+        let end = stops.next(second.start + 1).expect("end");
+        assert_eq!(end, sql.len()..sql.len());
         assert!(stops.is_empty());
     }
 
