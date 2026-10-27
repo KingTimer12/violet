@@ -772,9 +772,12 @@ impl VioletApp {
                     .insert((id, schema, prefix), Loadable::Ready(keys.into()));
             }
             Event::ForeignKeys { id, schema, result } => {
-                self.explorer
-                    .foreign_keys
-                    .insert((id, schema), Loadable::from_result(result));
+                if self
+                    .explorer
+                    .foreign_keys_loaded(id, schema.clone(), result.map(Into::into))
+                {
+                    self.backend.load_foreign_keys(id, schema);
+                }
             }
             Event::QueryFinished { request, result } => {
                 if let Some(pending) = self.rename_requests.remove(&request) {

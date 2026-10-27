@@ -32,6 +32,10 @@ impl<T> Loadable<T> {
     }
 }
 
+/// How many times a schema's foreign keys are asked for before a failure
+/// stands.
+const FOREIGN_KEY_TRIES: u8 = 3;
+
 /// A connection's state.
 #[derive(Clone, Debug, Default)]
 pub enum Link {
@@ -165,6 +169,9 @@ pub struct Explorer {
     pub columns: HashMap<RelationKey, Loadable<Arc<[ColumnInfo]>>>,
     /// Foreign keys from or to each schema's tables, for completion.
     pub foreign_keys: HashMap<(ConnectionId, String), Loadable<Arc<[ForeignKey]>>>,
+    /// How many times each schema's foreign keys were asked for, while they
+    /// are not loaded.
+    pub foreign_key_tries: HashMap<(ConnectionId, String), u8>,
     /// The triggers, roles and extensions of each session's database.
     pub folders: HashMap<(ConnectionId, Folder), Loadable<Arc<[FolderItem]>>>,
     /// The keys of each key-value database.
@@ -221,6 +228,29 @@ impl Explorer {
         }
     }
 
+    /// Stores a schema's foreign keys as loaded. A failure is asked again, up
+    /// to [`FOREIGN_KEY_TRIES`] times in all; returns whether to ask now.
+    pub fn foreign_keys_loaded(
+        &mut self,
+        id: ConnectionId,
+        schema: String,
+        result: violet_core::Result<Arc<[ForeignKey]>>,
+    ) -> bool {
+        let key = (id, schema);
+        if result.is_err() {
+            let tries = self.foreign_key_tries.entry(key.clone()).or_insert(1);
+            if *tries < FOREIGN_KEY_TRIES {
+                *tries += 1;
+                self.foreign_keys.insert(key, Loadable::Loading);
+                return true;
+            }
+        } else {
+            self.foreign_key_tries.remove(&key);
+        }
+        self.foreign_keys.insert(key, Loadable::from_result(result));
+        false
+    }
+
     /// Forgets everything loaded for a connection, keeping expansion so a
     /// reconnect reopens the same branches.
     pub fn forget(&mut self, id: ConnectionId) {
@@ -229,6 +259,7 @@ impl Explorer {
         self.objects.retain(|(owner, _), _| *owner != id);
         self.columns.retain(|(owner, _, _), _| *owner != id);
         self.foreign_keys.retain(|(owner, _), _| *owner != id);
+        self.foreign_key_tries.retain(|(owner, _), _| *owner != id);
         self.folders.retain(|(owner, _), _| *owner != id);
         self.keys.retain(|(owner, _), _| *owner != id);
     }
@@ -355,5 +386,41 @@ impl crate::completion::Catalog for ConnectionCatalog<'_> {
             self.explorer.foreign_keys.get(&(id, schema.to_owned())),
             &[],
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use violet_core::{DbError, ErrorKind};
+
+    fn failure() -> violet_core::Result<Arc<[ForeignKey]>> {
+        Err(DbError::new(ErrorKind::Connection, "dropped"))
+    }
+
+    #[test]
+    fn failed_foreign_keys_are_asked_again_a_few_times() {
+        let mut explorer = Explorer::default();
+        let id = ConnectionId::new();
+        let key = (id, "public".to_owned());
+        assert!(explorer.foreign_keys_loaded(id, "public".into(), failure()));
+        assert!(explorer.foreign_keys[&key].is_loading());
+        assert!(explorer.foreign_keys_loaded(id, "public".into(), failure()));
+        // The third failure stands.
+        assert!(!explorer.foreign_keys_loaded(id, "public".into(), failure()));
+        assert!(matches!(explorer.foreign_keys[&key], Loadable::Failed(_)));
+    }
+
+    #[test]
+    fn foreign_keys_loaded_after_a_retry_are_kept() {
+        let mut explorer = Explorer::default();
+        let id = ConnectionId::new();
+        assert!(explorer.foreign_keys_loaded(id, "public".into(), failure()));
+        assert!(!explorer.foreign_keys_loaded(id, "public".into(), Ok(Arc::from(Vec::new()))));
+        assert!(matches!(
+            explorer.foreign_keys[&(id, "public".to_owned())],
+            Loadable::Ready(_)
+        ));
+        assert!(explorer.foreign_key_tries.is_empty());
     }
 }
