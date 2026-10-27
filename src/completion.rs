@@ -2124,6 +2124,72 @@ pub fn redis_signature(text: &str, cursor: usize) -> Option<Signature> {
     Some(Signature { label, active })
 }
 
+/// The syntax of the built-in function whose parentheses hold `cursor`,
+/// the argument being written marked. `None` outside a call, in a
+/// string or a comment, and for functions with no known signature.
+pub fn sql_signature(text: &str, cursor: usize, family: Family) -> Option<Signature> {
+    if cursor > text.len() || !text.is_char_boundary(cursor) {
+        return None;
+    }
+    let analysis = analyze(text, family);
+    if inside_literal(text, &analysis.all, cursor) {
+        return None;
+    }
+    let before = analysis
+        .significant
+        .partition_point(|token| token.range.end <= cursor);
+    let (name, commas) = open_call(text, &analysis.significant[..before])?;
+    let signature = family.signature(&name)?;
+    let arguments: Vec<&str> = if signature.is_empty() {
+        Vec::new()
+    } else {
+        signature.split(", ").collect()
+    };
+    let label = format!("{name}({signature})");
+    // A call may pass more arguments than the list names: the last repeats.
+    let active = arguments
+        .get(commas.min(arguments.len().saturating_sub(1)))
+        .map(|argument| {
+            let start = name.len()
+                + 1
+                + arguments
+                    .iter()
+                    .take(commas.min(arguments.len() - 1))
+                    .map(|argument| argument.len() + 2)
+                    .sum::<usize>();
+            start..start + argument.len()
+        });
+    Some(Signature { label, active })
+}
+
+/// The name of the call `tokens` ends inside, and how many arguments it
+/// has had before the one being written.
+fn open_call(text: &str, tokens: &[Token]) -> Option<(String, usize)> {
+    // One entry per parenthesis left open: the word before it, and the
+    // commas seen at its level.
+    let mut open: Vec<(Option<&str>, usize)> = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if is(text, token, ";") {
+            open.clear();
+        } else if is(text, token, "(") {
+            let caller = index
+                .checked_sub(1)
+                .map(|before| &tokens[before])
+                .filter(|before| matches!(before.kind, TokenKind::Keyword | TokenKind::Identifier))
+                .map(|before| &text[before.range.clone()]);
+            open.push((caller, 0));
+        } else if is(text, token, ")") {
+            open.pop();
+        } else if is(text, token, ",")
+            && let Some(top) = open.last_mut()
+        {
+            top.1 += 1;
+        }
+    }
+    let (caller, commas) = open.pop()?;
+    Some((caller?.to_owned(), commas))
+}
+
 /// The Redis command syntax for the command name at byte `offset`, when
 /// that is the first word of its line (or a container's second).
 pub fn redis_hover(text: &str, offset: usize) -> Option<Hover> {
@@ -3592,6 +3658,61 @@ mod tests {
         assert_eq!(redis_hover("GET a", 1).expect("command").title, "GET");
         assert!(redis_hover("GET a", 4).is_none());
         assert!(redis_hover("NOPE a", 1).is_none());
+    }
+
+    #[test]
+    fn a_call_shows_its_signature_with_the_argument_being_written() {
+        let marked = |text: &str, family: Family| {
+            let cursor = text.find('|').expect("cursor");
+            let text = text.replacen('|', "", 1);
+            sql_signature(&text, cursor, family).map(|sig| {
+                let active = sig.active.map(|range| sig.label[range].to_owned());
+                (sig.label, active)
+            })
+        };
+        let round = |active: Option<&str>| {
+            Some((
+                "round(number, decimals)".to_owned(),
+                active.map(str::to_owned),
+            ))
+        };
+        assert_eq!(
+            marked("SELECT round(|", Family::Postgres),
+            round(Some("number"))
+        );
+        assert_eq!(
+            marked("SELECT round(a, |", Family::Postgres),
+            round(Some("decimals"))
+        );
+        // A nested call or parenthesis keeps its commas to itself.
+        assert_eq!(
+            marked("SELECT round(coalesce(a, b), |", Family::Postgres),
+            round(Some("decimals"))
+        );
+        assert_eq!(
+            marked("SELECT round(coalesce(a, |", Family::Postgres),
+            Some((
+                "coalesce(value, value)".to_owned(),
+                Some("value".to_owned())
+            ))
+        );
+        // Past the named arguments the last one repeats.
+        assert!(marked("SELECT coalesce(a, b, c, |", Family::Postgres).is_some());
+        assert_eq!(
+            marked("SELECT now(|", Family::Postgres),
+            Some(("now()".to_owned(), None))
+        );
+        // Not in a call, a string, a comment, a closed call, or one unknown.
+        assert!(marked("SELECT |", Family::Postgres).is_none());
+        assert!(marked("SELECT round(a, 'x|", Family::Postgres).is_none());
+        assert!(marked("SELECT round(a -- x|", Family::Postgres).is_none());
+        assert!(marked("SELECT round(a, b) |", Family::Postgres).is_none());
+        assert!(marked("SELECT mine(|", Family::Postgres).is_none());
+        assert!(marked("SELECT 1 WHERE a IN (|", Family::Postgres).is_none());
+        // The statement before it does not leak into the next.
+        assert!(marked("SELECT round(a; SELECT |", Family::Postgres).is_none());
+        // A function this database lacks.
+        assert!(marked("SELECT array_agg(|", Family::MySql).is_none());
     }
 
     #[test]

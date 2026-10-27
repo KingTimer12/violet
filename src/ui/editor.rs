@@ -673,10 +673,20 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
                             .clone()
                             .on_hover_ui_at_pointer(|ui| hover_card(ui, &hint, &palette));
                     }
-                    if output.response.has_focus()
-                        && assist.language == Language::Redis
-                        && let Some(signature) = completion::redis_signature(sql, selection.start)
-                    {
+                    let signature = if !output.response.has_focus() {
+                        None
+                    } else {
+                        match assist.language {
+                            Language::Redis => completion::redis_signature(sql, selection.start),
+                            Language::Sql => completion::sql_signature(
+                                sql,
+                                selection.start,
+                                assist.options.family,
+                            ),
+                            Language::Mongodb => None,
+                        }
+                    };
+                    if let Some(signature) = signature {
                         let at = sql[..selection.start].chars().count();
                         let rect = output.galley.pos_from_cursor(CCursor::new(at));
                         let anchor = output.galley_pos + rect.left_bottom().to_vec2();
@@ -818,7 +828,7 @@ fn hover_card(ui: &mut Ui, hint: &completion::Hover, palette: &Palette) {
     }
 }
 
-/// A command's syntax under the cursor, the argument being written marked.
+/// A command's or function's syntax under the cursor, the argument being written marked.
 fn signature_card(
     ui: &Ui,
     tab: u64,
