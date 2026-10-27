@@ -13,6 +13,7 @@ use std::rc::Rc;
 
 use violet_core::{ColumnInfo, DbObject, ForeignKey, ObjectKind};
 
+use crate::diagnostics::{Diagnostic, Severity};
 use crate::dialect::Family;
 use crate::settings::KeywordCase;
 use crate::sql::{self, Token, TokenKind};
@@ -900,7 +901,7 @@ fn analyze(text: &str, family: Family) -> Rc<Analysis> {
 /// The text's tokens and where its statements end. A `;` inside a string,
 /// a comment or a `$$` body ends nothing; MySQL knows no `$$` bodies, and
 /// its client ends statements with what `DELIMITER` sets.
-fn lex(text: &str, family: Family) -> (Vec<Token>, Vec<Range<usize>>) {
+pub(crate) fn lex(text: &str, family: Family) -> (Vec<Token>, Vec<Range<usize>>) {
     if family != Family::MySql {
         let tokens: Vec<Token> = sql::tokens(text).collect();
         let separators = tokens
@@ -1348,7 +1349,10 @@ fn relations(text: &str, tokens: &[Token]) -> Vec<Relation> {
                 from = None;
             }
         } else if is(text, token, ",") {
+            // The comma itself is no table: the one after it is.
             expect = from == Some(depth);
+            index += 1;
+            continue;
         }
         match word(text, token).as_deref() {
             Some("FROM") => {
@@ -2229,6 +2233,184 @@ pub fn redis_hover(text: &str, offset: usize) -> Option<Hover> {
         title: found.name.to_owned(),
         detail: found.syntax.to_owned(),
     })
+}
+
+// ---- names the catalog does not know ---------------------------------------
+
+/// Names that tables and columns the statements read the loaded catalog
+/// says are missing from it: a table or view that is in no schema it could
+/// be in, and `alias.column` where the table's columns are loaded and lack
+/// it. Never says so of what it cannot place: CTEs, subqueries, tables the
+/// script creates, schemas or columns not loaded, functions in `FROM`.
+pub fn unknown_names(text: &str, catalog: &dyn Catalog, options: &Options<'_>) -> Vec<Diagnostic> {
+    /// Columns every row has without the catalog listing them.
+    const SYSTEM_COLUMNS: &[&str] = &[
+        "ctid", "oid", "tableoid", "xmin", "xmax", "cmin", "cmax", "rowid", "_rowid_",
+    ];
+    let analysis = analyze(text, options.family);
+    let tokens = &analysis.significant;
+    let script = &analysis.script;
+    // `SET search_path` points at schemas the editor does not know.
+    let moved = tokens
+        .iter()
+        .any(|token| is_word(text, Some(token), "SEARCH_PATH"));
+    let mut found = Vec::new();
+    let mut from = 0;
+    let ends = analysis
+        .separators
+        .iter()
+        .map(|separator| separator.start)
+        .chain(std::iter::once(text.len()));
+    for end in ends {
+        let first = tokens.partition_point(|token| token.range.start < from);
+        let last = tokens.partition_point(|token| token.range.end <= end);
+        from = end;
+        let statement = &tokens[first..last.max(first)];
+        let reads = statement.first().and_then(|token| word(text, token));
+        if !reads.is_some_and(|w| {
+            matches!(
+                w.as_str(),
+                "SELECT" | "WITH" | "INSERT" | "UPDATE" | "DELETE" | "REPLACE"
+            )
+        }) {
+            continue;
+        }
+        let inserting = statement
+            .iter()
+            .any(|token| matches!(word(text, token).as_deref(), Some("INSERT" | "REPLACE")));
+        let scope = Scope {
+            relations: relations(text, statement),
+            ctes: ctes(text, statement),
+        };
+        // Where each table is named, so its parts are not read as columns.
+        let mut named: Vec<Range<usize>> = Vec::new();
+        for relation in scope.relations.iter().filter(|r| r.columns.is_none()) {
+            let Some(index) = statement.iter().position(|t| t.range.start == relation.at) else {
+                continue;
+            };
+            let Some((parts, next)) = dotted(text, statement, index) else {
+                continue;
+            };
+            let span = relation.at..statement[next - 1].range.end;
+            named.push(span.clone());
+            let before = index
+                .checked_sub(1)
+                .and_then(|at| word(text, &statement[at]));
+            let called = statement.get(next).is_some_and(|t| is(text, t, "("))
+                && !matches!(before.as_deref(), Some("INTO" | "TABLE"));
+            // `SELECT ... INTO t` makes the table.
+            let makes = before.as_deref() == Some("INTO") && !inserting;
+            let known = scope.cte(&relation.name).is_some() && relation.schema.is_none()
+                || created_in(script, relation.schema.as_deref(), &relation.name).is_some();
+            if called || makes || known || parts.len() > 2 || moved && relation.schema.is_none() {
+                continue;
+            }
+            if table_missing(catalog, options, relation) {
+                found.push(Diagnostic {
+                    range: span,
+                    message: format!("{} is not in the catalog", parts.join(".")),
+                    severity: Severity::Warning,
+                });
+            }
+        }
+
+        // `handle.column` against the columns of the table the handle names.
+        for (index, token) in statement.iter().enumerate() {
+            let [dot, column, after] = [1, 2, 3].map(|at| statement.get(index + at));
+            let (Some(dot), Some(column)) = (dot, column) else {
+                continue;
+            };
+            let after_dot = index
+                .checked_sub(1)
+                .is_some_and(|at| is(text, &statement[at], "."));
+            if !is(text, dot, ".")
+                || after_dot
+                || after.is_some_and(|t| is(text, t, ".") || is(text, t, "("))
+                || named.iter().any(|span| span.contains(&token.range.start))
+            {
+                continue;
+            }
+            let (Some(handle), Some(typed)) = (alias(text, Some(token)), alias(text, Some(column)))
+            else {
+                continue;
+            };
+            let quoted = column.kind == TokenKind::QuotedIdentifier;
+            let same_handle = |r: &&Relation| r.handle().eq_ignore_ascii_case(&handle);
+            let mut matching = scope.relations.iter().filter(same_handle);
+            let (Some(relation), None) = (matching.next(), matching.next()) else {
+                continue;
+            };
+            if relation.columns.is_some()
+                || scope.cte(&relation.name).is_some()
+                || created_in(script, relation.schema.as_deref(), &relation.name).is_some()
+                || SYSTEM_COLUMNS.contains(&typed.to_ascii_lowercase().as_str())
+            {
+                continue;
+            }
+            let Some((schema, table)) = table_found(catalog, options, relation) else {
+                continue;
+            };
+            let Some(columns) = catalog.columns(&schema, &table) else {
+                continue;
+            };
+            if !columns.iter().any(|c| same(&c.name, &typed, quoted)) {
+                found.push(Diagnostic {
+                    range: column.range.clone(),
+                    message: format!("{table} has no column {typed}"),
+                    severity: Severity::Warning,
+                });
+            }
+        }
+    }
+    found
+}
+
+/// Where the catalog has `relation`, as its schema and name, when it is
+/// loaded far enough to say.
+fn table_found(
+    catalog: &dyn Catalog,
+    options: &Options<'_>,
+    relation: &Relation,
+) -> Option<(String, String)> {
+    let schemas: Vec<&String> = match &relation.schema {
+        Some(schema) => catalog
+            .schemas()
+            .iter()
+            .filter(|s| s.eq_ignore_ascii_case(schema))
+            .collect(),
+        None => options.search.iter().chain(catalog.schemas()).collect(),
+    };
+    schemas.into_iter().find_map(|schema| {
+        let object = catalog.object(schema, &relation.name, relation.quoted, true)?;
+        Some((schema.clone(), object.name.clone()))
+    })
+}
+
+/// Whether the catalog, loaded where `relation` could be, lacks it.
+fn table_missing(catalog: &dyn Catalog, options: &Options<'_>, relation: &Relation) -> bool {
+    let lower = relation.name.to_ascii_lowercase();
+    // The server's own tables are in schemas the editor may not list.
+    if lower.starts_with("pg_") || lower.starts_with("sqlite_") || lower == "dual" {
+        return false;
+    }
+    let schemas: Vec<&String> = match &relation.schema {
+        Some(schema) => {
+            let Some(schema) = catalog
+                .schemas()
+                .iter()
+                .find(|s| s.eq_ignore_ascii_case(schema))
+            else {
+                return false;
+            };
+            vec![schema]
+        }
+        None if options.search.is_empty() => return false,
+        None => options.search.iter().collect(),
+    };
+    schemas
+        .iter()
+        .all(|schema| catalog.objects(schema).is_some())
+        && table_found(catalog, options, relation).is_none()
 }
 
 // ---- building the list ----------------------------------------------------
@@ -3658,6 +3840,80 @@ mod tests {
         assert_eq!(redis_hover("GET a", 1).expect("command").title, "GET");
         assert!(redis_hover("GET a", 4).is_none());
         assert!(redis_hover("NOPE a", 1).is_none());
+    }
+
+    /// The names marked in `text`, as typed, with the catalog `shop`.
+    fn unknown(shop: &Fake, text: &str) -> Vec<String> {
+        let search = vec!["public".to_owned()];
+        let quote = |name: &str| name.to_owned();
+        let options = Options {
+            search: &search,
+            database: Some("shop"),
+            quote: &quote,
+            family: Family::Postgres,
+            case: KeywordCase::default(),
+            history: &History::default(),
+        };
+        unknown_names(text, shop, &options)
+            .into_iter()
+            .map(|d| text[d.range].to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn missing_tables_and_columns_are_marked_only_when_sure() {
+        let mut shop = shop();
+        shop.schemas.push("archive".into());
+        assert_eq!(unknown(&shop, "SELECT * FROM custmers"), ["custmers"]);
+        assert_eq!(unknown(&shop, "SELECT * FROM public.nope"), ["public.nope"]);
+        assert_eq!(
+            unknown(&shop, "SELECT o.totl, o.total FROM orders o"),
+            ["totl"]
+        );
+        assert_eq!(
+            unknown(&shop, "SELECT c.zzz FROM orders o, customers c"),
+            ["zzz"]
+        );
+        assert_eq!(
+            unknown(&shop, "UPDATE orders SET total = 1 WHERE orders.x = 1"),
+            ["x"]
+        );
+        assert_eq!(
+            unknown(&shop, "INSERT INTO nope (a) VALUES (1); DELETE FROM orders"),
+            ["nope"]
+        );
+        // What is known, or cannot be told, is left alone.
+        for fine in [
+            "SELECT * FROM customers c JOIN orders o ON o.customer_id = c.id",
+            "SELECT * FROM \"orders\"",
+            "WITH t AS (SELECT 1 AS a) SELECT t.a, t.zzz FROM t",
+            "SELECT s.a FROM (SELECT 1 AS a) s",
+            "SELECT * FROM generate_series(1, 3) g",
+            "SELECT 1 INTO backup FROM orders",
+            "CREATE TABLE scratch (a int); SELECT s.a, s.b FROM scratch s",
+            "SELECT * FROM archive.old",
+            "SELECT * FROM elsewhere.old",
+            "SELECT * FROM pg_class",
+            "SELECT o.ctid FROM orders o",
+            "SELECT o.a.b, o.f(1) FROM orders o",
+            "SELECT * FROM public.orders WHERE public.orders.id = 1",
+            "SET search_path TO other; SELECT * FROM mine",
+            "DROP TABLE IF EXISTS gone",
+            "SELECT x.a FROM orders x, customers x",
+        ] {
+            assert!(
+                unknown(&shop, fine).is_empty(),
+                "{fine}: {:?}",
+                unknown(&shop, fine)
+            );
+        }
+        // A quoted name is exact.
+        assert_eq!(unknown(&shop, "SELECT * FROM \"Orders\""), ["\"Orders\""]);
+        // Columns not loaded say nothing; tables not loaded say nothing.
+        shop.columns.clear();
+        assert!(unknown(&shop, "SELECT o.zzz FROM orders o").is_empty());
+        shop.objects.clear();
+        assert!(unknown(&shop, "SELECT * FROM custmers").is_empty());
     }
 
     #[test]

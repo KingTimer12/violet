@@ -16,6 +16,7 @@ use super::theme::{self, Palette};
 use super::widgets::{self, Tone};
 use super::workspace::QueryTab;
 use crate::completion::{self, Catalog, Completion, Item, Kind};
+use crate::diagnostics::{self, Diagnostic, Severity};
 use crate::editing::{self, Edited, Snippet};
 use crate::sql::{self, TokenKind};
 
@@ -27,8 +28,11 @@ const GUTTER: f32 = 46.0;
 pub struct Highlighter {
     /// The job holds the text it was made from: comparing against it is a
     /// `memcmp`, far cheaper than hashing the whole buffer every frame.
-    job: Option<(LayoutJob, bool, Option<usize>, Language)>,
+    job: Option<(LayoutJob, bool, Option<usize>, Language, Marks)>,
 }
+
+/// The ranges the editor underlines for the problems it found.
+type Marks = Vec<(Range<usize>, Severity)>;
 
 impl Highlighter {
     fn job(
@@ -37,16 +41,25 @@ impl Highlighter {
         palette: &Palette,
         error_at: Option<usize>,
         language: Language,
+        marks: &Marks,
     ) -> LayoutJob {
-        let fresh = self.job.as_ref().is_some_and(|(job, dark, at, lang)| {
-            *dark == palette.dark && *at == error_at && *lang == language && job.text == text
-        });
+        let fresh = self
+            .job
+            .as_ref()
+            .is_some_and(|(job, dark, at, lang, kept)| {
+                *dark == palette.dark
+                    && *at == error_at
+                    && *lang == language
+                    && kept == marks
+                    && job.text == text
+            });
         if !fresh {
             self.job = Some((
-                highlight(text, palette, error_at, language),
+                highlight(text, palette, error_at, language, marks),
                 palette.dark,
                 error_at,
                 language,
+                marks.clone(),
             ));
         }
         self.job
@@ -58,7 +71,7 @@ impl Highlighter {
 
 /// `text` coloured as the editor colours it, for previews.
 pub fn highlighted(text: &str, palette: &Palette, language: Language) -> LayoutJob {
-    highlight(text, palette, None, language)
+    highlight(text, palette, None, language, &Vec::new())
 }
 
 /// Moves `tab`'s editor cursor to `char_index`, and focuses it.
@@ -293,6 +306,7 @@ fn highlight(
     palette: &Palette,
     error_at: Option<usize>,
     language: Language,
+    marks: &Marks,
 ) -> LayoutJob {
     let syntax = palette.syntax;
     let font = theme::mono(FONT_SIZE);
@@ -326,6 +340,15 @@ fn highlight(
         if is_error {
             format.underline = Stroke::new(1.5, palette.danger);
             format.background = palette.danger.gamma_multiply(0.18);
+        } else if let Some((_, severity)) = marks
+            .iter()
+            .find(|(range, _)| range.start < token.range.end && token.range.start < range.end)
+        {
+            let color = match severity {
+                Severity::Error => palette.danger,
+                Severity::Warning => palette.warning,
+            };
+            format.underline = Stroke::new(1.5, color);
         }
         job.append(&text[token.range], 0.0, format);
     }
@@ -402,6 +425,7 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
         popup,
         snippet,
         find,
+        diagnostics,
         ..
     } = tab;
     let text_id = Id::new(("violet-editor", *id));
@@ -570,8 +594,21 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
         .zip(ui.ctx().pointer_hover_pos())
         .is_some_and(|(area, pointer)| area.contains(pointer));
 
+    // Problems are read once the text stands still, and again as the
+    // catalog fills in.
+    if assist.language == Language::Sql {
+        let now = std::time::Instant::now();
+        if diagnostics.due(sql, now) {
+            let found = diagnostics::diagnose(sql, assist.catalog, &assist.options);
+            diagnostics.store(found, now);
+        }
+        if let Some(wait) = diagnostics.wait(now) {
+            ui.ctx().request_repaint_after(wait);
+        }
+    }
+    let marks = diagnostics.marks(selection.start);
     let mut layouter = |ui: &Ui, buffer: &dyn egui::TextBuffer, wrap: f32| -> Arc<egui::Galley> {
-        let mut job = highlighter.job(buffer.as_str(), &palette, error_at, assist.language);
+        let mut job = highlighter.job(buffer.as_str(), &palette, error_at, assist.language, &marks);
         job.wrap.max_width = wrap;
         ui.painter().layout_job(job)
     };
@@ -665,7 +702,7 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
                 // Tooltips for the word under the pointer; the syntax of the
                 // command being written, under the cursor.
                 if !popup.showing() {
-                    let hint = hovered_word(&output, sql, assist);
+                    let hint = hovered_word(&output, sql, assist, diagnostics.found());
                     if let Some(hint) = hint {
                         output
                             .response
@@ -785,6 +822,7 @@ fn hovered_word(
     output: &egui::text_edit::TextEditOutput,
     sql: &str,
     assist: &Assist<'_>,
+    problems: &[Diagnostic],
 ) -> Option<completion::Hover> {
     let pointer = output.response.hover_pos()?;
     let local = pointer - output.galley_pos;
@@ -793,11 +831,19 @@ fn hovered_word(
         .char_indices()
         .nth(index)
         .map_or(sql.len(), |(at, _)| at);
-    let hint = match assist.language {
+    let problem = problems
+        .iter()
+        .find(|problem| problem.range.contains(&offset))
+        .map(|problem| completion::Hover {
+            range: problem.range.clone(),
+            title: problem.message.clone(),
+            detail: String::new(),
+        });
+    let hint = problem.or_else(|| match assist.language {
         Language::Redis => completion::redis_hover(sql, offset),
         Language::Sql => completion::hover(sql, offset, assist.catalog, &assist.options),
         Language::Mongodb => None,
-    }?;
+    })?;
     // The nearest character is not the one under the pointer past a row's
     // end or off its word.
     let chars = |at: usize| sql[..at].chars().count();
@@ -1246,6 +1292,34 @@ mod tests {
         assert!(!opened("FROM ", Language::Redis));
         assert!(!opened("db.find({ FROM ", Language::Mongodb));
         assert!(opened("db.", Language::Mongodb));
+    }
+
+    #[test]
+    fn marked_problems_are_underlined_in_their_severity() {
+        let palette = Palette::DARK;
+        let text = "SELECT a FROM nope";
+        let marks = vec![(14..18, Severity::Warning)];
+        let job = highlight(text, &palette, None, Language::Sql, &marks);
+        let underlined: String = job
+            .sections
+            .iter()
+            .filter(|section| section.format.underline != Stroke::NONE)
+            .map(|section| &text[section.byte_range.start.0..section.byte_range.end.0])
+            .collect();
+        assert_eq!(underlined, "nope");
+        let color = job
+            .sections
+            .iter()
+            .find(|section| section.format.underline != Stroke::NONE)
+            .map(|section| section.format.underline.color);
+        assert_eq!(color, Some(palette.warning));
+        // A server error under it wins.
+        let job = highlight(text, &palette, Some(15), Language::Sql, &marks);
+        assert!(
+            job.sections
+                .iter()
+                .any(|section| section.format.underline.color == palette.danger)
+        );
     }
 
     /// One table, `t(a, b, c)`, in `public`.

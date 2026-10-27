@@ -136,6 +136,8 @@ pub struct QueryTab {
     pub highlighter: Highlighter,
     /// Completion, while it shows.
     pub popup: Popup,
+    /// The problems found in the text, marked in the editor.
+    pub diagnostics: crate::diagnostics::Tracker,
     /// The stops Tab still visits in an inserted snippet.
     pub snippet: Option<crate::editing::Snippet>,
     /// The file the script is saved in, and its text as last read or
@@ -299,6 +301,7 @@ impl Workspace {
             last_run: None,
             highlighter: Highlighter::default(),
             popup: Popup::default(),
+            diagnostics: crate::diagnostics::Tracker::default(),
             snippet: None,
             file: None,
             source: None,
