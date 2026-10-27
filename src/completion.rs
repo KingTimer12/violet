@@ -558,7 +558,7 @@ pub fn complete_mongo(
             key: name.to_owned(),
         });
     };
-    let head = text[..start].trim_end_matches(|c: char| c == ' ' || c == '\t');
+    let head = text[..start].trim_end_matches([' ', '\t']);
     if prefix.starts_with('$') {
         for operator in MONGO_OPERATORS {
             offer(Kind::Keyword, operator, "", (*operator).to_owned());
@@ -3331,6 +3331,38 @@ mod tests {
         let waiting = keyspace(None);
         let got = complete_redis("GET us", 6, Some(&waiting), &History::default());
         assert_eq!(got.expect("completion").needs[0], Need::Keys("db0".into()));
+    }
+
+    #[test]
+    fn catalog_needs_are_answered_once_the_catalog_has_them() {
+        let mut fake = Fake {
+            schemas: vec!["public".into()],
+            ..Fake::default()
+        };
+        let waiting = at(&fake, "SELECT * FROM ord|");
+        assert_eq!(waiting.needs, [Need::Objects("public".into())]);
+        assert!(!waiting.needs_answered(&fake, None));
+        fake.objects
+            .insert("public".into(), vec![object("orders", ObjectKind::Table)]);
+        assert!(waiting.needs_answered(&fake, None));
+
+        let columns = at(&fake, "SELECT | FROM orders");
+        assert_eq!(
+            columns.needs,
+            [Need::Columns("public".into(), "orders".into())]
+        );
+        assert!(!columns.needs_answered(&fake, None));
+        fake.columns
+            .insert(("public".into(), "orders".into()), vec![column("id", true)]);
+        assert!(columns.needs_answered(&fake, None));
+
+        let joins = at(&fake, "SELECT * FROM orders o JOIN |");
+        assert!(joins.needs.contains(&Need::ForeignKeys("public".into())));
+        assert!(!joins.needs_answered(&fake, None));
+        fake.keys.insert("public".into(), Vec::new());
+        assert!(joins.needs_answered(&fake, None));
+        // Nothing needed, nothing to answer.
+        assert!(!Completion::default().needs_answered(&fake, None));
     }
 
     #[test]
