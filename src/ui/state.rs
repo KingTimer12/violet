@@ -36,6 +36,42 @@ impl<T> Loadable<T> {
 /// stands.
 const FOREIGN_KEY_TRIES: u8 = 3;
 
+/// A schema's objects, found by name without scanning them.
+pub struct ObjectIndex {
+    list: Arc<[DbObject]>,
+    /// Positions in `list` by lower-cased name: a name may be shared by
+    /// objects that differ in case or kind.
+    names: HashMap<String, Vec<u32>>,
+}
+
+impl ObjectIndex {
+    fn new(list: Arc<[DbObject]>) -> Self {
+        let mut names: HashMap<String, Vec<u32>> = HashMap::with_capacity(list.len());
+        for (at, object) in list.iter().enumerate() {
+            let at = u32::try_from(at).unwrap_or(u32::MAX);
+            names
+                .entry(object.name.to_ascii_lowercase())
+                .or_default()
+                .push(at);
+        }
+        Self { list, names }
+    }
+
+    /// The first object called `name`, as completion matches names.
+    fn find(&self, name: &str, quoted: bool, relation: bool) -> Option<&DbObject> {
+        let lower = if name.bytes().any(|b| b.is_ascii_uppercase()) {
+            std::borrow::Cow::Owned(name.to_ascii_lowercase())
+        } else {
+            std::borrow::Cow::Borrowed(name)
+        };
+        self.names
+            .get(lower.as_ref())?
+            .iter()
+            .filter_map(|at| self.list.get(*at as usize))
+            .find(|o| (!relation || o.kind.is_relation()) && (!quoted || o.name == name))
+    }
+}
+
 /// A connection's state.
 #[derive(Clone, Debug, Default)]
 pub enum Link {
@@ -166,6 +202,9 @@ pub struct Explorer {
     pub opened: HashMap<ConnectionId, (ConnectionId, String)>,
     pub schemas: HashMap<ConnectionId, Loadable<Arc<[String]>>>,
     pub objects: HashMap<(ConnectionId, String), Loadable<Arc<[DbObject]>>>,
+    /// Each loaded schema's objects by name, for completion's lookups; kept
+    /// by [`Explorer::objects_loaded`].
+    pub object_index: HashMap<ConnectionId, HashMap<String, ObjectIndex>>,
     pub columns: HashMap<RelationKey, Loadable<Arc<[ColumnInfo]>>>,
     /// Foreign keys from or to each schema's tables, for completion.
     pub foreign_keys: HashMap<(ConnectionId, String), Loadable<Arc<[ForeignKey]>>>,
@@ -251,11 +290,44 @@ impl Explorer {
         false
     }
 
+    /// Stores a schema's objects as loaded, and indexes them by name.
+    pub fn objects_loaded(
+        &mut self,
+        id: ConnectionId,
+        schema: String,
+        result: violet_core::Result<Arc<[DbObject]>>,
+    ) {
+        let loaded = Loadable::from_result(result);
+        match &loaded {
+            Loadable::Ready(list) => {
+                self.object_index
+                    .entry(id)
+                    .or_default()
+                    .insert(schema.clone(), ObjectIndex::new(Arc::clone(list)));
+            }
+            _ => self.drop_object_index(id, &schema),
+        }
+        self.objects.insert((id, schema), loaded);
+    }
+
+    /// Marks a schema's objects as loading, which drops their index.
+    pub fn objects_loading(&mut self, id: ConnectionId, schema: String) {
+        self.drop_object_index(id, &schema);
+        self.objects.insert((id, schema), Loadable::Loading);
+    }
+
+    fn drop_object_index(&mut self, id: ConnectionId, schema: &str) {
+        if let Some(schemas) = self.object_index.get_mut(&id) {
+            schemas.remove(schema);
+        }
+    }
+
     /// Forgets everything loaded for a connection, keeping expansion so a
     /// reconnect reopens the same branches.
     pub fn forget(&mut self, id: ConnectionId) {
         self.databases.remove(&id);
         self.schemas.remove(&id);
+        self.object_index.remove(&id);
         self.objects.retain(|(owner, _), _| *owner != id);
         self.columns.retain(|(owner, _, _), _| *owner != id);
         self.foreign_keys.retain(|(owner, _), _| *owner != id);
@@ -371,7 +443,30 @@ impl crate::completion::Catalog for ConnectionCatalog<'_> {
 
     fn objects(&self, schema: &str) -> Option<&[DbObject]> {
         let id = self.id?;
+        if let Some(index) = self
+            .explorer
+            .object_index
+            .get(&id)
+            .and_then(|m| m.get(schema))
+        {
+            return Some(&index.list);
+        }
         ready(self.explorer.objects.get(&(id, schema.to_owned())), &[])
+    }
+
+    fn object(&self, schema: &str, name: &str, quoted: bool, relation: bool) -> Option<&DbObject> {
+        let index = self
+            .explorer
+            .object_index
+            .get(&self.id?)
+            .and_then(|m| m.get(schema));
+        match index {
+            Some(index) => index.find(name, quoted, relation),
+            None => self.objects(schema)?.iter().find(|o| {
+                (!relation || o.kind.is_relation())
+                    && crate::completion::same(&o.name, name, quoted)
+            }),
+        }
     }
 
     fn columns(&self, schema: &str, relation: &str) -> Option<&[ColumnInfo]> {
@@ -396,6 +491,72 @@ mod tests {
 
     fn failure() -> violet_core::Result<Arc<[ForeignKey]>> {
         Err(DbError::new(ErrorKind::Connection, "dropped"))
+    }
+
+    fn object(name: &str, kind: violet_core::ObjectKind) -> DbObject {
+        DbObject {
+            schema: "public".into(),
+            name: name.into(),
+            kind,
+            comment: None,
+            estimated_rows: None,
+            subtype: None,
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn objects_are_found_by_name_through_the_index() {
+        use crate::completion::Catalog;
+        use violet_core::ObjectKind::{Function, Table};
+        let mut explorer = Explorer::default();
+        let id = ConnectionId::new();
+        let list: Arc<[DbObject]> = vec![
+            object("Orders", Function),
+            object("orders", Table),
+            object("Items", Table),
+        ]
+        .into();
+        explorer.objects_loaded(id, "public".into(), Ok(list));
+        let catalog = ConnectionCatalog {
+            explorer: &explorer,
+            id: Some(id),
+        };
+        assert_eq!(catalog.objects("public").map(<[_]>::len), Some(3));
+        // Any case, the first one listed; or only what a query can read.
+        assert_eq!(
+            catalog
+                .object("public", "ORDERS", false, false)
+                .expect("found")
+                .name,
+            "Orders"
+        );
+        assert_eq!(
+            catalog
+                .object("public", "ORDERS", false, true)
+                .expect("found")
+                .name,
+            "orders"
+        );
+        // Quoted names match exactly.
+        assert_eq!(
+            catalog
+                .object("public", "orders", true, false)
+                .expect("found")
+                .name,
+            "orders"
+        );
+        assert!(catalog.object("public", "ORDERS", true, false).is_none());
+        assert!(catalog.object("public", "missing", false, false).is_none());
+        assert!(catalog.object("sales", "orders", false, false).is_none());
+        // Loading again leaves nothing to find until it answers.
+        explorer.objects_loading(id, "public".into());
+        let catalog = ConnectionCatalog {
+            explorer: &explorer,
+            id: Some(id),
+        };
+        assert!(catalog.object("public", "orders", false, false).is_none());
+        assert!(catalog.objects("public").is_none());
     }
 
     #[test]

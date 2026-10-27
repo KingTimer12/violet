@@ -22,6 +22,14 @@ use crate::sql::{self, Token, TokenKind};
 pub trait Catalog {
     fn schemas(&self) -> &[String];
     fn objects(&self, schema: &str) -> Option<&[DbObject]>;
+    /// The object called `name` in `schema`: by exact name when `quoted`,
+    /// else in any case; only tables and views and the like when `relation`.
+    /// A catalog with many objects answers from an index.
+    fn object(&self, schema: &str, name: &str, quoted: bool, relation: bool) -> Option<&DbObject> {
+        self.objects(schema)?
+            .iter()
+            .find(|o| (!relation || o.kind.is_relation()) && same(&o.name, name, quoted))
+    }
     fn columns(&self, schema: &str, relation: &str) -> Option<&[ColumnInfo]>;
     fn foreign_keys(&self, schema: &str) -> Option<&[ForeignKey]>;
 }
@@ -1937,35 +1945,27 @@ impl<'a> Builder<'a> {
             .cloned()
     }
 
-    /// Finds a relation in the catalog: in `schema`, else the search path,
-    /// else any schema loaded.
-    fn find(
-        &mut self,
-        schema: Option<&str>,
-        name: &str,
-        quoted: bool,
-    ) -> Option<(String, DbObject)> {
+    /// Finds a relation in the catalog, as its schema and name: in `schema`,
+    /// else the search path, else any schema loaded.
+    fn find(&mut self, schema: Option<&str>, name: &str, quoted: bool) -> Option<(String, String)> {
         let schemas: Vec<String> = match schema {
             Some(schema) => self.schema_named(schema).into_iter().collect(),
             None => self.options.search.to_vec(),
         };
         for schema in &schemas {
-            if let Some(object) = self
-                .objects(schema)
-                .and_then(|objects| objects.iter().find(|o| same(&o.name, name, quoted)))
-            {
-                return Some((schema.clone(), object.clone()));
+            if self.objects(schema).is_none() {
+                continue;
+            }
+            if let Some(object) = self.catalog.object(schema, name, quoted, false) {
+                return Some((schema.clone(), object.name.clone()));
             }
         }
         if schema.is_some() {
             return None;
         }
         self.catalog.schemas().iter().find_map(|schema| {
-            self.catalog
-                .objects(schema)?
-                .iter()
-                .find(|o| o.kind.is_relation() && same(&o.name, name, quoted))
-                .map(|object| (schema.clone(), object.clone()))
+            let object = self.catalog.object(schema, name, quoted, true)?;
+            Some((schema.clone(), object.name.clone()))
         })
     }
 
@@ -1990,7 +1990,7 @@ impl<'a> Builder<'a> {
             return Some(Source::Script(created));
         }
         self.find(relation.schema.as_deref(), &relation.name, relation.quoted)
-            .map(|(schema, object)| Source::Catalog(schema, object.name))
+            .map(|(schema, name)| Source::Catalog(schema, name))
     }
 
     /// Lists a relation's columns; `handle` qualifies them.
@@ -2343,7 +2343,6 @@ impl<'a> Builder<'a> {
             return Some((schema, created.name.clone()));
         }
         self.find(relation.schema.as_deref(), &relation.name, relation.quoted)
-            .map(|(schema, object)| (schema, object.name))
     }
 
     /// Foreign keys touching `schema`, from the catalog and the script.
@@ -2635,7 +2634,7 @@ fn score(key: &str, prefix: &str) -> Option<u8> {
 
 /// Whether a catalog name is the one typed: exactly when it was quoted,
 /// else in any case.
-fn same(catalog: &str, typed: &str, quoted: bool) -> bool {
+pub fn same(catalog: &str, typed: &str, quoted: bool) -> bool {
     if quoted {
         catalog == typed
     } else {
@@ -3433,6 +3432,18 @@ mod tests {
         assert!(found.contains(&"o.total".to_owned()), "{found:?}");
         let next = "DELIMITER //\nSELECT 1 FROM orders //\nSELECT na| FROM customers //";
         assert_eq!(with(Family::MySql, next)[0], "name");
+    }
+
+    #[test]
+    fn relations_are_looked_up_by_name_in_any_schema() {
+        let shop = shop();
+        // Unquoted names match in any case, quoted ones exactly.
+        let plain = at(&shop, "SELECT tot| FROM ORDERS");
+        assert_eq!(inserts(&plain)[0], "total");
+        let quoted = at(&shop, "SELECT tot| FROM \"ORDERS\"");
+        assert!(!inserts(&quoted).contains(&"total"));
+        let exact = at(&shop, "SELECT tot| FROM \"orders\"");
+        assert_eq!(inserts(&exact)[0], "total");
     }
 
     #[test]

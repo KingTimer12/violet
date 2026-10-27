@@ -739,8 +739,7 @@ impl VioletApp {
                     }
                 }
                 self.explorer
-                    .objects
-                    .insert((id, schema), Loadable::from_result(result));
+                    .objects_loaded(id, schema, result.map(Into::into));
             }
             Event::Columns {
                 id,
@@ -1034,9 +1033,7 @@ impl VioletApp {
     }
 
     fn load_objects(&mut self, id: ConnectionId, schema: String) {
-        self.explorer
-            .objects
-            .insert((id, schema.clone()), Loadable::Loading);
+        self.explorer.objects_loading(id, schema.clone());
         self.backend.load_objects(id, schema);
     }
 
