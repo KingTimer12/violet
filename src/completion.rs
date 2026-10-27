@@ -484,6 +484,188 @@ const MONGO_CURSOR: &[&str] = &[
     "toArray",
 ];
 
+/// The arguments and what each shell method does, by method name.
+const MONGO_SYNTAX: &[(&str, &str, &str)] = &[
+    (
+        "aggregate",
+        "(pipeline, options)",
+        "Runs an aggregation pipeline",
+    ),
+    (
+        "batchSize",
+        "(size)",
+        "Sets how many documents each batch returns",
+    ),
+    (
+        "bulkWrite",
+        "(operations, options)",
+        "Runs several writes in one request",
+    ),
+    (
+        "collation",
+        "(options)",
+        "Sets the language rules for comparing strings",
+    ),
+    ("count", "()", "Counts the documents the cursor reaches"),
+    (
+        "countDocuments",
+        "(filter, options)",
+        "Counts the documents that match",
+    ),
+    (
+        "createCollection",
+        "(name, options)",
+        "Creates a collection",
+    ),
+    ("createIndex", "(keys, options)", "Builds an index"),
+    (
+        "deleteMany",
+        "(filter)",
+        "Deletes every document that matches",
+    ),
+    (
+        "deleteOne",
+        "(filter)",
+        "Deletes the first document that matches",
+    ),
+    (
+        "distinct",
+        "(field, filter)",
+        "Lists the distinct values of a field",
+    ),
+    ("drop", "()", "Drops the collection"),
+    ("dropDatabase", "()", "Drops the database"),
+    ("dropIndex", "(index)", "Drops an index, by name or keys"),
+    (
+        "estimatedDocumentCount",
+        "()",
+        "Counts the documents from the collection's metadata",
+    ),
+    ("explain", "(verbosity)", "Shows how the query runs"),
+    (
+        "find",
+        "(filter, projection)",
+        "Returns a cursor over the documents that match",
+    ),
+    (
+        "findOne",
+        "(filter, projection)",
+        "Returns the first document that matches",
+    ),
+    (
+        "findOneAndDelete",
+        "(filter, options)",
+        "Deletes the first match and returns it",
+    ),
+    (
+        "findOneAndReplace",
+        "(filter, replacement, options)",
+        "Replaces the first match and returns it",
+    ),
+    (
+        "findOneAndUpdate",
+        "(filter, update, options)",
+        "Updates the first match and returns it",
+    ),
+    (
+        "forEach",
+        "(function)",
+        "Calls a function for each document",
+    ),
+    ("getCollection", "(name)", "Gets a collection by name"),
+    (
+        "getCollectionNames",
+        "()",
+        "Lists the collections of the database",
+    ),
+    ("getIndexes", "()", "Lists the indexes of the collection"),
+    ("hint", "(index)", "Forces the index the query uses"),
+    (
+        "insertMany",
+        "(documents, options)",
+        "Inserts several documents",
+    ),
+    ("insertOne", "(document, options)", "Inserts a document"),
+    (
+        "limit",
+        "(count)",
+        "Caps how many documents the cursor returns",
+    ),
+    ("map", "(function)", "Maps each document through a function"),
+    ("pretty", "()", "Prints the results formatted"),
+    (
+        "project",
+        "(projection)",
+        "Picks the fields the documents keep",
+    ),
+    (
+        "replaceOne",
+        "(filter, replacement, options)",
+        "Replaces the first document that matches",
+    ),
+    ("runCommand", "(command)", "Runs a database command"),
+    ("skip", "(count)", "Skips that many documents"),
+    (
+        "sort",
+        "(order)",
+        "Orders the documents: 1 ascending, -1 descending",
+    ),
+    ("stats", "()", "Shows statistics of the database"),
+    ("toArray", "()", "Reads every document into an array"),
+    (
+        "updateMany",
+        "(filter, update, options)",
+        "Updates every document that matches",
+    ),
+    (
+        "updateOne",
+        "(filter, update, options)",
+        "Updates the first document that matches",
+    ),
+];
+
+/// The syntax of the shell method named at byte `offset`: after a `.`,
+/// on `db`, on a collection, or on a cursor.
+pub fn mongo_hover(text: &str, offset: usize) -> Option<Hover> {
+    if offset > text.len() || !text.is_char_boundary(offset) {
+        return None;
+    }
+    let (start, end) = (word_start(text, offset), word_end(text, offset));
+    let method = &text[start..end];
+    let owner = text[..start].strip_suffix('.')?;
+    let open = text[end..].trim_start_matches([' ', '\t']).starts_with('(');
+    if method.is_empty() || !open {
+        return None;
+    }
+    let name = &owner[word_start(owner, owner.len())..];
+    let parent = owner[..owner.len() - name.len()].strip_suffix('.');
+    // The lists the owner offers; a call's result is a cursor, or a
+    // collection after `getCollection(...)`.
+    let lists: &[&[&str]] = if owner.ends_with(')') {
+        &[MONGO_CURSOR, MONGO_COLLECTION]
+    } else if name == "db" && parent.is_none() {
+        &[MONGO_DB]
+    } else if parent.is_some_and(|parent| parent.ends_with("db")) {
+        &[MONGO_COLLECTION]
+    } else {
+        return None;
+    };
+    let list = lists.iter().find(|list| list.contains(&method))?;
+    let (_, arguments, detail) = MONGO_SYNTAX.iter().find(|(known, ..)| *known == method)?;
+    let scope = if list.as_ptr() == MONGO_DB.as_ptr() {
+        "db."
+    } else if list.as_ptr() == MONGO_COLLECTION.as_ptr() {
+        "db.collection."
+    } else {
+        "cursor."
+    };
+    Some(Hover {
+        range: start..end,
+        title: format!("{scope}{method}{arguments}"),
+        detail: (*detail).to_owned(),
+    })
+}
+
 /// Query, update and aggregation operators.
 const MONGO_OPERATORS: &[&str] = &[
     "$addFields",
@@ -3914,6 +4096,47 @@ mod tests {
         assert!(unknown(&shop, "SELECT o.zzz FROM orders o").is_empty());
         shop.objects.clear();
         assert!(unknown(&shop, "SELECT * FROM custmers").is_empty());
+    }
+
+    #[test]
+    fn mongo_methods_have_their_syntax_on_hover() {
+        let hover = |text: &str| {
+            let at = text.find('|').expect("cursor");
+            mongo_hover(&text.replacen('|', "", 1), at).map(|h| (h.title, h.detail))
+        };
+        assert_eq!(
+            hover("db.orders.fi|nd({})").map(|h| h.0).as_deref(),
+            Some("db.collection.find(filter, projection)")
+        );
+        assert_eq!(
+            hover("db.getCollectionNames|()").map(|h| h.0).as_deref(),
+            Some("db.getCollectionNames()")
+        );
+        assert_eq!(
+            hover("db.orders.find({}).so|rt({ a: 1 })")
+                .map(|h| h.0)
+                .as_deref(),
+            Some("cursor.sort(order)")
+        );
+        assert_eq!(
+            hover("db.getCollection('x').update|One({})")
+                .map(|h| h.0)
+                .as_deref(),
+            Some("db.collection.updateOne(filter, update, options)")
+        );
+        // Not a method of its owner, not a call, not after a dot.
+        assert!(hover("db.orders.sor|t()").is_none());
+        assert!(hover("db.orders.fi|nd").is_none());
+        assert!(hover("fi|nd({})").is_none());
+        assert!(hover("db.ord|ers.find({})").is_none());
+        // Every method the list offers is described.
+        for method in MONGO_DB.iter().chain(MONGO_COLLECTION).chain(MONGO_CURSOR) {
+            assert!(
+                MONGO_SYNTAX.iter().any(|(known, ..)| known == method),
+                "{method}"
+            );
+        }
+        assert!(MONGO_SYNTAX.windows(2).all(|pair| pair[0].0 < pair[1].0));
     }
 
     #[test]

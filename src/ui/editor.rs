@@ -842,7 +842,7 @@ fn hovered_word(
     let hint = problem.or_else(|| match assist.language {
         Language::Redis => completion::redis_hover(sql, offset),
         Language::Sql => completion::hover(sql, offset, assist.catalog, &assist.options),
-        Language::Mongodb => None,
+        Language::Mongodb => completion::mongo_hover(sql, offset),
     })?;
     // The nearest character is not the one under the pointer past a row's
     // end or off its word.
