@@ -1991,29 +1991,41 @@ impl<'a> Builder<'a> {
                 created.name.clone(),
             );
         }
-        let search = self.options.search.to_vec();
-        for schema in &search {
-            for object in self.objects(schema).unwrap_or_default().to_vec() {
-                if let Some(kind) = relation_kind(object.kind) {
+        // The catalog outlives the builder: its lists are read in place, and
+        // names that cannot match what is typed are not built at all.
+        let (catalog, options, prefix) = (self.catalog, self.options, self.prefix);
+        let taken = self.taken();
+        for schema in options.search {
+            let objects = catalog.objects(schema);
+            if objects.is_none() {
+                self.needs.push(Need::Objects(schema.clone()));
+            }
+            for object in objects.unwrap_or_default() {
+                if let Some(kind) = relation_kind(object.kind)
+                    && score(&object.name, prefix).is_some()
+                {
                     let insert = self.ident(&object.name);
-                    let (label, insert) = self.aliased(object.name.clone(), insert, &object.name);
-                    self.push_keyed(kind, label, insert, schema.clone(), object.name);
+                    let (label, insert) =
+                        self.aliased_among(&taken, object.name.clone(), insert, &object.name);
+                    self.push_keyed(kind, label, insert, schema.clone(), object.name.clone());
                 }
             }
         }
         // Other schemas' tables, qualified, once something is typed.
-        if !self.prefix.is_empty() {
-            for schema in self.catalog.schemas().to_vec() {
-                if search.contains(&schema) {
+        if !prefix.is_empty() {
+            for schema in catalog.schemas() {
+                if options.search.contains(schema) {
                     continue;
                 }
-                for object in self.catalog.objects(&schema).unwrap_or_default().to_vec() {
-                    if let Some(kind) = relation_kind(object.kind) {
-                        let insert =
-                            format!("{}.{}", self.ident(&schema), self.ident(&object.name));
+                for object in catalog.objects(schema).unwrap_or_default() {
+                    if let Some(kind) = relation_kind(object.kind)
+                        && score(&object.name, prefix).is_some()
+                    {
+                        let insert = format!("{}.{}", self.ident(schema), self.ident(&object.name));
                         let label = format!("{schema}.{}", object.name);
-                        let (label, insert) = self.aliased(label, insert, &object.name);
-                        self.push_keyed(kind, label, insert, schema.clone(), object.name);
+                        let (label, insert) =
+                            self.aliased_among(&taken, label, insert, &object.name);
+                        self.push_keyed(kind, label, insert, schema.clone(), object.name.clone());
                     }
                 }
             }
@@ -2028,16 +2040,34 @@ impl<'a> Builder<'a> {
     /// takes one: `usuarios` as `usuarios u`, avoiding the statement's other
     /// aliases.
     fn aliased(&self, label: String, insert: String, table: &str) -> (String, String) {
+        self.aliased_among(&self.taken(), label, insert, table)
+    }
+
+    /// The handles the statement's tables already use, lower-cased.
+    fn taken(&self) -> Vec<String> {
         if !self.alias_tables {
-            return (label, insert);
+            return Vec::new();
         }
-        let taken: Vec<String> = self
-            .scope
+        self.scope
             .relations
             .iter()
             .map(|r| r.handle().to_lowercase())
-            .collect();
-        let alias = short_alias(table, &taken);
+            .collect()
+    }
+
+    /// [`Self::aliased`] with `taken` worked out by the caller, once for a
+    /// whole catalog's worth of tables.
+    fn aliased_among(
+        &self,
+        taken: &[String],
+        label: String,
+        insert: String,
+        table: &str,
+    ) -> (String, String) {
+        if !self.alias_tables {
+            return (label, insert);
+        }
+        let alias = short_alias(table, taken);
         (format!("{label} {alias}"), format!("{insert} {alias}"))
     }
 
@@ -2548,26 +2578,37 @@ fn kind_order(kind: Kind, relation: bool) -> (bool, Kind) {
 /// Best matches first, the latest accepted first among them; with nothing
 /// typed, each kind keeps its own order (columns as the table has them).
 fn rank(items: Vec<Item>, prefix: &str, history: &History, relation: bool) -> Vec<Item> {
-    let mut scored: Vec<(u8, Item)> = items
+    // What the comparison reads is worked out once per item, not once per
+    // comparison: a large catalog sorts thousands of them.
+    let mut scored: Vec<(u8, u64, String, Item)> = items
         .into_iter()
-        .filter_map(|item| Some((score(&item.key, prefix)?, item)))
+        .filter_map(|item| {
+            let score = score(&item.key, prefix)?;
+            let recency = history.recency(&item);
+            let label = if prefix.is_empty() {
+                String::new()
+            } else {
+                item.label.to_lowercase()
+            };
+            Some((score, recency, label, item))
+        })
         .collect();
-    scored.sort_by(|(a, x), (b, y)| {
+    scored.sort_by(|(a, recent_x, label_x, x), (b, recent_y, label_y, y)| {
         let order = a
             .cmp(b)
-            .then_with(|| history.recency(y).cmp(&history.recency(x)))
+            .then_with(|| recent_y.cmp(recent_x))
             .then(kind_order(x.kind, relation).cmp(&kind_order(y.kind, relation)));
         if prefix.is_empty() {
             return order;
         }
         order
             .then(x.key.len().cmp(&y.key.len()))
-            .then_with(|| x.label.to_lowercase().cmp(&y.label.to_lowercase()))
+            .then_with(|| label_x.cmp(label_y))
     });
     let mut seen = HashSet::new();
     scored
         .into_iter()
-        .map(|(_, item)| item)
+        .map(|(.., item)| item)
         .filter(|item| seen.insert(item.insert.clone()))
         .take(MAX_ITEMS)
         .collect()
@@ -3317,5 +3358,58 @@ mod tests {
         assert!(found.contains(&"o.total".to_owned()), "{found:?}");
         let next = "DELIMITER //\nSELECT 1 FROM orders //\nSELECT na| FROM customers //";
         assert_eq!(with(Family::MySql, next)[0], "name");
+    }
+
+    /// 20 schemas of 500 tables, and a script of 300 `CREATE TABLE`s.
+    fn large() -> (Fake, String) {
+        let mut fake = Fake::default();
+        for s in 0..20 {
+            let schema = if s == 0 {
+                "public".to_owned()
+            } else {
+                format!("s{s}")
+            };
+            let tables = (0..500)
+                .map(|t| object(&format!("table_{s}_{t}"), ObjectKind::Table))
+                .collect();
+            fake.objects.insert(schema.clone(), tables);
+            fake.keys.insert(schema.clone(), Vec::new());
+            fake.schemas.push(schema);
+        }
+        let script = (0..300)
+            .map(|n| format!("CREATE TABLE made_{n} (id int PRIMARY KEY, name text);\n"))
+            .collect::<String>();
+        (fake, script)
+    }
+
+    #[test]
+    fn large_catalogs_and_scripts_complete() {
+        let (fake, script) = large();
+        let found = at(&fake, &format!("{script}SELECT * FROM table_0_49|"));
+        assert!(inserts(&found).iter().any(|i| i.starts_with("table_0_499")));
+        let made = at(&fake, &format!("{script}SELECT * FROM made_29|"));
+        assert!(inserts(&made)[0].starts_with("made_29"));
+    }
+
+    /// `cargo test --release large_catalog_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing"]
+    fn large_catalog_timing() {
+        let (fake, script) = large();
+        let runs = 50;
+        let time = |name: &str, catalog: &Fake, text: String| {
+            let start = std::time::Instant::now();
+            for _ in 0..runs {
+                std::hint::black_box(at(catalog, &text));
+            }
+            println!("{name}: {:?} per call", start.elapsed() / runs);
+        };
+        time("complete", &fake, format!("{script}SELECT * FROM tab|"));
+        time(
+            "script only",
+            &shop(),
+            format!("{script}SELECT * FROM tab|"),
+        );
+        time("catalog only", &fake, "SELECT * FROM tab|".to_owned());
     }
 }
