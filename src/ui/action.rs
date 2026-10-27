@@ -64,6 +64,8 @@ pub enum Action {
     /// Catalog data completion is waiting for; what is already loading or
     /// loaded is skipped.
     LoadForCompletion(ConnectionId, Vec<Need>),
+    /// A completion item was accepted: it ranks higher on that connection.
+    CompletionAccepted(ConnectionId, crate::completion::Item),
     SaveProfile {
         profile: ConnectionProfile,
         password: Option<Secret>,

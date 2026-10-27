@@ -172,6 +172,8 @@ pub struct VioletApp {
     /// Oldest first.
     history: Vec<HistoryEntry>,
     history_view: Option<history::HistoryView>,
+    /// Completion items accepted lately, per connection; kept in memory.
+    completion_history: HashMap<ConnectionId, completion::History>,
     session_file: JsonFile<SavedSession>,
     /// A fingerprint of the editors as last saved, and when they were last
     /// compared.
@@ -314,6 +316,7 @@ impl VioletApp {
             history_store: services.history,
             history: Vec::new(),
             history_view: None,
+            completion_history: HashMap::new(),
             session_file: services.session,
             session_saved: 0,
             session_checked: Instant::now(),
@@ -1852,6 +1855,9 @@ impl VioletApp {
             } => self.run_in_schema(ctx, connection, schema, script, done),
             Action::LoadColumns(id, schema, relation) => self.load_columns(id, schema, relation),
             Action::LoadForCompletion(id, needs) => self.load_for_completion(id, needs),
+            Action::CompletionAccepted(id, item) => {
+                self.completion_history.entry(id).or_default().accepted(&item);
+            }
             Action::SaveProfile {
                 profile,
                 password,
@@ -2426,6 +2432,8 @@ impl VioletApp {
         let links = self.sync_reference(active);
         let profiles = &*connections(&self.profiles, &self.explorer);
         let explorer = &self.explorer;
+        let keyword_case = self.settings.keyword_case;
+        let completion_history = &self.completion_history;
         let actions = &mut self.actions;
         let reference = self.reference.as_ref().filter(|r| r.tab == active);
         let Some(tab) = self.workspace.tabs.iter_mut().find(|tab| tab.id == active) else {
@@ -2529,6 +2537,7 @@ impl VioletApp {
                 .map(|keys| &*keys.list);
             (database.as_str(), listed)
         });
+        let no_history = completion::History::default();
         let assist = editor::Assist {
             connection: tab.connection,
             language,
@@ -2540,6 +2549,11 @@ impl VioletApp {
                 search: &search,
                 quote: &quote,
                 family,
+                case: keyword_case,
+                history: tab
+                    .connection
+                    .and_then(|id| completion_history.get(&id))
+                    .unwrap_or(&no_history),
             },
             keys,
         };

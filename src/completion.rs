@@ -6,12 +6,13 @@
 //! Like the lexer it reads tokens, not a grammar, so it never fails: text it
 //! cannot place gets columns and keywords.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use violet_core::{ColumnInfo, DbObject, ForeignKey, ObjectKind};
 
 use crate::dialect::Family;
+use crate::settings::KeywordCase;
 use crate::sql::{self, Token, TokenKind};
 
 /// What completion reads from the database. `None` means not loaded yet;
@@ -81,9 +82,50 @@ pub struct Options<'a> {
     pub quote: &'a dyn Fn(&str) -> String,
     /// Which statements, keywords, functions and types to offer.
     pub family: Family,
+    /// The case keywords are offered in.
+    pub case: KeywordCase,
+    /// What was accepted before on this connection.
+    pub history: &'a History,
 }
 
 const MAX_ITEMS: usize = 200;
+/// How many accepted items [`History`] keeps.
+const HISTORY_SIZE: usize = 200;
+
+/// The items accepted lately, by kind and name: the latest come first among
+/// equally good matches.
+#[derive(Clone, Debug, Default)]
+pub struct History {
+    /// Counts acceptances; the higher, the more recent.
+    clock: u64,
+    used: HashMap<(Kind, String), u64>,
+}
+
+impl History {
+    /// Remembers `item` as just accepted.
+    pub fn accepted(&mut self, item: &Item) {
+        self.clock += 1;
+        self.used
+            .insert((item.kind, item.key.to_lowercase()), self.clock);
+        if self.used.len() > HISTORY_SIZE
+            && let Some(oldest) = self
+                .used
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(key, _)| key.clone())
+        {
+            self.used.remove(&oldest);
+        }
+    }
+
+    /// When `item` was last accepted; 0 when never.
+    fn recency(&self, item: &Item) -> u64 {
+        self.used
+            .get(&(item.kind, item.key.to_lowercase()))
+            .copied()
+            .unwrap_or(0)
+    }
+}
 
 /// Completes a Redis command line: command names (with their syntax) in
 /// the first word, a container's subcommands in the second, and the keys
@@ -390,7 +432,7 @@ pub fn complete_mongo(
         offer(Kind::Keyword, "show collections", "", "show collections".to_owned());
         offer(Kind::Keyword, "use", "database", "use ".to_owned());
     }
-    let mut items = rank(items, &prefix);
+    let mut items = rank(items, &prefix, &History::default(), false);
     items.truncate(MAX_ITEMS);
     Some(Completion {
         range: start..end,
@@ -493,7 +535,7 @@ pub fn complete(
         return None;
     }
     let end = word_end(text, cursor);
-    let (qualifiers, qualified_start) = qualifiers(text, start);
+    let (qualifiers, qualified_start, quoted) = qualifiers(text, start);
 
     let significant: Vec<Token> = all
         .into_iter()
@@ -524,7 +566,7 @@ pub fn complete(
     let context = if qualifiers.is_empty() {
         slot
     } else {
-        Context::Qualified(qualifiers)
+        Context::Qualified(qualifiers, quoted)
     };
 
     let mut builder = Builder {
@@ -540,7 +582,8 @@ pub fn complete(
     };
     builder.fill(&context);
     let prefix = text[start..cursor].to_owned();
-    let mut items = rank(builder.items, &prefix);
+    let relation = matches!(context, Context::Relation { .. });
+    let mut items = rank(builder.items, &prefix, options.history, relation);
     if items.len() == 1 && items[0].insert.eq_ignore_ascii_case(&prefix) {
         items.clear();
     }
@@ -556,6 +599,45 @@ pub fn complete(
         items,
         needs,
     })
+}
+
+/// Whether the list opens by itself with the cursor at `cursor`, right
+/// after typing: after `FROM `, `JOIN `, `ON ` and `INTO `, the `(` of
+/// `INSERT INTO table (` and a name's `.`; never in a string or a comment.
+pub fn opens_by_itself(text: &str, cursor: usize) -> bool {
+    if cursor == 0 || cursor > text.len() || !text.is_char_boundary(cursor) {
+        return false;
+    }
+    let all: Vec<Token> = sql::tokens(text).collect();
+    if inside_literal(text, &all, cursor) {
+        return false;
+    }
+    let mut typed = text[..cursor].chars().rev();
+    let before: Vec<&Token> = all
+        .iter()
+        .filter(|token| !matches!(token.kind, TokenKind::Whitespace | TokenKind::Comment))
+        .filter(|token| token.range.end <= cursor)
+        .collect();
+    let Some(last) = before.last() else {
+        return false;
+    };
+    match typed.next() {
+        Some('.') => typed
+            .next()
+            .is_some_and(|c| is_word_char(c) || matches!(c, '"' | '`')),
+        Some(' ') => {
+            last.range.end + 1 == cursor
+                && matches!(
+                    word(text, last).as_deref(),
+                    Some("FROM" | "JOIN" | "ON" | "INTO")
+                )
+        }
+        Some('(') => matches!(
+            context(text, &before, &Scope::default()),
+            Context::InsertColumns(_)
+        ),
+        _ => false,
+    }
 }
 
 // ---- reading the text -----------------------------------------------------
@@ -605,9 +687,10 @@ fn inside_literal(text: &str, tokens: &[Token], cursor: usize) -> bool {
 }
 
 /// The names before the word, as in `schema.table.` + word: at most two,
-/// and where the first starts.
-fn qualifiers(text: &str, start: usize) -> (Vec<String>, usize) {
+/// where the first starts, and whether the last is quoted.
+fn qualifiers(text: &str, start: usize) -> (Vec<String>, usize, bool) {
     let mut names = Vec::new();
+    let mut quoted = false;
     let mut at = start;
     while names.len() < 2 && text[..at].ends_with('.') {
         let dot = at - 1;
@@ -625,11 +708,14 @@ fn qualifiers(text: &str, start: usize) -> (Vec<String>, usize) {
         if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
             break;
         }
+        if names.is_empty() {
+            quoted = quote.is_some();
+        }
         names.insert(0, name);
         at = begin;
     }
     let begin = if names.is_empty() { start } else { at };
-    (names, begin)
+    (names, begin, quoted)
 }
 
 fn is(text: &str, token: &Token, punctuation: &str) -> bool {
@@ -806,6 +892,8 @@ struct Relation {
     columns: Option<Vec<String>>,
     /// Where it is named, as a byte offset.
     at: usize,
+    /// Named in quotes: matched case-sensitively.
+    quoted: bool,
 }
 
 impl Relation {
@@ -917,6 +1005,7 @@ fn relations(text: &str, tokens: &[Token]) -> Vec<Relation> {
             }
             _ if expect => {
                 if let Some((mut parts, mut next)) = dotted(text, tokens, index) {
+                    let quoted = tokens[next - 1].kind == TokenKind::QuotedIdentifier;
                     let table = parts.pop().unwrap_or_default();
                     let schema = parts.pop();
                     if is_word(text, tokens.get(next), "AS") {
@@ -932,6 +1021,7 @@ fn relations(text: &str, tokens: &[Token]) -> Vec<Relation> {
                         alias,
                         columns: None,
                         at: token.range.start,
+                        quoted,
                     });
                     expect = false;
                     index = next;
@@ -1206,8 +1296,8 @@ enum Context {
     /// After `::`.
     Type,
     Expression,
-    /// After `name.` or `schema.table.`.
-    Qualified(Vec<String>),
+    /// After `name.` or `schema.table.`; the last name in quotes.
+    Qualified(Vec<String>, bool),
 }
 
 /// The innermost clause keyword before the cursor at its bracket depth, or
@@ -1371,7 +1461,7 @@ impl<'a> Builder<'a> {
                 }
             }
             Context::Expression => self.expression(),
-            Context::Qualified(names) => self.qualified(names),
+            Context::Qualified(names, quoted) => self.qualified(names, *quoted),
         }
     }
 
@@ -1403,10 +1493,17 @@ impl<'a> Builder<'a> {
         });
     }
 
-    /// A keyword in the case the user types in.
+    /// A keyword in the case the settings ask for: by default the case the
+    /// user types in.
     fn cased(&self, keyword: &str) -> String {
-        let lower = self.prefix.chars().any(|c| c.is_ascii_lowercase())
-            && !self.prefix.chars().any(|c| c.is_ascii_uppercase());
+        let lower = match self.options.case {
+            KeywordCase::Upper => false,
+            KeywordCase::Lower => true,
+            KeywordCase::Typed => {
+                self.prefix.chars().any(|c| c.is_ascii_lowercase())
+                    && !self.prefix.chars().any(|c| c.is_ascii_uppercase())
+            }
+        };
         if lower {
             keyword.to_lowercase()
         } else {
@@ -1452,7 +1549,12 @@ impl<'a> Builder<'a> {
 
     /// Finds a relation in the catalog: in `schema`, else the search path,
     /// else any schema loaded.
-    fn find(&mut self, schema: Option<&str>, name: &str) -> Option<(String, DbObject)> {
+    fn find(
+        &mut self,
+        schema: Option<&str>,
+        name: &str,
+        quoted: bool,
+    ) -> Option<(String, DbObject)> {
         let schemas: Vec<String> = match schema {
             Some(schema) => self.schema_named(schema).into_iter().collect(),
             None => self.options.search.to_vec(),
@@ -1460,7 +1562,7 @@ impl<'a> Builder<'a> {
         for schema in &schemas {
             if let Some(object) = self
                 .objects(schema)
-                .and_then(|objects| objects.iter().find(|o| o.name.eq_ignore_ascii_case(name)))
+                .and_then(|objects| objects.iter().find(|o| same(&o.name, name, quoted)))
             {
                 return Some((schema.clone(), object.clone()));
             }
@@ -1472,7 +1574,7 @@ impl<'a> Builder<'a> {
             self.catalog
                 .objects(schema)?
                 .iter()
-                .find(|o| o.kind.is_relation() && o.name.eq_ignore_ascii_case(name))
+                .find(|o| o.kind.is_relation() && same(&o.name, name, quoted))
                 .map(|object| (schema.clone(), object.clone()))
         })
     }
@@ -1497,7 +1599,7 @@ impl<'a> Builder<'a> {
         if let Some(created) = created_in(script, relation.schema.as_deref(), &relation.name) {
             return Some(Source::Script(created));
         }
-        self.find(relation.schema.as_deref(), &relation.name)
+        self.find(relation.schema.as_deref(), &relation.name, relation.quoted)
             .map(|(schema, object)| Source::Catalog(schema, object.name))
     }
 
@@ -1696,7 +1798,7 @@ impl<'a> Builder<'a> {
         self.keywords(&self.options.family.keywords());
     }
 
-    fn qualified(&mut self, names: &[String]) {
+    fn qualified(&mut self, names: &[String], quoted: bool) {
         match names {
             [handle] => {
                 if let Some(relation) = self.scope.by_handle(handle).cloned() {
@@ -1730,6 +1832,7 @@ impl<'a> Builder<'a> {
                     // the statement does not read yet.
                     let relation = Relation {
                         name: handle.clone(),
+                        quoted,
                         ..Relation::default()
                     };
                     self.columns_of(&relation, None);
@@ -1739,6 +1842,7 @@ impl<'a> Builder<'a> {
                 let relation = Relation {
                     schema: Some(schema.clone()),
                     name: table.clone(),
+                    quoted,
                     ..Relation::default()
                 };
                 self.columns_of(&relation, None);
@@ -1760,7 +1864,7 @@ impl<'a> Builder<'a> {
                 .unwrap_or_default();
             return Some((schema, created.name.clone()));
         }
-        self.find(relation.schema.as_deref(), &relation.name)
+        self.find(relation.schema.as_deref(), &relation.name, relation.quoted)
             .map(|(schema, object)| (schema, object.name))
     }
 
@@ -2051,15 +2155,35 @@ fn score(key: &str, prefix: &str) -> Option<u8> {
         .then_some(2)
 }
 
-/// Best matches first; with nothing typed, each kind keeps its own order
-/// (columns as the table has them).
-fn rank(items: Vec<Item>, prefix: &str) -> Vec<Item> {
+/// Whether a catalog name is the one typed: exactly when it was quoted,
+/// else in any case.
+fn same(catalog: &str, typed: &str, quoted: bool) -> bool {
+    if quoted {
+        catalog == typed
+    } else {
+        catalog.eq_ignore_ascii_case(typed)
+    }
+}
+
+/// Where a kind sorts among equally good items: where a table goes
+/// (`relation`), tables and views lead.
+fn kind_order(kind: Kind, relation: bool) -> (bool, Kind) {
+    let table = matches!(kind, Kind::Table | Kind::View);
+    (!(relation && table), kind)
+}
+
+/// Best matches first, the latest accepted first among them; with nothing
+/// typed, each kind keeps its own order (columns as the table has them).
+fn rank(items: Vec<Item>, prefix: &str, history: &History, relation: bool) -> Vec<Item> {
     let mut scored: Vec<(u8, Item)> = items
         .into_iter()
         .filter_map(|item| Some((score(&item.key, prefix)?, item)))
         .collect();
     scored.sort_by(|(a, x), (b, y)| {
-        let order = a.cmp(b).then(x.kind.cmp(&y.kind));
+        let order = a
+            .cmp(b)
+            .then_with(|| history.recency(y).cmp(&history.recency(x)))
+            .then(kind_order(x.kind, relation).cmp(&kind_order(y.kind, relation)));
         if prefix.is_empty() {
             return order;
         }
@@ -2185,6 +2309,11 @@ mod tests {
 
     /// Completes at `|` in `text`.
     fn at(catalog: &Fake, text: &str) -> Completion {
+        at_with(catalog, text, KeywordCase::default(), &History::default())
+    }
+
+    /// Completes at `|` in `text` with keywords in `case`, after `history`.
+    fn at_with(catalog: &Fake, text: &str, case: KeywordCase, history: &History) -> Completion {
         let cursor = text.find('|').expect("a cursor");
         let text = text.replacen('|', "", 1);
         let search = vec!["public".to_owned()];
@@ -2197,6 +2326,8 @@ mod tests {
                 search: &search,
                 quote: &quote,
                 family: Family::Other,
+                case,
+                history,
             },
         )
         .expect("a completion")
@@ -2261,9 +2392,11 @@ mod tests {
     fn joins_follow_foreign_keys() {
         let shop = shop();
         let join = at(&shop, "SELECT * FROM customers c JOIN |");
+        // Tables lead; the join along the key comes first after them.
+        let first_join = join.items.iter().find(|item| item.kind == Kind::Join);
         assert_eq!(
-            join.items[0].insert,
-            "orders o ON o.customer_id = c.id",
+            first_join.map(|item| item.insert.as_str()),
+            Some("orders o ON o.customer_id = c.id"),
             "{:?}",
             inserts(&join)
         );
@@ -2294,8 +2427,12 @@ mod tests {
         let script = "CREATE TABLE notes (id serial PRIMARY KEY, body text,\n  customer_id int REFERENCES customers);\nSELECT * FROM notes n JOIN |";
         let joined = at(&shop, script);
         assert_eq!(
-            joined.items[0].insert,
-            "customers c ON c.id = n.customer_id",
+            joined
+                .items
+                .iter()
+                .find(|item| item.kind == Kind::Join)
+                .map(|item| item.insert.as_str()),
+            Some("customers c ON c.id = n.customer_id"),
             "{:?}",
             inserts(&joined)
         );
@@ -2339,6 +2476,8 @@ mod tests {
                     search: &[],
                     quote: &quote,
                     family: Family::Other,
+                    case: KeywordCase::default(),
+                    history: &History::default(),
                 },
             )
         };
@@ -2418,6 +2557,8 @@ mod tests {
                 search: &search,
                 quote: &quote,
                 family,
+                case: KeywordCase::default(),
+                history: &History::default(),
             };
             complete(&text, cursor, &shop, &options).expect("a completion")
         };
@@ -2471,5 +2612,104 @@ HGETALL us";
         let waiting = complete_redis("GET us", 6, Some("db0"), None).expect("completion");
         assert_eq!(waiting.needs, [Need::Keys("db0".into())]);
         assert!(complete_redis("SET k \"open", 11, None, None).is_none());
+    }
+
+    #[test]
+    fn accepted_items_rise_on_their_connection() {
+        let shop = shop();
+        let fresh = at(&shop, "SELECT * FROM orders WHERE |");
+        let first = fresh.items[0].clone();
+        let last = fresh
+            .items
+            .iter()
+            .rfind(|item| item.kind == Kind::Column)
+            .expect("a column")
+            .clone();
+        assert_ne!(first, last);
+        let mut history = History::default();
+        history.accepted(&last);
+        let used = at_with(
+            &shop,
+            "SELECT * FROM orders WHERE |",
+            KeywordCase::default(),
+            &history,
+        );
+        assert_eq!(used.items[0].insert, last.insert);
+        // A worse match stays below a better one, used or not.
+        let typed = at_with(
+            &shop,
+            "SELECT * FROM orders WHERE cu|",
+            KeywordCase::default(),
+            &history,
+        );
+        assert_eq!(typed.items[0].insert, "customer_id");
+    }
+
+    #[test]
+    fn tables_lead_an_empty_relation_slot() {
+        let shop = shop();
+        let join = at(&shop, "SELECT * FROM orders o JOIN |");
+        assert!(join.items.iter().any(|item| item.kind == Kind::Join));
+        assert_eq!(join.items[0].kind, Kind::Table);
+        let mut with_cte = at(&shop, "WITH recent AS (SELECT 1 AS id) SELECT * FROM |");
+        assert_eq!(with_cte.items.remove(0).kind, Kind::Table);
+        // Elsewhere the kinds keep their order.
+        let on = at(&shop, "SELECT * FROM orders o JOIN customers c ON |");
+        assert_ne!(on.items[0].kind, Kind::Table);
+    }
+
+    #[test]
+    fn quoted_names_match_their_case() {
+        let mut shop = shop();
+        shop.objects
+            .get_mut("public")
+            .expect("public")
+            .push(object("Users", ObjectKind::Table));
+        shop.columns.insert(
+            ("public".into(), "Users".into()),
+            vec![column("id", true), column("email", false)],
+        );
+        assert!(inserts(&at(&shop, "SELECT \"Users\".| FROM x")).contains(&"email"));
+        assert!(inserts(&at(&shop, "SELECT users.| FROM x")).contains(&"email"));
+        let wrong = at(&shop, "SELECT \"users\".| FROM x");
+        assert!(!inserts(&wrong).contains(&"email"));
+        assert!(inserts(&at(&shop, "SELECT u.| FROM \"Users\" u")).contains(&"email"));
+        assert!(!inserts(&at(&shop, "SELECT u.| FROM \"USERS\" u")).contains(&"email"));
+    }
+
+    #[test]
+    fn keyword_case_follows_the_setting() {
+        let shop = shop();
+        let history = History::default();
+        let keyword = |case, text| {
+            at_with(&shop, text, case, &history)
+                .items
+                .into_iter()
+                .find(|item| item.kind == Kind::Keyword)
+                .expect("a keyword")
+                .insert
+        };
+        assert_eq!(keyword(KeywordCase::Typed, "sel|"), "select");
+        assert_eq!(keyword(KeywordCase::Typed, "|"), keyword(KeywordCase::Upper, "|"));
+        assert_eq!(keyword(KeywordCase::Upper, "sel|"), "SELECT");
+        assert_eq!(keyword(KeywordCase::Lower, "SEL|"), "select");
+    }
+
+    #[test]
+    fn list_opens_by_itself_where_a_name_must_follow() {
+        let opens = |text: &str| opens_by_itself(text, text.len());
+        assert!(opens("SELECT * FROM "));
+        assert!(opens("select * from orders o join "));
+        assert!(opens("SELECT * FROM a JOIN b ON "));
+        assert!(opens("INSERT INTO "));
+        assert!(opens("INSERT INTO public.orders ("));
+        assert!(opens("SELECT o."));
+        assert!(opens("SELECT \"Users\"."));
+        assert!(!opens("SELECT count("));
+        assert!(!opens("SELECT a, "));
+        assert!(!opens("SELECT * FROM  "));
+        assert!(!opens("SELECT 'FROM "));
+        assert!(!opens("-- FROM "));
+        assert!(!opens("SELECT 1 /* o."));
     }
 }

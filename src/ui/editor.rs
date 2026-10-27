@@ -547,7 +547,8 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
             pressed
         });
     if let Some(index) = accept {
-        insert(ui.ctx(), text_id, sql, popup, index);
+        let item = insert(ui.ctx(), text_id, sql, popup, index);
+        accepted(assist, item, actions);
     }
     let over_list = popup
         .area
@@ -719,7 +720,8 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
     if let Some(anchor) = anchor
         && let Some(index) = list(ui, *id, popup, anchor, &palette)
     {
-        insert(ui.ctx(), text_id, sql, popup, index);
+        let item = insert(ui.ctx(), text_id, sql, popup, index);
+        accepted(assist, item, actions);
         ui.ctx().memory_mut(|memory| memory.request_focus(text_id));
         ui.ctx().request_repaint();
     }
@@ -779,7 +781,10 @@ fn follow(
                 || c == '.'
                 || (language == Language::Redis && matches!(c, ':' | '-'))
         };
-        if typed.is_some_and(word) {
+        // SQL also opens it where a table or column is sure to follow.
+        let sql_slot = !matches!(language, Language::Redis | Language::Mongodb)
+            && completion::opens_by_itself(sql, cursor);
+        if typed.is_some_and(word) || sql_slot {
             popup.open = true;
             popup.completion = None;
         } else {
@@ -855,15 +860,24 @@ fn refresh(
     popup.completion = Some(completion);
 }
 
-/// Replaces the word at the cursor with the `index`th item.
-fn insert(ctx: &egui::Context, text_id: Id, sql: &mut String, popup: &mut Popup, index: usize) {
-    let Some(completion) = popup.completion.take() else {
-        return;
-    };
+/// Remembers an accepted item for its connection's ranking.
+fn accepted(assist: &Assist<'_>, item: Option<Item>, actions: &mut Vec<Action>) {
+    if let (Some(connection), Some(item)) = (assist.connection, item) {
+        actions.push(Action::CompletionAccepted(connection, item));
+    }
+}
+
+/// Replaces the word at the cursor with the `index`th item, and returns it.
+fn insert(
+    ctx: &egui::Context,
+    text_id: Id,
+    sql: &mut String,
+    popup: &mut Popup,
+    index: usize,
+) -> Option<Item> {
+    let completion = popup.completion.take()?;
     popup.close();
-    let Some(item) = completion.items.get(index) else {
-        return;
-    };
+    let item = completion.items.get(index)?;
     let range = completion.range.start.min(sql.len())..completion.range.end.min(sql.len());
     sql.replace_range(range.clone(), &item.insert);
     let caret = sql[..range.start + item.caret].chars().count();
@@ -872,6 +886,7 @@ fn insert(ctx: &egui::Context, text_id: Id, sql: &mut String, popup: &mut Popup,
         .cursor
         .set_char_range(Some(CCursorRange::one(CCursor::new(caret))));
     state.store(ctx, text_id);
+    Some(item.clone())
 }
 
 fn kind_style(kind: Kind, palette: &Palette) -> (Icon, egui::Color32) {
@@ -1048,5 +1063,29 @@ fn row(
                 palette.dim,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Whether the list is open after typing the end of `sql`.
+    fn opened(sql: &str, language: Language) -> bool {
+        let mut popup = Popup::default();
+        let end = sql.len();
+        follow(&mut popup, sql, &(end..end), true, false, true, language);
+        popup.open
+    }
+
+    #[test]
+    fn typing_into_a_table_slot_opens_the_list() {
+        assert!(opened("SELECT * FROM ", Language::Sql));
+        assert!(opened("INSERT INTO orders (", Language::Sql));
+        assert!(!opened("SELECT a, ", Language::Sql));
+        assert!(!opened("SELECT ' FROM ", Language::Sql));
+        assert!(!opened("FROM ", Language::Redis));
+        assert!(!opened("db.find({ FROM ", Language::Mongodb));
+        assert!(opened("db.", Language::Mongodb));
     }
 }
