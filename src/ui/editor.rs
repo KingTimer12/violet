@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use egui::text::{CCursor, CCursorRange, LayoutJob};
 use egui::{CornerRadius, Id, Key, Modifiers, Sense, Stroke, TextFormat, Ui, Vec2};
-use violet_core::{ConnectionId, DbObject, Language};
+use violet_core::{ConnectionId, Language};
 
 use super::action::Action;
 use super::icons::Icon;
@@ -16,7 +16,8 @@ use super::theme::{self, Palette};
 use super::widgets::{self, Tone};
 use super::workspace::QueryTab;
 use crate::completion::{self, Catalog, Completion, Item, Kind};
-use crate::editing::{self, Edited};
+use crate::diagnostics::{self, Diagnostic, Severity};
+use crate::editing::{self, CharIndex, Edited, Snippet};
 use crate::sql::{self, TokenKind};
 
 const FONT_SIZE: f32 = 13.5;
@@ -27,8 +28,13 @@ const GUTTER: f32 = 46.0;
 pub struct Highlighter {
     /// The job holds the text it was made from: comparing against it is a
     /// `memcmp`, far cheaper than hashing the whole buffer every frame.
-    job: Option<(LayoutJob, bool, Option<usize>, Language)>,
+    job: Option<(LayoutJob, bool, Option<usize>, Language, Marks)>,
+    /// Char indices of the job's text as byte offsets, made when asked.
+    chars: Option<CharIndex>,
 }
+
+/// The ranges the editor underlines for the problems it found.
+type Marks = Vec<(Range<usize>, Severity)>;
 
 impl Highlighter {
     fn job(
@@ -37,16 +43,26 @@ impl Highlighter {
         palette: &Palette,
         error_at: Option<usize>,
         language: Language,
+        marks: &Marks,
     ) -> LayoutJob {
-        let fresh = self.job.as_ref().is_some_and(|(job, dark, at, lang)| {
-            *dark == palette.dark && *at == error_at && *lang == language && job.text == text
-        });
+        let fresh = self
+            .job
+            .as_ref()
+            .is_some_and(|(job, dark, at, lang, kept)| {
+                *dark == palette.dark
+                    && *at == error_at
+                    && *lang == language
+                    && kept == marks
+                    && job.text == text
+            });
         if !fresh {
+            self.chars = None;
             self.job = Some((
-                highlight(text, palette, error_at, language),
+                highlight(text, palette, error_at, language, marks),
                 palette.dark,
                 error_at,
                 language,
+                marks.clone(),
             ));
         }
         self.job
@@ -56,9 +72,24 @@ impl Highlighter {
     }
 }
 
+impl Highlighter {
+    /// The byte offset of char `index` of `text`. The offsets are worked out
+    /// once for the text the layout was made from, not scanned from its
+    /// start at every call.
+    fn byte_at(&mut self, text: &str, index: usize) -> usize {
+        let fresh = self.job.as_ref().is_some_and(|(job, ..)| job.text == text);
+        if !fresh {
+            return CharIndex::new(text).byte(text, index);
+        }
+        self.chars
+            .get_or_insert_with(|| CharIndex::new(text))
+            .byte(text, index)
+    }
+}
+
 /// `text` coloured as the editor colours it, for previews.
 pub fn highlighted(text: &str, palette: &Palette, language: Language) -> LayoutJob {
-    highlight(text, palette, None, language)
+    highlight(text, palette, None, language, &Vec::new())
 }
 
 /// Moves `tab`'s editor cursor to `char_index`, and focuses it.
@@ -293,6 +324,7 @@ fn highlight(
     palette: &Palette,
     error_at: Option<usize>,
     language: Language,
+    marks: &Marks,
 ) -> LayoutJob {
     let syntax = palette.syntax;
     let font = theme::mono(FONT_SIZE);
@@ -326,6 +358,15 @@ fn highlight(
         if is_error {
             format.underline = Stroke::new(1.5, palette.danger);
             format.background = palette.danger.gamma_multiply(0.18);
+        } else if let Some((_, severity)) = marks
+            .iter()
+            .find(|(range, _)| range.start < token.range.end && token.range.start < range.end)
+        {
+            let color = match severity {
+                Severity::Error => palette.danger,
+                Severity::Warning => palette.warning,
+            };
+            format.underline = Stroke::new(1.5, color);
         }
         job.append(&text[token.range], 0.0, format);
     }
@@ -346,6 +387,9 @@ pub struct Popup {
     completion: Option<Completion>,
     /// The cursor the list was made for; moving away closes it.
     cursor: usize,
+    /// The connection the list was made for: switching it remakes the
+    /// list in the new connection's language.
+    connection: Option<ConnectionId>,
     /// Keyboard moved the selection: scroll it into view.
     reveal: bool,
     /// Where the list was drawn, so clicking it does not count as leaving
@@ -372,6 +416,29 @@ impl Popup {
     }
 }
 
+/// What Tab does while a list is open or a snippet has stops left.
+#[derive(Debug, PartialEq, Eq)]
+enum Tab {
+    /// Accepts the item chosen in the list.
+    Item,
+    /// Moves to the next stop of the snippet.
+    Stop,
+    /// Is left to the editor.
+    Plain,
+}
+
+/// Who takes Tab: a snippet's stops come before the list, which Enter
+/// still accepts.
+fn tab_picks(list_open: bool, stops_left: bool) -> Tab {
+    if stops_left {
+        Tab::Stop
+    } else if list_open {
+        Tab::Item
+    } else {
+        Tab::Plain
+    }
+}
+
 /// What completion knows about the editor's connection.
 pub struct Assist<'a> {
     pub connection: Option<ConnectionId>,
@@ -379,8 +446,8 @@ pub struct Assist<'a> {
     pub catalog: &'a dyn Catalog,
     pub options: completion::Options<'a>,
     /// For a key-value store: the database the editor is on, and its keys
-    /// listed so far.
-    pub keys: Option<(&'a str, Option<&'a [DbObject]>)>,
+    /// known so far.
+    pub keys: Option<completion::Keyspace<'a>>,
 }
 
 const ROW_HEIGHT: f32 = 24.0;
@@ -397,7 +464,10 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
         selection,
         highlighter,
         popup,
+        snippet,
         find,
+        diagnostics,
+        hints,
         ..
     } = tab;
     let text_id = Id::new(("violet-editor", *id));
@@ -508,6 +578,7 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
     }
 
     // An open list takes the keys it uses before the editor sees them.
+    let pending = snippet.as_ref().is_some_and(|open| !open.is_empty());
     let mut accept = None;
     if focused && popup.open {
         let count = popup.items().len();
@@ -522,7 +593,8 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
                     popup.reveal = true;
                 }
                 if input.consume_key(Modifiers::NONE, Key::Enter)
-                    || input.consume_key(Modifiers::NONE, Key::Tab)
+                    || (tab_picks(true, pending) == Tab::Item
+                        && input.consume_key(Modifiers::NONE, Key::Tab))
                 {
                     accept = Some(popup.selected);
                 }
@@ -531,6 +603,22 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
                 popup.close();
             }
         });
+    }
+    // Tab moves through what is left of an inserted snippet, even over a
+    // list the typing in a placeholder opened.
+    if focused
+        && tab_picks(popup.open, pending) == Tab::Stop
+        && let Some(open) = snippet.as_mut()
+        && ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Tab))
+    {
+        popup.close();
+        if let Some(stop) = open.next(selection.start) {
+            select(ui.ctx(), text_id, sql, stop.clone());
+            *selection = stop;
+        }
+        if open.is_empty() {
+            *snippet = None;
+        }
     }
     let summoned = focused
         && ui.input_mut(|input| {
@@ -544,15 +632,44 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
             pressed
         });
     if let Some(index) = accept {
-        insert(ui.ctx(), text_id, sql, popup, index);
+        let item = insert(ui.ctx(), text_id, sql, popup, snippet, index);
+        accepted(assist, item, actions);
     }
     let over_list = popup
         .area
         .zip(ui.ctx().pointer_hover_pos())
         .is_some_and(|(area, pointer)| area.contains(pointer));
 
+    // Problems are read once the text stands still, and again as the
+    // catalog fills in.
+    if assist.language == Language::Sql {
+        let now = std::time::Instant::now();
+        if diagnostics.due(sql, now) {
+            let found = diagnostics::diagnose(sql, assist.catalog, &assist.options);
+            diagnostics.store(found, now);
+        }
+        if let Some(wait) = diagnostics.wait(now) {
+            ui.ctx().request_repaint_after(wait);
+        }
+    }
+    // Performance hints share the underline and the tooltip of problems.
+    let mut marks = diagnostics.marks(selection.start);
+    marks.extend(
+        hints
+            .list
+            .iter()
+            .map(|hint| (hint.range.clone(), Severity::Warning)),
+    );
+    // The layout and the hover both read it, one after the other.
+    let highlighter = std::cell::RefCell::new(highlighter);
     let mut layouter = |ui: &Ui, buffer: &dyn egui::TextBuffer, wrap: f32| -> Arc<egui::Galley> {
-        let mut job = highlighter.job(buffer.as_str(), &palette, error_at, assist.language);
+        let mut job = highlighter.borrow_mut().job(
+            buffer.as_str(),
+            &palette,
+            error_at,
+            assist.language,
+            &marks,
+        );
         job.wrap.max_width = wrap;
         ui.painter().layout_job(job)
     };
@@ -617,6 +734,23 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
                     let [start, end] = range.sorted_cursors();
                     *selection = byte_offset(sql, start)..byte_offset(sql, end);
                 }
+                if output.response.changed()
+                    && let Some(open) = snippet.as_mut()
+                    && !open.follow(sql.len(), selection.start)
+                {
+                    *snippet = None;
+                }
+                // Moving out of the snippet or pressing Esc abandons it.
+                let escaped = output.response.has_focus()
+                    && ui.input(|input| input.key_pressed(Key::Escape));
+                if escaped
+                    || (output.cursor_range.is_some()
+                        && snippet.as_ref().is_some_and(|open| {
+                            open.left(selection.start) || open.left(selection.end)
+                        }))
+                {
+                    *snippet = None;
+                }
                 follow(
                     popup,
                     sql,
@@ -635,6 +769,45 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
                     let start = sql[..completion.range.start.min(sql.len())].chars().count();
                     let rect = output.galley.pos_from_cursor(CCursor::new(start));
                     anchor = Some(output.galley_pos + rect.left_bottom().to_vec2());
+                }
+
+                // Tooltips for the word under the pointer; the syntax of the
+                // command being written, under the cursor.
+                if !popup.showing() {
+                    let hint = hovered_word(
+                        &output,
+                        sql,
+                        assist,
+                        diagnostics.found(),
+                        &hints.list,
+                        &mut highlighter.borrow_mut(),
+                    );
+                    if let Some(hint) = hint {
+                        output
+                            .response
+                            .response
+                            .clone()
+                            .on_hover_ui_at_pointer(|ui| hover_card(ui, &hint, &palette));
+                    }
+                    let signature = if !output.response.has_focus() {
+                        None
+                    } else {
+                        match assist.language {
+                            Language::Redis => completion::redis_signature(sql, selection.start),
+                            Language::Sql => completion::sql_signature(
+                                sql,
+                                selection.start,
+                                assist.options.family,
+                            ),
+                            Language::Mongodb => None,
+                        }
+                    };
+                    if let Some(signature) = signature {
+                        let at = sql[..selection.start].chars().count();
+                        let rect = output.galley.pos_from_cursor(CCursor::new(at));
+                        let anchor = output.galley_pos + rect.left_bottom().to_vec2();
+                        signature_card(ui, *id, anchor, &signature, &palette);
+                    }
                 }
 
                 // Matches of the find bar, the picked one stronger.
@@ -716,10 +889,126 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
     if let Some(anchor) = anchor
         && let Some(index) = list(ui, *id, popup, anchor, &palette)
     {
-        insert(ui.ctx(), text_id, sql, popup, index);
+        let item = insert(ui.ctx(), text_id, sql, popup, snippet, index);
+        accepted(assist, item, actions);
         ui.ctx().memory_mut(|memory| memory.request_focus(text_id));
         ui.ctx().request_repaint();
     }
+}
+
+/// What the word under the pointer is, when the pointer is on one.
+fn hovered_word(
+    output: &egui::text_edit::TextEditOutput,
+    sql: &str,
+    assist: &Assist<'_>,
+    problems: &[Diagnostic],
+    hints: &[crate::hints::Hint],
+    highlighter: &mut Highlighter,
+) -> Option<completion::Hover> {
+    let pointer = output.response.hover_pos()?;
+    let local = pointer - output.galley_pos;
+    let index = output.galley.cursor_from_pos(local).index.0;
+    let offset = highlighter.byte_at(sql, index);
+    let problem = problems
+        .iter()
+        .find(|problem| problem.range.contains(&offset))
+        .map(|problem| completion::Hover {
+            range: problem.range.clone(),
+            title: problem.message.clone(),
+            detail: String::new(),
+        });
+    let tip = || {
+        hints
+            .iter()
+            .find(|hint| {
+                hint.range.contains(&offset)
+                    && hint.range.end <= sql.len()
+                    && sql.is_char_boundary(hint.range.start)
+                    && sql.is_char_boundary(hint.range.end)
+            })
+            .map(|hint| completion::Hover {
+                range: hint.range.clone(),
+                title: hint.kind.label().to_owned(),
+                detail: hint.message.clone(),
+            })
+    };
+    let hint = problem.or_else(tip).or_else(|| match assist.language {
+        Language::Redis => completion::redis_hover(sql, offset),
+        Language::Sql => completion::hover(sql, offset, assist.catalog, &assist.options),
+        Language::Mongodb => completion::mongo_hover(sql, offset),
+    })?;
+    // The nearest character is not the one under the pointer past a row's
+    // end or off its word.
+    let chars = |at: usize| sql[..at].chars().count();
+    let from = output
+        .galley
+        .pos_from_cursor(CCursor::new(chars(hint.range.start)));
+    let to = output
+        .galley
+        .pos_from_cursor(CCursor::new(chars(hint.range.end)));
+    let on_word = local.y >= from.top()
+        && local.y <= from.bottom()
+        && to.top() == from.top()
+        && local.x >= from.left()
+        && local.x <= to.right();
+    on_word.then_some(hint)
+}
+
+/// The tooltip of a word: what it is, and what is known of it.
+fn hover_card(ui: &mut Ui, hint: &completion::Hover, palette: &Palette) {
+    ui.set_max_width(420.0);
+    ui.label(
+        egui::RichText::new(&hint.title)
+            .font(theme::mono(FONT_SIZE))
+            .color(palette.text),
+    );
+    if !hint.detail.is_empty() {
+        ui.label(egui::RichText::new(&hint.detail).color(palette.dim));
+    }
+}
+
+/// A command's or function's syntax under the cursor, the argument being written marked.
+fn signature_card(
+    ui: &Ui,
+    tab: u64,
+    anchor: egui::Pos2,
+    signature: &completion::Signature,
+    palette: &Palette,
+) {
+    let font = theme::mono(12.0);
+    let mut job = LayoutJob::default();
+    let plain = TextFormat {
+        font_id: font.clone(),
+        color: palette.dim,
+        ..TextFormat::default()
+    };
+    let active = TextFormat {
+        font_id: font,
+        color: palette.accent,
+        underline: Stroke::new(1.0, palette.accent),
+        ..TextFormat::default()
+    };
+    let label = &signature.label;
+    match &signature.active {
+        Some(range) => {
+            job.append(&label[..range.start], 0.0, plain.clone());
+            job.append(&label[range.clone()], 0.0, active);
+            job.append(&label[range.end..], 0.0, plain);
+        }
+        None => job.append(label, 0.0, plain),
+    }
+    egui::Area::new(Id::new(("signature", tab)))
+        .order(egui::Order::Foreground)
+        .fixed_pos(anchor + Vec2::new(-6.0, 4.0))
+        .interactable(false)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::new()
+                .fill(palette.surface)
+                .stroke(Stroke::new(1.0, palette.outline))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(egui::Margin::symmetric(8, 4))
+                .show(ui, |ui| ui.label(job));
+        });
 }
 
 /// While a selection is dragged near or past the top or bottom of the
@@ -769,14 +1058,18 @@ fn follow(
     if changed {
         // Typing a name or a dot opens it, anything else closes it.
         let typed = sql[..cursor.min(sql.len())].chars().next_back();
-        // Redis keys go on through `:` and `-`, as in `user:1`.
+        // Redis words go on through `:`, `-` and `.`, as in `user:1:name`.
         let word = |c: char| {
-            c.is_alphanumeric()
-                || c == '_'
-                || c == '.'
-                || (language == Language::Redis && matches!(c, ':' | '-'))
+            if language == Language::Redis {
+                completion::redis_word(c)
+            } else {
+                c.is_alphanumeric() || c == '_' || c == '.'
+            }
         };
-        if typed.is_some_and(word) {
+        // SQL also opens it where a table or column is sure to follow.
+        let sql_slot = !matches!(language, Language::Redis | Language::Mongodb)
+            && completion::opens_by_itself(sql, cursor);
+        if typed.is_some_and(word) || sql_slot {
             popup.open = true;
             popup.completion = None;
         } else {
@@ -800,20 +1093,38 @@ fn refresh(
     assist: &Assist<'_>,
     actions: &mut Vec<Action>,
 ) {
-    let stale = popup
-        .completion
-        .as_ref()
-        .is_none_or(|completion| popup.cursor != cursor || !completion.needs.is_empty());
+    let stale = popup.completion.as_ref().is_none_or(|completion| {
+        popup.cursor != cursor
+            || popup.connection != assist.connection
+            || completion.needs_answered(assist.catalog, assist.keys.as_ref())
+    });
     if !stale {
+        // Still waiting on the catalog: ask again for what is missing, which
+        // costs nothing where it is loading, but do not make the list again.
+        if let (Some(connection), Some(completion)) = (assist.connection, &popup.completion)
+            && !completion.needs.is_empty()
+        {
+            actions.push(Action::LoadForCompletion(
+                connection,
+                completion.needs.clone(),
+            ));
+        }
         return;
     }
-    let fresh = popup.completion.is_none() || popup.cursor != cursor;
+    let fresh = popup.completion.is_none()
+        || popup.cursor != cursor
+        || popup.connection != assist.connection;
     popup.cursor = cursor;
+    popup.connection = assist.connection;
     let completed = match (assist.language, assist.keys) {
-        (Language::Redis, Some((schema, keys))) => {
-            completion::complete_redis(sql, cursor, Some(schema), keys)
+        (Language::Redis, _) => {
+            completion::complete_redis(sql, cursor, assist.keys.as_ref(), assist.options.history)
         }
-        (Language::Redis, None) => completion::complete_redis(sql, cursor, None, None),
+        (Language::Mongodb, _) => {
+            let schema = assist.options.search.first().map(String::as_str);
+            let collections = schema.and_then(|schema| assist.catalog.objects(schema));
+            completion::complete_mongo(sql, cursor, schema, collections)
+        }
         _ => completion::complete(sql, cursor, assist.catalog, &assist.options),
     };
     let Some(completion) = completed else {
@@ -840,23 +1151,40 @@ fn refresh(
     popup.completion = Some(completion);
 }
 
-/// Replaces the word at the cursor with the `index`th item.
-fn insert(ctx: &egui::Context, text_id: Id, sql: &mut String, popup: &mut Popup, index: usize) {
-    let Some(completion) = popup.completion.take() else {
-        return;
-    };
+/// Remembers an accepted item for its connection's ranking.
+fn accepted(assist: &Assist<'_>, item: Option<Item>, actions: &mut Vec<Action>) {
+    if let (Some(connection), Some(item)) = (assist.connection, item) {
+        actions.push(Action::CompletionAccepted(connection, item));
+    }
+}
+
+/// Replaces the word at the cursor with the `index`th item, and returns it.
+fn insert(
+    ctx: &egui::Context,
+    text_id: Id,
+    sql: &mut String,
+    popup: &mut Popup,
+    snippet: &mut Option<Snippet>,
+    index: usize,
+) -> Option<Item> {
+    let completion = popup.completion.take()?;
     popup.close();
-    let Some(item) = completion.items.get(index) else {
-        return;
-    };
+    let item = completion.items.get(index)?;
     let range = completion.range.start.min(sql.len())..completion.range.end.min(sql.len());
+    let (stops, caret) = place(sql, range, item);
+    *snippet = stops;
+    select(ctx, text_id, sql, caret);
+    Some(item.clone())
+}
+
+/// Replaces `range` of `sql` with `item`, and returns the stops Tab visits
+/// after it and the byte range to select: the caret, or a placeholder.
+fn place(sql: &mut String, range: Range<usize>, item: &Item) -> (Option<Snippet>, Range<usize>) {
     sql.replace_range(range.clone(), &item.insert);
-    let caret = sql[..range.start + item.caret].chars().count();
-    let mut state = egui::text_edit::TextEditState::load(ctx, text_id).unwrap_or_default();
-    state
-        .cursor
-        .set_char_range(Some(CCursorRange::one(CCursor::new(caret))));
-    state.store(ctx, text_id);
+    // `caret` and `stops` are offsets into the inserted text.
+    let stops = Snippet::new(range.start, &item.stops, sql.len());
+    let caret = range.start + item.caret;
+    (stops, caret..caret + item.caret_len)
 }
 
 fn kind_style(kind: Kind, palette: &Palette) -> (Icon, egui::Color32) {
@@ -1033,5 +1361,275 @@ fn row(
                 palette.dim,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Whether the list is open after typing the end of `sql`.
+    fn opened(sql: &str, language: Language) -> bool {
+        let mut popup = Popup::default();
+        let end = sql.len();
+        follow(&mut popup, sql, &(end..end), true, false, true, language);
+        popup.open
+    }
+
+    #[test]
+    fn typing_into_a_table_slot_opens_the_list() {
+        assert!(opened("SELECT * FROM ", Language::Sql));
+        assert!(opened("INSERT INTO orders (", Language::Sql));
+        assert!(!opened("SELECT a, ", Language::Sql));
+        assert!(!opened("SELECT ' FROM ", Language::Sql));
+        assert!(!opened("FROM ", Language::Redis));
+        assert!(!opened("db.find({ FROM ", Language::Mongodb));
+        assert!(opened("db.", Language::Mongodb));
+    }
+
+    #[test]
+    fn tab_moves_through_pending_stops_before_it_takes_a_list_item() {
+        assert_eq!(tab_picks(true, false), Tab::Item);
+        assert_eq!(tab_picks(true, true), Tab::Stop);
+        assert_eq!(tab_picks(false, true), Tab::Stop);
+        assert_eq!(tab_picks(false, false), Tab::Plain);
+    }
+
+    #[test]
+    fn marked_problems_are_underlined_in_their_severity() {
+        let palette = Palette::DARK;
+        let text = "SELECT a FROM nope";
+        let marks = vec![(14..18, Severity::Warning)];
+        let job = highlight(text, &palette, None, Language::Sql, &marks);
+        let underlined: String = job
+            .sections
+            .iter()
+            .filter(|section| section.format.underline != Stroke::NONE)
+            .map(|section| &text[section.byte_range.start.0..section.byte_range.end.0])
+            .collect();
+        assert_eq!(underlined, "nope");
+        let color = job
+            .sections
+            .iter()
+            .find(|section| section.format.underline != Stroke::NONE)
+            .map(|section| section.format.underline.color);
+        assert_eq!(color, Some(palette.warning));
+        // A server error under it wins.
+        let job = highlight(text, &palette, Some(15), Language::Sql, &marks);
+        assert!(
+            job.sections
+                .iter()
+                .any(|section| section.format.underline.color == palette.danger)
+        );
+    }
+
+    /// One table, `t(a, b, c)`, in `public`.
+    struct Table {
+        schemas: Vec<String>,
+        objects: Vec<DbObject>,
+        columns: Vec<ColumnInfo>,
+    }
+
+    impl Table {
+        fn new() -> Self {
+            let column = |name: &str| ColumnInfo {
+                name: name.into(),
+                data_type: "integer".into(),
+                nullable: true,
+                default: None,
+                primary_key: false,
+                comment: None,
+            };
+            Self {
+                schemas: vec!["public".into()],
+                objects: vec![DbObject {
+                    schema: "public".into(),
+                    name: "t".into(),
+                    kind: violet_core::ObjectKind::Table,
+                    comment: None,
+                    estimated_rows: None,
+                    subtype: None,
+                    detail: None,
+                }],
+                columns: vec![column("a"), column("b"), column("c")],
+            }
+        }
+    }
+
+    impl Catalog for Table {
+        fn schemas(&self) -> &[String] {
+            &self.schemas
+        }
+        fn objects(&self, _: &str) -> Option<&[DbObject]> {
+            Some(&self.objects)
+        }
+        fn columns(&self, _: &str, _: &str) -> Option<&[ColumnInfo]> {
+            Some(&self.columns)
+        }
+        fn foreign_keys(&self, _: &str) -> Option<&[ForeignKey]> {
+            None
+        }
+    }
+
+    #[test]
+    fn an_inserted_template_keeps_every_stop_at_its_place() {
+        let catalog = Table::new();
+        let history = History::default();
+        let search = vec!["public".to_owned()];
+        let quote = |name: &str| name.to_owned();
+        let options = Options {
+            search: &search,
+            database: None,
+            quote: &quote,
+            family: Family::Other,
+            case: KeywordCase::default(),
+            history: &history,
+        };
+        let mut sql = "INSERT INTO t ".to_owned();
+        let completion =
+            completion::complete(&sql, sql.len(), &catalog, &options).expect("completion");
+        let item = completion
+            .items
+            .iter()
+            .find(|item| item.detail == "template")
+            .expect("template");
+        let (stops, caret) = place(&mut sql, completion.range.clone(), item);
+        assert_eq!(&sql[..caret.start], "INSERT INTO t (a, b, c) VALUES (");
+        let mut stops = stops.expect("stops");
+        // Each Tab lands at the next value, not shifted by the caret.
+        let second = stops.next(caret.start).expect("second");
+        assert_eq!(&sql[..second.start], "INSERT INTO t (a, b, c) VALUES (, ");
+        let third = stops.next(second.start).expect("third");
+        assert_eq!(&sql[..third.start], "INSERT INTO t (a, b, c) VALUES (, , ");
+        assert!(stops.is_empty());
+    }
+
+    #[test]
+    fn a_function_placeholder_is_typed_over_and_tab_moves_on() {
+        let item = |sql: &str, label: &str| {
+            let catalog = Table::new();
+            let history = History::default();
+            let search = vec!["public".to_owned()];
+            let quote = |name: &str| name.to_owned();
+            let options = Options {
+                search: &search,
+                database: None,
+                quote: &quote,
+                family: Family::Other,
+                case: KeywordCase::default(),
+                history: &history,
+            };
+            let completion =
+                completion::complete(sql, sql.len(), &catalog, &options).expect("completion");
+            let found = completion
+                .items
+                .iter()
+                .find(|item| item.label == label)
+                .expect("item")
+                .clone();
+            (completion.range, found)
+        };
+        let mut sql = "SELECT rou".to_owned();
+        let (range, round) = item(&sql, "round()");
+        let (stops, first) = place(&mut sql, range, &round);
+        assert_eq!(sql, "SELECT round(number, decimals)");
+        assert_eq!(&sql[first.clone()], "number");
+        let mut stops = stops.expect("stops");
+        // Typing over the placeholder moves the later ones along.
+        sql.replace_range(first.clone(), "price");
+        let cursor = first.start + "price".len();
+        assert!(stops.follow(sql.len(), cursor));
+        let second = stops.next(cursor).expect("second");
+        assert_eq!(&sql[second.clone()], "decimals");
+        sql.replace_range(second.clone(), "2");
+        assert!(stops.follow(sql.len(), second.start + 1));
+        let end = stops.next(second.start + 1).expect("end");
+        assert_eq!(end, sql.len()..sql.len());
+        assert!(stops.is_empty());
+    }
+
+    use std::cell::Cell;
+
+    use crate::completion::{History, Need, Options};
+    use crate::dialect::Family;
+    use crate::settings::KeywordCase;
+    use violet_core::{ColumnInfo, DbObject, ForeignKey};
+
+    /// A catalog with `public` loaded or not, counting how often it is read.
+    struct Counting {
+        loaded: bool,
+        reads: Cell<usize>,
+    }
+
+    impl Catalog for Counting {
+        fn schemas(&self) -> &[String] {
+            self.reads.set(self.reads.get() + 1);
+            &[]
+        }
+        fn objects(&self, _: &str) -> Option<&[DbObject]> {
+            self.loaded.then_some(&[][..])
+        }
+        fn columns(&self, _: &str, _: &str) -> Option<&[ColumnInfo]> {
+            None
+        }
+        fn foreign_keys(&self, _: &str) -> Option<&[ForeignKey]> {
+            None
+        }
+    }
+
+    #[test]
+    fn a_list_waiting_on_the_catalog_is_not_made_again_every_frame() {
+        let history = History::default();
+        let search = vec!["public".to_owned()];
+        let quote = |name: &str| name.to_owned();
+        let options = Options {
+            search: &search,
+            database: None,
+            quote: &quote,
+            family: Family::Other,
+            case: KeywordCase::default(),
+            history: &history,
+        };
+        let connection = Some(ConnectionId::new());
+        let sql = "SELECT * FROM ";
+        let mut popup = Popup::default();
+        let mut actions = Vec::new();
+        let show = |popup: &mut Popup, catalog: &Counting, actions: &mut Vec<Action>| {
+            let assist = Assist {
+                connection,
+                language: Language::Sql,
+                catalog,
+                options: Options { ..options },
+                keys: None,
+            };
+            refresh(popup, sql, sql.len(), &assist, actions);
+        };
+        let waiting = Counting {
+            loaded: false,
+            reads: Cell::new(0),
+        };
+        show(&mut popup, &waiting, &mut actions);
+        let first = waiting.reads.get();
+        assert!(first > 0);
+        assert_eq!(actions.len(), 1);
+        // Frames while it loads ask again but do not read the catalog.
+        show(&mut popup, &waiting, &mut actions);
+        show(&mut popup, &waiting, &mut actions);
+        assert_eq!(waiting.reads.get(), first);
+        assert_eq!(actions.len(), 3);
+        assert!(matches!(
+            &actions[2],
+            Action::LoadForCompletion(_, needs) if needs == &[Need::Objects("public".into())]
+        ));
+        // Once it arrives the list is made again.
+        let loaded = Counting {
+            loaded: true,
+            reads: Cell::new(0),
+        };
+        show(&mut popup, &loaded, &mut actions);
+        assert!(loaded.reads.get() > 0);
+        // Nothing is left to wait for, and nothing to list.
+        assert_eq!(actions.len(), 3);
+        assert!(popup.completion.is_none());
     }
 }

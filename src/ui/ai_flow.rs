@@ -214,7 +214,7 @@ impl VioletApp {
             id: Some(id),
         };
         let schemas = ai::schemas_to_describe(
-            self.explorer.search_path(id),
+            self.search_path(id),
             crate::completion::Catalog::schemas(&catalog),
         );
         let foreign_keys = self.language(id) == Language::Sql;

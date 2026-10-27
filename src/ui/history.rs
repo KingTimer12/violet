@@ -11,6 +11,7 @@ use super::icons::Icon;
 use super::theme::{self, Palette};
 use super::widgets::{self, Tone};
 use super::workspace::{format_duration, thousands};
+use crate::compare::RunStats;
 
 const ROW_HEIGHT: f32 = 52.0;
 
@@ -143,7 +144,7 @@ pub fn show(
                     } else {
                         violet_core::Language::Sql
                     };
-                    preview(ui, entry, &palette, language);
+                    preview(ui, entry, entries, &palette, language);
                 }
             }
 
@@ -340,6 +341,7 @@ fn row(
 fn preview(
     ui: &mut egui::Ui,
     entry: &HistoryEntry,
+    entries: &[HistoryEntry],
     palette: &Palette,
     language: violet_core::Language,
 ) {
@@ -358,7 +360,60 @@ fn preview(
                     job.wrap.max_width = ui.available_width();
                     ui.add(egui::Label::new(job).selectable(true));
                 });
+            runs(ui, &RunStats::of(entries, entry), palette);
         });
+}
+
+/// How the runs of the selected query went: the times over time, and how the
+/// last compares with the one before.
+fn runs(ui: &mut egui::Ui, stats: &RunStats, palette: &Palette) {
+    if stats.times.len() < 2 {
+        return;
+    }
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        let mut text = format!(
+            "{} runs · last {} ms · best {} ms · median {} ms · worst {} ms",
+            stats.times.len(),
+            stats.last().unwrap_or(0),
+            stats.best().unwrap_or(0),
+            stats.median().unwrap_or(0),
+            stats.worst().unwrap_or(0)
+        );
+        if stats.failed > 0 {
+            text.push_str(&format!(" · {} failed", stats.failed));
+        }
+        ui.label(RichText::new(text).color(palette.secondary));
+        if let Some(change) = stats.change() {
+            let (color, word) = if change > 0.1 {
+                (palette.warning, "slower")
+            } else if change < -0.1 {
+                (palette.success, "faster")
+            } else {
+                (palette.dim, "about the same")
+            };
+            ui.label(
+                RichText::new(format!(
+                    "{:+.0}% vs the run before ({word})",
+                    change * 100.0
+                ))
+                .color(color),
+            );
+        }
+    });
+    // One bar per run, the latest twenty, as tall as their time.
+    let shown = &stats.times[stats.times.len().saturating_sub(20)..];
+    let top = shown.iter().max().copied().unwrap_or(1).max(1) as f32;
+    let (area, _) =
+        ui.allocate_exact_size(Vec2::new(shown.len() as f32 * 8.0, 24.0), Sense::hover());
+    for (at, ms) in shown.iter().enumerate() {
+        let height = (area.height() * *ms as f32 / top).max(2.0);
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(area.left() + at as f32 * 8.0, area.bottom() - height),
+            egui::pos2(area.left() + at as f32 * 8.0 + 6.0, area.bottom()),
+        );
+        ui.painter().rect_filled(bar, 1.0, palette.accent);
+    }
 }
 
 fn footer(

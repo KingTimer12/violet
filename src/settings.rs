@@ -33,6 +33,17 @@ impl From<egui::ThemePreference> for ThemeChoice {
     }
 }
 
+/// The case completion offers keywords in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeywordCase {
+    /// Lower case after a lower-case prefix, else upper case.
+    #[default]
+    Typed,
+    Upper,
+    Lower,
+}
+
 /// A workspace besides the default one: its own connections, open editors
 /// and scripts.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +98,8 @@ pub struct Settings {
     /// The command that starts the agent panel's agent; empty for Claude
     /// Code's ACP adapter.
     pub agent_command: String,
+    /// The case completion offers keywords in.
+    pub keyword_case: KeywordCase,
 }
 
 impl Default for Settings {
@@ -112,6 +125,7 @@ impl Default for Settings {
             active_project: None,
             ai: crate::ai::AiSettings::default(),
             agent_command: String::new(),
+            keyword_case: KeywordCase::default(),
         }
     }
 }

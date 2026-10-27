@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use egui::RichText;
 use violet_app::{CachePolicy, ExecOptions};
-use violet_core::{ConnectionId, QueryOutput, Result, ResultSet};
+use violet_core::{ConnectionId, Language, QueryOutput, Result, ResultSet, TaskKind};
 
 use super::VioletApp;
 use super::action::Action;
@@ -16,6 +16,19 @@ use super::state::{Explorer, Folder, FolderItem, Loadable, TreeFilter};
 use super::theme::{self, Palette};
 use super::toasts::Toast;
 use super::widgets::{self, Tone};
+
+/// Whether a run of `sql` leaves the loaded catalog behind, so it is loaded
+/// again: SQL that may have changed the schema, even if the script failed
+/// after some of its statements ran.
+pub fn run_reloads_catalog(language: Language, sql: &str, succeeded: bool) -> bool {
+    language == Language::Sql && crate::sql::may_have_changed_schema(sql, succeeded)
+}
+
+/// Whether a task changes the database's catalog however it ends: a restore
+/// cancelled or failed partway has still created some of it.
+pub fn task_reloads_catalog(kind: TaskKind) -> bool {
+    kind == TaskKind::Restore
+}
 
 /// The folders a database of `family` shows, in order.
 pub fn folders(family: Family) -> &'static [Folder] {
@@ -365,6 +378,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn runs_reload_the_catalog_when_the_schema_may_have_changed() {
+        let sql = |language, text, ok| run_reloads_catalog(language, text, ok);
+        assert!(sql(Language::Sql, "CREATE TABLE t (a int)", true));
+        assert!(!sql(Language::Sql, "SELECT 1", true));
+        // Only SQL has a schema to change.
+        assert!(!sql(Language::Redis, "CREATE TABLE t (a int)", true));
+        assert!(sql(
+            Language::Sql,
+            "DROP TABLE a; SELECT * FROM nope",
+            false
+        ));
+        assert!(!sql(Language::Sql, "DROP TABLE a", false));
+    }
+
+    #[test]
+    fn a_restore_reloads_the_catalog_however_it_ends() {
+        assert!(task_reloads_catalog(TaskKind::Restore));
+        assert!(!task_reloads_catalog(TaskKind::Backup));
     }
 
     #[test]

@@ -272,6 +272,11 @@ impl Iterator for Tokens<'_> {
                 at = quoted_end(bytes, at, b'"');
                 TokenKind::QuotedIdentifier
             }
+            // MySQL's quotes; nothing else uses a backtick.
+            b'`' => {
+                at = quoted_end(bytes, at, b'`');
+                TokenKind::QuotedIdentifier
+            }
             b'$' => match dollar_tag(bytes, at) {
                 Some(tag_end) => {
                     at = dollar_body_end(bytes, at, tag_end);
@@ -623,6 +628,49 @@ pub fn plan(source: &str) -> Plan {
         pageable,
         reads_only,
     }
+}
+
+/// Whether `source` is one statement that changes rows (`INSERT`,
+/// `UPDATE`, `DELETE`, `MERGE`, alone or behind a `WITH`): the writes
+/// `EXPLAIN ANALYZE` may run when it undoes them after.
+#[must_use]
+pub fn is_row_write(source: &str) -> bool {
+    let ranges = statements(source);
+    let [range] = ranges.as_slice() else {
+        return false;
+    };
+    let words = words(&source[range.clone()]);
+    let writes = |word: &str| matches!(word, "INSERT" | "UPDATE" | "DELETE" | "MERGE");
+    match words.first().map(|(word, _)| word.as_str()) {
+        Some("WITH") => words.iter().any(|(word, _)| writes(word)),
+        Some(word) => writes(word),
+        None => false,
+    }
+}
+
+/// Whether a statement of `source` changes the schema (`CREATE`, `ALTER`,
+/// `DROP`, `RENAME`, `TRUNCATE`), so what was loaded about it is stale.
+#[must_use]
+pub fn changes_schema(source: &str) -> bool {
+    statements(source).iter().any(|range| {
+        words(&source[range.clone()])
+            .first()
+            .is_some_and(|(word, _)| {
+                matches!(
+                    word.as_str(),
+                    "CREATE" | "ALTER" | "DROP" | "RENAME" | "TRUNCATE"
+                )
+            })
+    })
+}
+
+/// Whether running `source` left the schema changed, or may have: a script
+/// that failed halfway ran the statements before the failing one, so DDL in
+/// a script of several statements counts; a lone statement that failed
+/// changed nothing.
+#[must_use]
+pub fn may_have_changed_schema(source: &str, succeeded: bool) -> bool {
+    changes_schema(source) && (succeeded || statements(source).len() > 1)
 }
 
 /// What `source`'s own transaction statements do: `BEGIN` and
@@ -1143,6 +1191,43 @@ mod tests {
         assert!(!plan("SELECT now()").cacheable);
         assert!(!plan("DELETE FROM t").reads_only);
         assert!(!plan("SELECT 1; UPDATE t SET a = 1").reads_only);
+        assert!(is_row_write("UPDATE t SET a = 1 WHERE b"));
+        assert!(is_row_write(
+            "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d"
+        ));
+        assert!(!is_row_write("SELECT 1"));
+        assert!(!is_row_write("DROP TABLE t"));
+        assert!(!is_row_write("DELETE FROM a; DELETE FROM b"));
+    }
+
+    #[test]
+    fn ddl_changes_the_schema() {
+        assert!(changes_schema("CREATE TABLE t (a int)"));
+        assert!(changes_schema("select 1; drop table t"));
+        assert!(changes_schema("-- note\nALTER TABLE t ADD b int"));
+        assert!(!changes_schema("SELECT 1"));
+        assert!(!changes_schema("INSERT INTO t VALUES (1)"));
+        assert!(!changes_schema("SELECT 'drop table t'"));
+    }
+
+    #[test]
+    fn a_script_that_failed_halfway_may_have_changed_the_schema() {
+        assert!(may_have_changed_schema("CREATE TABLE t (a int)", true));
+        // Nothing of a lone statement that failed ran.
+        assert!(!may_have_changed_schema("CREATE TABLE t (a int)", false));
+        assert!(!may_have_changed_schema("DROP TABLE t", false));
+        // The statements before the failing one did.
+        assert!(may_have_changed_schema(
+            "CREATE TABLE t (a int);\nSELECT * FROM missing",
+            false
+        ));
+        assert!(may_have_changed_schema(
+            "SELECT 1; ALTER TABLE t ADD b int; INSERT INTO nope VALUES (1)",
+            false
+        ));
+        // No DDL, nothing to reload, whatever happened.
+        assert!(!may_have_changed_schema("SELECT 1; SELECT 2", false));
+        assert!(!may_have_changed_schema("INSERT INTO t VALUES (1)", true));
     }
 
     fn kinds(source: &str) -> Vec<(TokenKind, &str)> {

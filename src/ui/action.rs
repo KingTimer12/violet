@@ -26,6 +26,13 @@ pub enum RunScope {
     ExplainAnalyze,
 }
 
+/// An option of a tab's explain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExplainFlag {
+    Buffers,
+    Timing,
+}
+
 #[derive(Debug)]
 pub enum Action {
     NewConnection,
@@ -61,9 +68,23 @@ pub enum Action {
     Refresh(ConnectionId),
     LoadObjects(ConnectionId, String),
     LoadColumns(ConnectionId, String, String),
+    /// Opens a table's statistics: connection, schema and table.
+    TableStats(ConnectionId, String, String),
+    /// Opens the server health panel for a connection.
+    OpenHealth(ConnectionId),
+    /// Reads the health panel again.
+    HealthRefresh,
+    /// Shows a section of the health panel.
+    HealthSection(usize),
+    /// Cancels or ends a session the health panel lists.
+    HealthStop(super::health_flow::Stop),
+    /// Reads a table's indexes, for hints.
+    LoadIndexes(ConnectionId, String, String),
     /// Catalog data completion is waiting for; what is already loading or
     /// loaded is skipped.
     LoadForCompletion(ConnectionId, Vec<Need>),
+    /// A completion item was accepted: it ranks higher on that connection.
+    CompletionAccepted(ConnectionId, crate::completion::Item),
     SaveProfile {
         profile: ConnectionProfile,
         password: Option<Secret>,
@@ -104,6 +125,8 @@ pub enum Action {
         done: String,
     },
     Run(TabId, RunScope),
+    /// Turns an option of a tab's explain on or off.
+    ToggleExplain(TabId, ExplainFlag),
     /// Runs again, the user having accepted statements without `WHERE`.
     RunConfirmed(TabId, RunScope),
     /// Opens the editor for a cell of a tab's rows.

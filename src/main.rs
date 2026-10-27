@@ -9,15 +9,25 @@
 
 mod agent;
 mod ai;
+mod compare;
 mod completion;
+mod diagnostics;
+mod dialect;
 mod editing;
 mod export;
 mod format;
 mod geometry;
+mod health;
+mod hints;
 mod lang;
 mod mcp;
+mod metrics;
+mod mongo;
+mod plan;
 mod settings;
 mod sql;
+mod stats;
+mod timing;
 mod ui;
 mod update;
 

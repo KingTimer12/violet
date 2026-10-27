@@ -17,11 +17,15 @@ mod edit_flow;
 mod editor;
 mod export_flow;
 mod fonts;
+mod health_flow;
+mod hints_flow;
 mod history;
 pub mod icons;
 mod key_flow;
 mod keys_flow;
 mod mcp_flow;
+mod metrics_flow;
+mod plan_view;
 mod project_flow;
 mod providers;
 mod reference;
@@ -32,6 +36,7 @@ mod selection;
 mod shortcuts;
 mod sidebar;
 mod state;
+mod stats_flow;
 mod task_flow;
 mod tasks;
 pub mod theme;
@@ -54,12 +59,13 @@ use violet_core::{ConnectionId, ConnectionProfile, DriverId, ErrorKind, Language
 use violet_storage::{JsonFile, SavedScript, ScriptFolder, ScriptStore};
 
 use crate::completion::{self, Need};
+use crate::dialect::Explain;
 use crate::settings::Settings;
 use crate::sql;
-use action::{Action, RunScope};
+use action::{Action, ExplainFlag, RunScope};
 use connection_form::{ConnectionForm, PasswordPrompt, TestState};
 use shortcuts::Command;
-use state::{ConnectionCatalog, Explorer, Link, Loadable, NodeKey};
+use state::{ConnectionCatalog, Explorer, Link, LoadKey, Loadable, NodeKey};
 use theme::Palette;
 use toasts::{Toast, Toasts};
 use workspace::{
@@ -152,6 +158,16 @@ pub struct VioletApp {
     rename_requests: HashMap<violet_app::RequestId, rename_flow::Pending>,
     /// Commands the tree ran on keys, waiting for their answer.
     key_requests: HashMap<violet_app::RequestId, key_flow::Pending>,
+    /// A table's statistics, when the dialog is open.
+    table_stats: Option<stats_flow::StatsView>,
+    /// The server health panel, when open.
+    health: Option<health_flow::Health>,
+    /// What the panel asked, by request.
+    health_requests: HashMap<violet_app::RequestId, health_flow::Asked>,
+    /// Index lists being read: the table they are of.
+    index_requests: HashMap<violet_app::RequestId, (ConnectionId, String, String)>,
+    /// Pings sent, by the connection they measure.
+    ping_requests: HashMap<violet_app::RequestId, ConnectionId>,
     /// Actions to run once their connection opens.
     waiting: Vec<(ConnectionId, Action)>,
     /// The format and header choice advanced copy starts with.
@@ -172,6 +188,8 @@ pub struct VioletApp {
     /// Oldest first.
     history: Vec<HistoryEntry>,
     history_view: Option<history::HistoryView>,
+    /// Completion items accepted lately, per connection; kept in memory.
+    completion_history: HashMap<ConnectionId, completion::History>,
     session_file: JsonFile<SavedSession>,
     /// A fingerprint of the editors as last saved, and when they were last
     /// compared.
@@ -190,6 +208,30 @@ pub struct VioletApp {
     update_receipt: Option<fastframe_update::Receipt>,
     #[cfg(debug_assertions)]
     snapshot: Option<devtools::Snapshot>,
+}
+
+/// An analyzed write that failed halfway left its transaction, or the
+/// savepoint it ran in, open: closes it.
+fn undo_explain(backend: &violet_app::Backend, connection: ConnectionId, sent: &str) {
+    let undo =
+        if sent.starts_with("BEGIN;\nEXPLAIN") || sent.starts_with("START TRANSACTION;\nEXPLAIN") {
+            "ROLLBACK"
+        } else if sent.starts_with("SAVEPOINT violet_explain;") {
+            "ROLLBACK TO SAVEPOINT violet_explain; RELEASE SAVEPOINT violet_explain"
+        } else {
+            return;
+        };
+    let options = ExecOptions {
+        cache: CachePolicy::Refresh,
+        page: None,
+    };
+    backend.execute_script(
+        connection,
+        None,
+        undo.to_owned(),
+        options,
+        sql::transaction_control(undo),
+    );
 }
 
 fn connection_name(
@@ -302,6 +344,11 @@ impl VioletApp {
             drop_prompt: None,
             rename_requests: HashMap::new(),
             key_requests: HashMap::new(),
+            ping_requests: HashMap::new(),
+            index_requests: HashMap::new(),
+            table_stats: None,
+            health: None,
+            health_requests: HashMap::new(),
             copy_choice: (crate::export::Format::Tsv, true),
             confirm_delete: None,
             confirm_project_delete: None,
@@ -314,6 +361,7 @@ impl VioletApp {
             history_store: services.history,
             history: Vec::new(),
             history_view: None,
+            completion_history: HashMap::new(),
             session_file: services.session,
             session_saved: 0,
             session_checked: Instant::now(),
@@ -559,6 +607,11 @@ impl VioletApp {
             .map_or(Language::Sql, |id| self.language(id))
     }
 
+    /// Schemas whose objects need no qualifier on a connection.
+    fn search_path(&self, id: ConnectionId) -> Vec<String> {
+        self.explorer.search_path(id, self.family(id))
+    }
+
     /// The SQL dialect of a connection's driver.
     fn dialect(&self, id: ConnectionId) -> violet_core::SqlDialect {
         connections(&self.profiles, &self.explorer)
@@ -622,6 +675,12 @@ impl VioletApp {
                     .extend(ready.into_iter().map(|(_, action)| action));
                 self.explorer.links.insert(id, Link::Online(server));
                 self.explorer.forget(id);
+                self.explorer
+                    .metrics
+                    .entry(id)
+                    .or_default()
+                    .connected(Instant::now());
+                self.ping(id);
                 self.explorer.schemas.insert(id, Loadable::Loading);
                 self.backend.load_schemas(id);
                 if self.shows_all_databases(id) {
@@ -645,6 +704,9 @@ impl VioletApp {
                 }
             }
             Event::ConnectFailed { id, error } => {
+                if let Some(metrics) = self.explorer.metrics.get_mut(&id) {
+                    metrics.connect_failed();
+                }
                 self.waiting.retain(|(connection, _)| *connection != id);
                 self.queued.retain(|(tab, _)| {
                     !self
@@ -677,6 +739,9 @@ impl VioletApp {
                 }
             }
             Event::Disconnected { id } => {
+                if let Some(metrics) = self.explorer.metrics.get_mut(&id) {
+                    metrics.closed();
+                }
                 self.explorer.links.insert(id, Link::Offline);
                 self.explorer.forget(id);
             }
@@ -731,8 +796,7 @@ impl VioletApp {
                     }
                 }
                 self.explorer
-                    .objects
-                    .insert((id, schema), Loadable::from_result(result));
+                    .objects_loaded(id, schema, result.map(Into::into), Instant::now());
             }
             Event::Columns {
                 id,
@@ -740,9 +804,14 @@ impl VioletApp {
                 relation,
                 result,
             } => {
-                self.explorer
-                    .columns
-                    .insert((id, schema, relation), Loadable::from_result(result));
+                self.explorer.columns_loaded(
+                    id,
+                    schema,
+                    relation,
+                    result.map(Into::into),
+                    Instant::now(),
+                );
+                self.explorer.hint_rev += 1;
             }
             Event::Entries {
                 id,
@@ -751,14 +820,44 @@ impl VioletApp {
                 more,
                 result,
             } => self.keys_listed(id, schema, pattern, more, result),
-            Event::ForeignKeys { id, schema, result } => {
+            Event::KeysMatching {
+                id,
+                schema,
+                prefix,
+                result,
+            } => {
+                // A failed lookup counts as done, so it is not asked again.
+                let keys = result.map(|page| page.objects).unwrap_or_default();
                 self.explorer
-                    .foreign_keys
-                    .insert((id, schema), Loadable::from_result(result));
+                    .key_matches
+                    .insert((id, schema, prefix), Loadable::Ready(keys.into()));
+            }
+            Event::ForeignKeys { id, schema, result } => {
+                self.explorer.foreign_keys_loaded(
+                    id,
+                    schema,
+                    result.map(Into::into),
+                    Instant::now(),
+                );
             }
             Event::QueryFinished { request, result } => {
                 if let Some(pending) = self.rename_requests.remove(&request) {
                     self.renamed(ctx, pending, &result);
+                    return;
+                }
+                if self.table_stats_read(request, &result) {
+                    return;
+                }
+                if let Some(asked) = self.health_requests.remove(&request) {
+                    self.health_answered(ctx, asked, result);
+                    return;
+                }
+                if let Some(table) = self.index_requests.remove(&request) {
+                    self.indexes_read(table, &result);
+                    return;
+                }
+                if let Some(connection) = self.ping_requests.remove(&request) {
+                    self.pinged(ctx, connection, &result);
                     return;
                 }
                 if let Some(pending) = self.key_requests.remove(&request) {
@@ -799,6 +898,14 @@ impl VioletApp {
                         .map_or(Language::Sql, |profile| {
                             self.explorer.language(profile.driver.as_str())
                         })
+                });
+                // DDL that ran leaves the loaded catalog behind.
+                let ddl = connection.filter(|_| {
+                    catalog_flow::run_reloads_catalog(
+                        language,
+                        &running.executed.sql,
+                        result.is_ok(),
+                    )
                 });
                 // Runs from editors go to the history; pages and data tabs
                 // do not.
@@ -867,8 +974,21 @@ impl VioletApp {
                     tab.active_set = 0;
                     tab.grid_selection.clear();
                 }
+                tab.received = Some(Instant::now());
+                tab.render = None;
+                tab.rtt = connection
+                    .and_then(|id| self.explorer.metrics.get(&id))
+                    .and_then(|metrics| metrics.latency.last());
                 tab.outcome = Some(match result {
-                    Ok(output) => {
+                    Ok(mut output) => {
+                        // A key's profile is four answers: show it as one.
+                        if language == Language::Redis
+                            && running.executed.sql.starts_with("TYPE ")
+                            && let Some(report) = crate::lang::redis_profile_report(&output.sets)
+                        {
+                            output.sets = vec![report];
+                        }
+                        tab.keep_plan(&running.executed.sql, &output.sets);
                         // Show the last set with rows: usually what was asked for.
                         tab.active_set = output
                             .sets
@@ -878,11 +998,15 @@ impl VioletApp {
                         Outcome::Done { output }
                     }
                     Err(error) => {
+                        if let Some(id) = connection {
+                            undo_explain(&self.backend, id, &running.executed.sql);
+                        }
                         if matches!(error.kind, ErrorKind::Connection | ErrorKind::NotConnected)
                             && let Some(id) = connection
                             && !self.backend.is_connected(id)
                         {
                             self.explorer.links.insert(id, Link::Offline);
+                            self.explorer.metrics.entry(id).or_default().dropped();
                         }
                         Outcome::Failed {
                             error,
@@ -892,6 +1016,12 @@ impl VioletApp {
                 });
                 if let Some(entry) = entry {
                     self.record(entry);
+                }
+                if let Some(id) = connection {
+                    self.ping_if_stale(id);
+                }
+                if let Some(id) = ddl {
+                    self.reload_catalog(id);
                 }
             }
             Event::Counted { request, result } => {
@@ -990,10 +1120,41 @@ impl VioletApp {
         }
     }
 
+    /// Asks again for the loads that failed and whose wait is over, and has
+    /// the next frame come when the next wait ends.
+    fn retry_loads(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        for key in self.explorer.retries.due(now) {
+            if !self.explorer.link(key.owner()).is_online() {
+                self.explorer.abandon(key, "not connected");
+                continue;
+            }
+            match key {
+                LoadKey::Objects(id, schema) => self.backend.load_objects(id, schema),
+                LoadKey::Columns(id, schema, relation) => {
+                    self.backend.load_columns(id, schema, relation);
+                }
+                LoadKey::ForeignKeys(id, schema) => self.backend.load_foreign_keys(id, schema),
+            }
+        }
+        if let Some(wait) = self.explorer.retries.next_due(now) {
+            ctx.request_repaint_after(wait);
+        }
+    }
+
+    /// Forgets what was loaded for a connection and loads it again.
+    fn reload_catalog(&mut self, id: ConnectionId) {
+        self.explorer.forget(id);
+        self.explorer.schemas.insert(id, Loadable::Loading);
+        self.backend.load_schemas(id);
+        if self.shows_all_databases(id) {
+            self.explorer.databases.insert(id, Loadable::Loading);
+            self.backend.load_databases(id);
+        }
+    }
+
     fn load_objects(&mut self, id: ConnectionId, schema: String) {
-        self.explorer
-            .objects
-            .insert((id, schema.clone()), Loadable::Loading);
+        self.explorer.objects_loading(id, schema.clone());
         self.backend.load_objects(id, schema);
     }
 
@@ -1032,6 +1193,17 @@ impl VioletApp {
                         self.load_keys(id, schema, false);
                     }
                 }
+                Need::KeysMatching(schema, prefix) => {
+                    let key = (id, schema.clone(), prefix.clone());
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        self.explorer.key_matches.entry(key)
+                    {
+                        entry.insert(Loadable::Loading);
+                        let glob = completion::key_glob(&prefix);
+                        self.backend
+                            .match_keys(id, schema, prefix, glob, completion::KEY_LOOKUP);
+                    }
+                }
                 Need::ForeignKeys(schema) => {
                     let key = (id, schema.clone());
                     if let std::collections::hash_map::Entry::Vacant(entry) =
@@ -1053,6 +1225,11 @@ impl VioletApp {
             return;
         }
         self.explorer.links.insert(id, Link::Connecting);
+        self.explorer
+            .metrics
+            .entry(id)
+            .or_default()
+            .connecting(Instant::now());
         self.backend.connect_to(id, profile, password);
     }
 
@@ -1159,8 +1336,7 @@ impl VioletApp {
             + (tab.sql[range.clone()].len() - tab.sql[range.clone()].trim_start().len());
         if explain {
             if language != Language::Sql {
-                self.toasts
-                    .push(ctx, Toast::info("This database has no query plans to show"));
+                self.explain_other(ctx, tab_id, connection, language, offset, &text, scope);
                 return;
             }
             self.explain(ctx, tab_id, connection, offset, &text, scope);
@@ -1305,6 +1481,42 @@ impl VioletApp {
         pending
     }
 
+    /// Explains a statement of a language that is not SQL: MongoDB's
+    /// `explain()`, or what a Redis command's key weighs.
+    #[allow(clippy::too_many_arguments)]
+    fn explain_other(
+        &mut self,
+        ctx: &egui::Context,
+        tab_id: TabId,
+        connection: ConnectionId,
+        language: Language,
+        offset: usize,
+        text: &str,
+        scope: RunScope,
+    ) {
+        let analyze = scope == RunScope::ExplainAnalyze;
+        let sent = match crate::lang::explain_script(language, text, analyze) {
+            Ok(sent) => sent,
+            Err(reason) => {
+                self.toasts.push(ctx, Toast::info(reason));
+                return;
+            }
+        };
+        if analyze && language == Language::Mongodb && crate::mongo::plans_only(text) {
+            self.toasts.push(
+                ctx,
+                Toast::info("MongoDB analyzes reads only; this shows the planner's choice"),
+            );
+        }
+        let shift = sent.find(text).map_or(0, |at| sent[..at].chars().count());
+        let executed = Executed {
+            offset,
+            sql: sent,
+            shift,
+        };
+        self.start(tab_id, connection, executed, ExecOptions::WRITE, false);
+    }
+
     /// Runs one statement under `EXPLAIN`, or `EXPLAIN ANALYZE` when it
     /// only reads: analysing runs it for real.
     fn explain(
@@ -1324,18 +1536,51 @@ impl VioletApp {
             return;
         }
         let analyze = scope == RunScope::ExplainAnalyze;
-        if analyze && !sql::plan(text).reads_only {
+        let statement = text.trim_end().trim_end_matches(';').trim_end();
+        let family = self.family(connection);
+        let mut options = self
+            .workspace
+            .get(tab_id)
+            .map_or_else(Explain::default, |tab| tab.explain);
+        options.analyze = analyze;
+        // A write is analyzed inside a transaction that is rolled back, where
+        // the database can undo it.
+        let rolled_back = analyze
+            && !sql::plan(text).reads_only
+            && sql::is_row_write(text)
+            && family
+                .explain_rolled_back(statement, &options, false)
+                .is_some();
+        if analyze && !rolled_back && !sql::plan(text).reads_only {
             self.toasts.push(
                 ctx,
                 Toast::error(
                     "EXPLAIN ANALYZE runs the statement",
-                    "Violet only analyses statements that read. Use Explain to see the plan of one that writes.",
+                    "Violet only analyses statements that read, or writes it can roll back (Postgres and MySQL). Use Explain to see the plan of one that writes.",
                 ),
             );
             return;
         }
-        let statement = text.trim_end().trim_end_matches(';').trim_end();
-        let Some(sent) = self.backend.explain_sql(connection, statement, analyze) else {
+        if analyze && family == crate::dialect::Family::Sqlite {
+            self.toasts.push(
+                ctx,
+                Toast::info("SQLite has no EXPLAIN ANALYZE; Explain shows its query plan"),
+            );
+            return;
+        }
+        // Where the database has a tree form, the results pane draws it.
+        let open = self
+            .explorer
+            .transactions
+            .get(&connection)
+            .is_some_and(|state| state.open);
+        let tree = if rolled_back {
+            family.explain_rolled_back(statement, &options, open)
+        } else {
+            family.explain_tree(statement, &options)
+        };
+        let Some(sent) = tree.or_else(|| self.backend.explain_sql(connection, statement, analyze))
+        else {
             return;
         };
         let shift = sent
@@ -1529,11 +1774,11 @@ impl VioletApp {
     /// Formats an editor's selection, or its whole script, keeping the
     /// formatted text selected.
     fn format_sql(&mut self, ctx: &egui::Context, tab_id: TabId) {
-        let mysql = self
+        let family = self
             .workspace
             .get(tab_id)
             .and_then(|tab| tab.connection)
-            .is_some_and(|id| self.dialect(id).quote_open == '`');
+            .map_or_else(Default::default, |id| self.family(id));
         let Some(tab) = self.workspace.get_mut(tab_id) else {
             return;
         };
@@ -1545,7 +1790,7 @@ impl VioletApp {
         let Some(source) = tab.sql.get(range.clone()) else {
             return;
         };
-        let formatted = match crate::format::format(source, mysql) {
+        let formatted = match crate::format::format(source, family) {
             Ok(formatted) => formatted,
             Err(refused) => {
                 let why = match refused {
@@ -1822,15 +2067,7 @@ impl VioletApp {
                     self.open_task(id, kind, Vec::new());
                 }
             }
-            Action::Refresh(id) => {
-                self.explorer.forget(id);
-                self.explorer.schemas.insert(id, Loadable::Loading);
-                self.backend.load_schemas(id);
-                if self.shows_all_databases(id) {
-                    self.explorer.databases.insert(id, Loadable::Loading);
-                    self.backend.load_databases(id);
-                }
-            }
+            Action::Refresh(id) => self.reload_catalog(id),
             Action::LoadObjects(id, schema) => self.load_objects(id, schema),
             Action::LoadKeys(id, schema, more) => self.load_keys(id, schema, more),
             Action::KeyDialog {
@@ -1847,6 +2084,12 @@ impl VioletApp {
             } => self.run_in_schema(ctx, connection, schema, script, done),
             Action::LoadColumns(id, schema, relation) => self.load_columns(id, schema, relation),
             Action::LoadForCompletion(id, needs) => self.load_for_completion(id, needs),
+            Action::CompletionAccepted(id, item) => {
+                self.completion_history
+                    .entry(id)
+                    .or_default()
+                    .accepted(&item);
+            }
             Action::SaveProfile {
                 profile,
                 password,
@@ -1907,6 +2150,29 @@ impl VioletApp {
                 self.run_data(ctx, tab, CachePolicy::Use);
             }
             Action::Run(tab, scope) => self.run(ctx, tab, scope),
+            Action::TableStats(connection, schema, table) => {
+                self.open_table_stats(ctx, connection, schema, table);
+            }
+            Action::OpenHealth(connection) => self.open_health(ctx, connection),
+            Action::HealthRefresh => self.refresh_health(),
+            Action::HealthSection(index) => {
+                if let Some(view) = &mut self.health {
+                    view.current = index;
+                }
+                self.load_section(index);
+            }
+            Action::HealthStop(stop) => self.stop_session(ctx, stop),
+            Action::LoadIndexes(connection, schema, table) => {
+                self.load_indexes(connection, schema, table);
+            }
+            Action::ToggleExplain(tab, flag) => {
+                if let Some(tab) = self.workspace.get_mut(tab) {
+                    match flag {
+                        ExplainFlag::Buffers => tab.explain.buffers = !tab.explain.buffers,
+                        ExplainFlag::Timing => tab.explain.timing = !tab.explain.timing,
+                    }
+                }
+            }
             action @ (Action::RunConfirmed(..)
             | Action::EditCell(..)
             | Action::SetCell(..)
@@ -2421,6 +2687,8 @@ impl VioletApp {
         let links = self.sync_reference(active);
         let profiles = &*connections(&self.profiles, &self.explorer);
         let explorer = &self.explorer;
+        let keyword_case = self.settings.keyword_case;
+        let completion_history = &self.completion_history;
         let actions = &mut self.actions;
         let reference = self.reference.as_ref().filter(|r| r.tab == active);
         let Some(tab) = self.workspace.tabs.iter_mut().find(|tab| tab.id == active) else {
@@ -2498,11 +2766,22 @@ impl VioletApp {
             });
         self.layout.results = (total > 0.0).then(|| results.response.rect.height() / total);
 
+        let family = tab
+            .connection
+            .and_then(|id| profiles.iter().find(|profile| profile.id == id))
+            .map_or_else(Default::default, |profile| {
+                crate::dialect::Family::of(profile.driver.as_str())
+            });
+        hints_flow::refresh(tab, explorer, language, family, actions);
         let search = tab
             .connection
-            .map(|id| explorer.search_path(id))
+            .map(|id| explorer.search_path(id, family))
             .unwrap_or_default();
         let quote = |name: &str| violet_core::Dialect::quote_ident(&dialect, name);
+        let connected = match tab.connection.map(|id| explorer.link(id)) {
+            Some(state::Link::Online(server)) => Some(server.database.clone()),
+            _ => None,
+        };
         // A key-value store's editor completes the keys of its database.
         let database = match tab.connection.map(|id| explorer.link(id)) {
             Some(state::Link::Online(server)) if language == Language::Redis => {
@@ -2510,14 +2789,35 @@ impl VioletApp {
             }
             _ => None,
         };
+        let found: Vec<(&str, Option<&[violet_core::DbObject]>)> = match (tab.connection, &database)
+        {
+            (Some(id), Some(database)) => explorer
+                .key_matches
+                .iter()
+                .filter(|((owner, schema, _), _)| *owner == id && schema == database)
+                .map(|((_, _, prefix), keys)| {
+                    let keys = match keys {
+                        Loadable::Ready(keys) => Some(&**keys),
+                        _ => None,
+                    };
+                    (prefix.as_str(), keys)
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
         let keys = database.as_ref().map(|database| {
-            let listed = tab
+            let tree = tab
                 .connection
                 .and_then(|id| explorer.keys.get(&(id, database.clone())))
-                .filter(|keys| keys.listed)
-                .map(|keys| &*keys.list);
-            (database.as_str(), listed)
+                .filter(|keys| keys.listed);
+            completion::Keyspace {
+                schema: database.as_str(),
+                listed: tree.map(|keys| &*keys.list),
+                whole: tree.is_some_and(|keys| keys.next.is_none() && keys.applied == "*"),
+                found: &found,
+            }
         });
+        let no_history = completion::History::default();
         let assist = editor::Assist {
             connection: tab.connection,
             language,
@@ -2527,7 +2827,14 @@ impl VioletApp {
             },
             options: completion::Options {
                 search: &search,
+                database: connected.as_deref(),
                 quote: &quote,
+                family,
+                case: keyword_case,
+                history: tab
+                    .connection
+                    .and_then(|id| completion_history.get(&id))
+                    .unwrap_or(&no_history),
             },
             keys,
         };
@@ -2617,6 +2924,16 @@ impl VioletApp {
                 self.history_view = None;
             }
         }
+        if let Some(view) = &self.table_stats
+            && !stats_flow::show(ctx, view, &mut self.actions)
+        {
+            self.table_stats = None;
+        }
+        if let Some(view) = &mut self.health
+            && !health_flow::show(ctx, view, &mut self.actions)
+        {
+            self.health = None;
+        }
         self.task_modal(ctx);
         if let Some(dialog) = &mut self.keys_dialog
             && !keys_flow::show(ctx, dialog, &mut self.actions)
@@ -2695,10 +3012,13 @@ impl eframe::App for VioletApp {
             .map(|info| (info.id.as_str().to_owned(), info.language))
             .collect();
         self.handle_events(ctx);
+        self.retry_loads(ctx);
         self.poll_agent(ctx);
         self.capture_shortcut(ctx);
         self.shortcuts(ctx);
         self.auto_refresh(ctx);
+        self.health_tick(ctx);
+        self.ping_tick(ctx);
         if std::mem::take(&mut self.names_unchecked) {
             for profile in self.profiles.all() {
                 self.fonts.cover(ctx, &profile.name);

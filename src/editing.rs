@@ -10,6 +10,113 @@ pub struct Edited {
     pub selection: Range<usize>,
 }
 
+/// Turns char indices of a text into byte offsets without reading the text
+/// from its start each time: a few chars from a mark, or none at all for
+/// ASCII.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CharIndex {
+    ascii: bool,
+    /// The byte offset of every `STEP`th char.
+    marks: Vec<usize>,
+}
+
+impl CharIndex {
+    const STEP: usize = 64;
+
+    pub fn new(text: &str) -> Self {
+        let ascii = text.is_ascii();
+        let marks = if ascii {
+            Vec::new()
+        } else {
+            text.char_indices()
+                .step_by(Self::STEP)
+                .map(|(at, _)| at)
+                .collect()
+        };
+        Self { ascii, marks }
+    }
+
+    /// The byte offset of char `index` of `text`, the text this was made
+    /// for; the end of it past the last char.
+    pub fn byte(&self, text: &str, index: usize) -> usize {
+        if self.ascii {
+            return index.min(text.len());
+        }
+        let Some(&mark) = self.marks.get(index / Self::STEP) else {
+            return text.len();
+        };
+        text[mark..]
+            .char_indices()
+            .nth(index % Self::STEP)
+            .map_or(text.len(), |(at, _)| mark + at)
+    }
+}
+
+/// The stops left in an inserted snippet, which Tab visits in turn.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Snippet {
+    /// Where the item was inserted.
+    start: usize,
+    /// Byte ranges in the text, ascending; empty for a bare caret.
+    stops: Vec<Range<usize>>,
+    /// The text's length when the stops were last placed.
+    len: usize,
+}
+
+impl Snippet {
+    /// The stops of an item inserted at byte `start` into a text now
+    /// `len` long; none when the item has no more stops.
+    pub fn new(start: usize, stops: &[Range<usize>], len: usize) -> Option<Self> {
+        (!stops.is_empty()).then(|| Self {
+            start,
+            stops: stops
+                .iter()
+                .map(|stop| start + stop.start..start + stop.end)
+                .collect(),
+            len,
+        })
+    }
+
+    /// Follows an edit that left the text `len` long with the cursor at
+    /// `cursor`: the stops past the edit move with it. False when what was
+    /// typed passed the next stop, so the snippet is over.
+    pub fn follow(&mut self, len: usize, cursor: usize) -> bool {
+        let delta = len as isize - self.len as isize;
+        self.len = len;
+        if delta == 0 {
+            return true;
+        }
+        let at = cursor.saturating_sub(delta.max(0) as usize);
+        for stop in &mut self.stops {
+            if stop.start >= at {
+                stop.start = stop.start.saturating_add_signed(delta);
+                stop.end = stop.end.saturating_add_signed(delta);
+            }
+        }
+        self.stops.first().is_some_and(|stop| stop.start >= cursor)
+    }
+
+    /// Whether `cursor` is outside the inserted item, from where it went in
+    /// to the end of its last stop: the snippet is then abandoned.
+    pub fn left(&self, cursor: usize) -> bool {
+        cursor < self.start || self.stops.last().is_none_or(|stop| cursor > stop.end)
+    }
+
+    /// The next stop after `cursor`, which is dropped; `None` when the
+    /// cursor is already past them all.
+    pub fn next(&mut self, cursor: usize) -> Option<Range<usize>> {
+        let index = self.stops.iter().position(|stop| stop.start > cursor)?;
+        let stop = self.stops[index].clone();
+        self.stops.drain(..=index);
+        Some(stop)
+    }
+
+    /// Whether any stop is left.
+    pub fn is_empty(&self) -> bool {
+        self.stops.is_empty()
+    }
+}
+
 /// Comments out the lines `selection` touches with `-- `, at their common
 /// indentation, or uncomments them when every one that is not blank
 /// already is. A selection ending at the start of a line leaves that line
@@ -169,5 +276,52 @@ mod tests {
             replace_all(text, &find_all(text, "nome", true), "name"),
             "Select name FROM t WHERE name = 'NOME'"
         );
+    }
+
+    #[test]
+    fn char_indices_become_byte_offsets() {
+        let texts = [
+            String::new(),
+            "SELECT 1".to_owned(),
+            "ação çã ".repeat(40),
+            format!("{}é{}", "a".repeat(130), "z".repeat(70)),
+        ];
+        for text in &texts {
+            let index = CharIndex::new(text);
+            let chars = text.chars().count();
+            for at in 0..=chars + 2 {
+                let expected = text.char_indices().nth(at).map_or(text.len(), |(b, _)| b);
+                assert_eq!(index.byte(text, at), expected, "{at} of {}", text.len());
+            }
+        }
+    }
+
+    #[test]
+    fn snippet_is_left_when_the_cursor_leaves_its_range() {
+        // Stops at 14 and 16, inserted at 10.
+        let snippet = Snippet::new(10, &[4..4, 6..8], 20).expect("stops");
+        assert!(!snippet.left(10));
+        assert!(!snippet.left(14));
+        assert!(!snippet.left(18));
+        assert!(snippet.left(9));
+        assert!(snippet.left(19));
+    }
+
+    #[test]
+    fn snippet_stops_are_visited_and_follow_typing() {
+        // `(a, b) VALUES (|, |)` inserted at 10.
+        let mut snippet = Snippet::new(10, &[4..4, 6..6], 20).expect("stops");
+        assert_eq!(snippet.next(14), Some(16..16));
+        assert_eq!(snippet.next(16), None);
+        assert!(snippet.is_empty());
+        assert!(Snippet::new(0, &[], 5).is_none());
+
+        // Typing `42` at the first stop moves the second one along.
+        let mut snippet = Snippet::new(10, &[4..4, 6..6], 20).expect("stops");
+        assert!(snippet.follow(22, 16));
+        assert_eq!(snippet.next(16), Some(18..18));
+        // Moving the cursor past the stop with edits ends it.
+        let mut snippet = Snippet::new(0, std::slice::from_ref(&(2..2)), 10).expect("stops");
+        assert!(!snippet.follow(14, 9));
     }
 }

@@ -666,6 +666,9 @@ fn connection(
                     ));
                 }
             }
+            if menu_item(ui, Icon::Activity, "Server health…") {
+                actions.push(Action::OpenHealth(id));
+            }
             if menu_item(ui, Icon::Power, "Disconnect") {
                 actions.push(Action::Disconnect(id));
             }
@@ -1635,6 +1638,17 @@ fn object_node(
                         quote(&object.name)
                     ),
                 });
+            }
+            if matches!(
+                object.kind,
+                ObjectKind::Table | ObjectKind::MaterializedView
+            ) && menu_item(ui, Icon::Activity, "Table statistics…")
+            {
+                actions.push(Action::TableStats(
+                    id,
+                    object.schema.clone(),
+                    object.name.clone(),
+                ));
             }
         }
         let has_source = matches!(

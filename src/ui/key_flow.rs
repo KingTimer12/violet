@@ -138,6 +138,12 @@ impl VioletApp {
         more: bool,
         result: Result<violet_core::EntryPage>,
     ) {
+        if !more {
+            // Listed afresh: keys looked up before may be stale.
+            self.explorer
+                .key_matches
+                .retain(|(owner, of, _), _| *owner != connection || *of != schema);
+        }
         let keys = self.explorer.keys.entry((connection, schema)).or_default();
         keys.loading = false;
         keys.listed = true;

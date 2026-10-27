@@ -6,21 +6,26 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use egui::{Align, CornerRadius, Layout, RichText, Sense, Stroke, Ui, Vec2};
 use egui_extras::{Column, TableBuilder};
+use violet_app::ExecOptions;
 use violet_core::{DbError, ResultSet};
 
 use super::action::Action;
 use super::cells::{self, Cell, Look};
 use super::edit_flow::{EditTarget, Editing};
 use super::icons::Icon;
+use super::plan_view::{self, View};
 use super::reference::{self, Reference};
 use super::selection::{Mode, Selection};
 use super::theme::{self, Palette};
 use super::widgets::{self, Tone};
 use super::workspace::{
-    Count, Executed, InlineCell, Outcome, Paging, QueryTab, TabKind, format_duration, thousands,
+    Count, Executed, InlineCell, Outcome, Paging, QueryTab, TabKind, format_duration,
+    previous_plan, thousands,
 };
 use crate::export::{to_delimited, write_row};
+use crate::plan::Plan;
 use crate::sql;
+use crate::timing::{Breakdown, Part};
 
 const ROW_HEIGHT: f32 = 26.0;
 
@@ -96,6 +101,16 @@ pub fn show(
             tab.active_set = tab.active_set.min(count - 1);
             let elapsed = output.elapsed;
             let set = &output.sets[tab.active_set];
+            let plan = explained(tab.last_run.as_ref(), set);
+            let previous = previous_plan(&tab.plan_runs);
+            // What an analyzed plan says the server spent, in seconds.
+            let server_time = plan
+                .as_ref()
+                .filter(|plan| plan.analyzed())
+                .map(|plan| {
+                    (plan.planning_ms.unwrap_or(0.0) + plan.execution_ms.unwrap_or(0.0)) / 1000.0
+                })
+                .filter(|seconds| *seconds > 0.0);
             let server_rows = set.rows.len();
             let pending = Pending {
                 cells: tab
@@ -138,6 +153,13 @@ pub fn show(
                                     .color(palette.text),
                             );
                         }
+                        if plan.is_some() {
+                            let options = View::options(previous.is_some());
+                            if !options.iter().any(|(view, _)| *view == tab.plan_view) {
+                                tab.plan_view = View::Tree;
+                            }
+                            widgets::segmented(ui, &mut tab.plan_view, &options);
+                        }
                         if set.has_rows() {
                             edit_bar(ui, tab.id, &pending, editing, actions);
                         }
@@ -172,7 +194,11 @@ pub fn show(
                             {
                                 actions.push(Action::RefreshTab(tab.id));
                             }
-                            ui.label(RichText::new(format_duration(elapsed)).color(palette.dim));
+                            let took = ui
+                                .label(RichText::new(format_duration(elapsed)).color(palette.dim));
+                            let server = server_time.map(std::time::Duration::from_secs_f64);
+                            let breakdown = Breakdown::new(elapsed, tab.rtt, server, tab.render);
+                            took.on_hover_ui(|ui| timing_card(ui, &palette, &breakdown));
                             if let Some(age) = output.cached {
                                 widgets::pill(
                                     ui,
@@ -218,7 +244,9 @@ pub fn show(
                 Stroke::new(1.0, palette.outline),
             );
 
-            if set.has_rows() {
+            if let Some(plan) = plan.filter(|_| tab.plan_view != View::Rows) {
+                plan_view::show(ui, tab.id, &plan, previous, tab.plan_view);
+            } else if set.has_rows() {
                 if let Some(paging) = &tab.paging {
                     let fetching = tab.running.as_ref().is_some_and(|r| r.append);
                     egui::Panel::bottom(egui::Id::new(("paging", tab.id)))
@@ -290,8 +318,52 @@ pub fn show(
                     ),
                 );
             }
+            if let Some(at) = tab.received.take() {
+                tab.render = Some(at.elapsed());
+            }
         }
     }
+}
+
+/// A run's time split by where it went, each part with its share.
+fn timing_card(ui: &mut Ui, palette: &Palette, breakdown: &Breakdown) {
+    ui.label(
+        RichText::new(format!("Where {} went", format_duration(breakdown.felt())))
+            .font(theme::semibold(13.0)),
+    );
+    let felt = breakdown.felt().as_secs_f64().max(f64::EPSILON);
+    for (part, took) in &breakdown.parts {
+        let share = (took.as_secs_f64() / felt) as f32;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(part.label()).color(palette.secondary));
+            let (bar, response) = ui.allocate_exact_size(Vec2::new(120.0, 6.0), Sense::hover());
+            ui.painter().rect_filled(bar, 3.0, palette.outline);
+            let mut filled = bar;
+            filled.set_width(bar.width() * share);
+            let color = if breakdown.slowest() == Some(*part) {
+                palette.warning
+            } else {
+                palette.accent
+            };
+            ui.painter().rect_filled(filled, 3.0, color);
+            ui.label(format_duration(*took));
+            response.on_hover_text(part.hint());
+        });
+    }
+    if breakdown
+        .parts
+        .iter()
+        .all(|(part, _)| *part != Part::Network)
+    {
+        ui.label(RichText::new("No round trip measured yet").color(palette.dim));
+    }
+}
+
+/// The plan an explain run returned, when the last run was one and the
+/// result is in a form Violet reads.
+fn explained(last_run: Option<&(Executed, ExecOptions)>, set: &ResultSet) -> Option<Plan> {
+    let (executed, _) = last_run?;
+    crate::plan::is_explain(&executed.sql).then(|| Plan::from_result(set))?
 }
 
 /// DBeaver's result footer: how much is loaded, and buttons to read more

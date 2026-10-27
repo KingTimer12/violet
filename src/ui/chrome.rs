@@ -5,7 +5,7 @@ use egui::{Align, Align2, CornerRadius, Layout, RichText, Sense, Stroke, Ui, Vec
 use violet_app::TxCommand;
 use violet_core::{ConnectionId, ConnectionProfile};
 
-use super::action::{Action, RunScope};
+use super::action::{Action, ExplainFlag, RunScope};
 use super::icons::Icon;
 use super::shortcuts::{self, Command};
 use super::sidebar::menu_item;
@@ -534,33 +534,87 @@ pub fn toolbar(
         if response.on_hover_text(script_tip).clicked() {
             actions.push(Action::Run(tab.id, RunScope::Script));
         }
-        // Only SQL has plans to explain.
-        let explain = (language == violet_core::Language::Sql).then(|| {
-            ui.add_enabled_ui(!running, |ui| {
-                widgets::button(ui, Tone::Secondary, Some(Icon::Zap), "Explain")
+        // SQL and MongoDB explain a query. Redis has no plans: its button
+        // profiles the key of a command.
+        let redis = language == violet_core::Language::Redis;
+        let (button, tip) = if redis {
+            (
+                "Analyze",
+                "The type, size, encoding and time to live of the key the command uses",
+            )
+        } else {
+            (
+                "Explain",
+                "How the server runs the statement under the cursor",
+            )
+        };
+        let explain = ui
+            .add_enabled_ui(!running, |ui| {
+                widgets::button(ui, Tone::Secondary, Some(Icon::Zap), button)
             })
             .inner
-            .on_hover_text("How the server runs the statement under the cursor")
-        });
-        if let Some(explain) = &explain {
-            egui::Popup::menu(explain).show(|ui| {
+            .on_hover_text(tip);
+        {
+            egui::Popup::menu(&explain).show(|ui| {
                 let ctx = ui.ctx().clone();
-                for (icon, label, shortcut, scope) in [
+                let analyze = if language == violet_core::Language::Sql {
+                    "Explain analyze (writes rolled back)"
+                } else {
+                    "Explain analyze (reads only)"
+                };
+                let items = [
                     (
                         Icon::Zap,
-                        "Explain plan",
+                        if redis {
+                            "Profile the key"
+                        } else {
+                            "Explain plan"
+                        },
                         shortcuts::get(Command::Explain),
                         RunScope::Explain,
                     ),
                     (
                         Icon::Clock,
-                        "Explain analyze (reads only)",
+                        analyze,
                         shortcuts::get(Command::ExplainAnalyze),
                         RunScope::ExplainAnalyze,
                     ),
-                ] {
+                ];
+                for (icon, label, shortcut, scope) in
+                    items.into_iter().take(if redis { 1 } else { 2 })
+                {
                     if mode_item(ui, icon, label, &ctx.format_shortcut(&shortcut)) {
                         actions.push(Action::Run(tab.id, scope));
+                    }
+                }
+                // Only Postgres counts pages and can leave the clock out.
+                let postgres = tab
+                    .connection
+                    .and_then(|id| profiles.iter().find(|profile| profile.id == id))
+                    .is_some_and(|profile| {
+                        crate::dialect::Family::of(profile.driver.as_str())
+                            == crate::dialect::Family::Postgres
+                    });
+                if postgres {
+                    ui.separator();
+                    for (flag, label, on, tip) in [
+                        (
+                            ExplainFlag::Buffers,
+                            "Buffers",
+                            tab.explain.buffers,
+                            "Pages hit, read and written by each step (analyze)",
+                        ),
+                        (
+                            ExplainFlag::Timing,
+                            "Timing",
+                            tab.explain.timing,
+                            "A clock reading per step; off, analyze costs less but shows no times",
+                        ),
+                    ] {
+                        let mut value = on;
+                        if ui.checkbox(&mut value, label).on_hover_text(tip).changed() {
+                            actions.push(Action::ToggleExplain(tab.id, flag));
+                        }
                     }
                 }
             });
@@ -937,6 +991,42 @@ fn connection_picker(
         });
 }
 
+/// What the status bar's round trip stands for.
+fn health_card(metrics: &crate::metrics::Metrics, sessions: usize) -> String {
+    let ms = |duration: Option<std::time::Duration>| {
+        duration.map_or("-".to_owned(), |d| {
+            format!("{:.1} ms", d.as_secs_f64() * 1000.0)
+        })
+    };
+    let latency = &metrics.latency;
+    let mut lines = vec![
+        format!(
+            "Round trip: last {}, average {}, best {}, worst {}",
+            ms(latency.last()),
+            ms(latency.average()),
+            ms(latency.min()),
+            ms(latency.max())
+        ),
+        format!("Jitter: {}", ms(latency.jitter())),
+    ];
+    if let Some(connect) = metrics.connect_time {
+        lines.push(format!("Connected in {}", format_duration(connect)));
+    }
+    if let Some(online) = metrics.online_for(std::time::Instant::now()) {
+        lines.push(format!("Online for {}", format_duration(online)));
+    }
+    lines.push(format!(
+        "{} reconnects, {} lost connections this run",
+        metrics.reconnects(),
+        metrics.drops
+    ));
+    lines.push(format!(
+        "{sessions} open session{}; Violet keeps one per database and no pool",
+        if sessions == 1 { "" } else { "s" }
+    ));
+    lines.join("\n")
+}
+
 /// The strip along the bottom of the window.
 pub fn status_bar(
     ui: &mut Ui,
@@ -963,9 +1053,42 @@ pub fn status_bar(
                     Link::Failed(_) => (palette.danger, "Connection failed".to_owned()),
                     Link::Offline => (palette.dim, "Disconnected".to_owned()),
                 };
+                let metrics = explorer.metrics.get(&id);
+                let stuck = metrics.is_some_and(crate::metrics::Metrics::not_answering);
+                let color = if stuck && explorer.link(id).is_online() {
+                    palette.warning
+                } else {
+                    color
+                };
                 widgets::dot(ui, color, 3.5);
                 ui.label(small(profile.display_name(), palette.secondary));
                 ui.label(small(state, palette.dim));
+                if explorer.link(id).is_online()
+                    && let Some(metrics) = metrics
+                {
+                    let (text, level) = if stuck {
+                        ("Not answering".to_owned(), palette.warning)
+                    } else {
+                        match metrics.latency.last() {
+                            Some(rtt) => (
+                                format!("{} ms", rtt.as_millis().max(1)),
+                                match rtt.as_millis() {
+                                    0..=99 => palette.dim,
+                                    100..=299 => palette.warning,
+                                    _ => palette.danger,
+                                },
+                            ),
+                            None => ("…".to_owned(), palette.dim),
+                        }
+                    };
+                    let sessions = 1 + explorer
+                        .opened
+                        .values()
+                        .filter(|(parent, _)| *parent == id)
+                        .count();
+                    ui.label(small(format!("· {text}"), level))
+                        .on_hover_text(health_card(metrics, sessions));
+                }
                 let transaction = explorer.transaction(id);
                 if transaction.open {
                     let text = match transaction.writes {

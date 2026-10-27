@@ -573,7 +573,7 @@ impl VioletApp {
                 id: Some(id),
             };
             let schemas = crate::ai::schemas_to_describe(
-                self.explorer.search_path(id),
+                self.search_path(id),
                 crate::completion::Catalog::schemas(&catalog),
             );
             let schema = crate::ai::describe(&catalog, &schemas, language == Language::Sql);

@@ -326,9 +326,9 @@ impl VioletApp {
                     Some(message) => Toast::error(format!("{what} of {name} failed"), message),
                 };
                 self.toasts.push(ctx, toast);
-                // A restore changed the catalog the tree shows.
-                if started.kind == TaskKind::Restore
-                    && !cancelled
+                // A restore changed the catalog the tree shows, even one that
+                // stopped or failed partway.
+                if super::catalog_flow::task_reloads_catalog(started.kind)
                     && self.explorer.link(started.connection).is_online()
                 {
                     self.actions.push(Action::Refresh(started.connection));
