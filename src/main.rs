@@ -17,6 +17,7 @@ mod editing;
 mod export;
 mod format;
 mod geometry;
+mod health;
 mod hints;
 mod lang;
 mod mcp;

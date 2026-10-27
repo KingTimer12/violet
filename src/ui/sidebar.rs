@@ -666,6 +666,9 @@ fn connection(
                     ));
                 }
             }
+            if menu_item(ui, Icon::Activity, "Server health…") {
+                actions.push(Action::OpenHealth(id));
+            }
             if menu_item(ui, Icon::Power, "Disconnect") {
                 actions.push(Action::Disconnect(id));
             }

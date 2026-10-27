@@ -17,6 +17,7 @@ mod edit_flow;
 mod editor;
 mod export_flow;
 mod fonts;
+mod health_flow;
 mod hints_flow;
 mod history;
 pub mod icons;
@@ -156,6 +157,10 @@ pub struct VioletApp {
     rename_requests: HashMap<violet_app::RequestId, rename_flow::Pending>,
     /// Commands the tree ran on keys, waiting for their answer.
     key_requests: HashMap<violet_app::RequestId, key_flow::Pending>,
+    /// The server health panel, when open.
+    health: Option<health_flow::Health>,
+    /// What the panel asked, by request.
+    health_requests: HashMap<violet_app::RequestId, health_flow::Asked>,
     /// Index lists being read: the table they are of.
     index_requests: HashMap<violet_app::RequestId, (ConnectionId, String, String)>,
     /// Pings sent, by the connection they measure.
@@ -338,6 +343,8 @@ impl VioletApp {
             key_requests: HashMap::new(),
             ping_requests: HashMap::new(),
             index_requests: HashMap::new(),
+            health: None,
+            health_requests: HashMap::new(),
             copy_choice: (crate::export::Format::Tsv, true),
             confirm_delete: None,
             confirm_project_delete: None,
@@ -822,6 +829,10 @@ impl VioletApp {
             Event::QueryFinished { request, result } => {
                 if let Some(pending) = self.rename_requests.remove(&request) {
                     self.renamed(ctx, pending, &result);
+                    return;
+                }
+                if let Some(asked) = self.health_requests.remove(&request) {
+                    self.health_answered(ctx, asked, result);
                     return;
                 }
                 if let Some(table) = self.index_requests.remove(&request) {
@@ -2116,6 +2127,15 @@ impl VioletApp {
                 self.run_data(ctx, tab, CachePolicy::Use);
             }
             Action::Run(tab, scope) => self.run(ctx, tab, scope),
+            Action::OpenHealth(connection) => self.open_health(ctx, connection),
+            Action::HealthRefresh => self.refresh_health(),
+            Action::HealthSection(index) => {
+                if let Some(view) = &mut self.health {
+                    view.current = index;
+                }
+                self.load_section(index);
+            }
+            Action::HealthStop(stop) => self.stop_session(ctx, stop),
             Action::LoadIndexes(connection, schema, table) => {
                 self.load_indexes(connection, schema, table);
             }
@@ -2878,6 +2898,11 @@ impl VioletApp {
                 self.history_view = None;
             }
         }
+        if let Some(view) = &mut self.health
+            && !health_flow::show(ctx, view, &mut self.actions)
+        {
+            self.health = None;
+        }
         self.task_modal(ctx);
         if let Some(dialog) = &mut self.keys_dialog
             && !keys_flow::show(ctx, dialog, &mut self.actions)
@@ -2961,6 +2986,7 @@ impl eframe::App for VioletApp {
         self.capture_shortcut(ctx);
         self.shortcuts(ctx);
         self.auto_refresh(ctx);
+        self.health_tick(ctx);
         if std::mem::take(&mut self.names_unchecked) {
             for profile in self.profiles.all() {
                 self.fonts.cover(ctx, &profile.name);

@@ -68,6 +68,14 @@ pub enum Action {
     Refresh(ConnectionId),
     LoadObjects(ConnectionId, String),
     LoadColumns(ConnectionId, String, String),
+    /// Opens the server health panel for a connection.
+    OpenHealth(ConnectionId),
+    /// Reads the health panel again.
+    HealthRefresh,
+    /// Shows a section of the health panel.
+    HealthSection(usize),
+    /// Cancels or ends a session the health panel lists.
+    HealthStop(super::health_flow::Stop),
     /// Reads a table's indexes, for hints.
     LoadIndexes(ConnectionId, String, String),
     /// Catalog data completion is waiting for; what is already loading or
