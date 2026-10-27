@@ -159,6 +159,13 @@ pub enum Event {
         more: bool,
         result: Result<EntryPage>,
     },
+    /// A schema's keys starting with `prefix`, looked up for completion.
+    KeysMatching {
+        id: ConnectionId,
+        schema: String,
+        prefix: String,
+        result: Result<EntryPage>,
+    },
     /// Foreign keys from or to a schema's tables.
     ForeignKeys {
         id: ConnectionId,
@@ -1166,6 +1173,31 @@ impl Backend {
                 schema,
                 pattern,
                 more: cursor.is_some(),
+                result,
+            });
+        });
+    }
+
+    /// Looks up at most `limit` of `schema`'s keys matching `glob`, for
+    /// completing keys starting with `prefix`.
+    pub fn match_keys(
+        &self,
+        id: ConnectionId,
+        schema: String,
+        prefix: String,
+        glob: String,
+        limit: u32,
+    ) {
+        let shared = Arc::clone(&self.shared);
+        self.runtime.spawn(async move {
+            let result = match shared.session(id) {
+                Ok(session) => session.entries(&schema, Some(&glob), None, limit).await,
+                Err(error) => Err(error),
+            };
+            shared.emit(Event::KeysMatching {
+                id,
+                schema,
+                prefix,
                 result,
             });
         });

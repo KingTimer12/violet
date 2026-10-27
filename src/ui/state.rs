@@ -110,6 +110,9 @@ pub struct FolderItem {
 /// A relation: connection, schema and name.
 pub type RelationKey = (ConnectionId, String, String);
 
+/// A key lookup: connection, database and the keys' prefix.
+pub type PrefixKey = (ConnectionId, String, String);
+
 /// A key-value database's keys, as far as they are listed: they come a
 /// page at a time, matching a glob.
 #[derive(Clone, Debug, Default)]
@@ -166,6 +169,8 @@ pub struct Explorer {
     pub folders: HashMap<(ConnectionId, Folder), Loadable<Arc<[FolderItem]>>>,
     /// The keys of each key-value database.
     pub keys: HashMap<(ConnectionId, String), Keys>,
+    /// Keys looked up by prefix for completion, by database and prefix.
+    pub key_matches: HashMap<PrefixKey, Loadable<Arc<[DbObject]>>>,
     /// Each driver's language, by driver id, as installed.
     pub languages: HashMap<String, Language>,
     pub expanded: HashSet<NodeKey>,

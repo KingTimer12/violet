@@ -759,6 +759,18 @@ impl VioletApp {
                 more,
                 result,
             } => self.keys_listed(id, schema, pattern, more, result),
+            Event::KeysMatching {
+                id,
+                schema,
+                prefix,
+                result,
+            } => {
+                // A failed lookup counts as done, so it is not asked again.
+                let keys = result.map(|page| page.objects).unwrap_or_default();
+                self.explorer
+                    .key_matches
+                    .insert((id, schema, prefix), Loadable::Ready(keys.into()));
+            }
             Event::ForeignKeys { id, schema, result } => {
                 self.explorer
                     .foreign_keys
@@ -1038,6 +1050,17 @@ impl VioletApp {
                         .is_some_and(|keys| keys.listed || keys.loading);
                     if !listed {
                         self.load_keys(id, schema, false);
+                    }
+                }
+                Need::KeysMatching(schema, prefix) => {
+                    let key = (id, schema.clone(), prefix.clone());
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        self.explorer.key_matches.entry(key)
+                    {
+                        entry.insert(Loadable::Loading);
+                        let glob = completion::key_glob(&prefix);
+                        self.backend
+                            .match_keys(id, schema, prefix, glob, completion::KEY_LOOKUP);
                     }
                 }
                 Need::ForeignKeys(schema) => {
@@ -1856,7 +1879,10 @@ impl VioletApp {
             Action::LoadColumns(id, schema, relation) => self.load_columns(id, schema, relation),
             Action::LoadForCompletion(id, needs) => self.load_for_completion(id, needs),
             Action::CompletionAccepted(id, item) => {
-                self.completion_history.entry(id).or_default().accepted(&item);
+                self.completion_history
+                    .entry(id)
+                    .or_default()
+                    .accepted(&item);
             }
             Action::SaveProfile {
                 profile,
@@ -2529,13 +2555,33 @@ impl VioletApp {
             }
             _ => None,
         };
+        let found: Vec<(&str, Option<&[violet_core::DbObject]>)> = match (tab.connection, &database)
+        {
+            (Some(id), Some(database)) => explorer
+                .key_matches
+                .iter()
+                .filter(|((owner, schema, _), _)| *owner == id && schema == database)
+                .map(|((_, _, prefix), keys)| {
+                    let keys = match keys {
+                        Loadable::Ready(keys) => Some(&**keys),
+                        _ => None,
+                    };
+                    (prefix.as_str(), keys)
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
         let keys = database.as_ref().map(|database| {
-            let listed = tab
+            let tree = tab
                 .connection
                 .and_then(|id| explorer.keys.get(&(id, database.clone())))
-                .filter(|keys| keys.listed)
-                .map(|keys| &*keys.list);
-            (database.as_str(), listed)
+                .filter(|keys| keys.listed);
+            completion::Keyspace {
+                schema: database.as_str(),
+                listed: tree.map(|keys| &*keys.list),
+                whole: tree.is_some_and(|keys| keys.next.is_none() && keys.applied == "*"),
+                found: &found,
+            }
         });
         let no_history = completion::History::default();
         let assist = editor::Assist {

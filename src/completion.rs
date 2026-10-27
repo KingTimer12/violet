@@ -32,6 +32,8 @@ pub enum Need {
     ForeignKeys(String),
     /// A key-value database's keys.
     Keys(String),
+    /// A key-value database's keys starting with a prefix.
+    KeysMatching(String, String),
 }
 
 /// What a suggestion is, in the order they are listed when equally good.
@@ -127,15 +129,110 @@ impl History {
     }
 }
 
+/// A key-value database's keys, as far as they are known.
+#[derive(Clone, Copy, Debug)]
+pub struct Keyspace<'a> {
+    pub schema: &'a str,
+    /// The keys the tree listed; `None` while they have not been.
+    pub listed: Option<&'a [DbObject]>,
+    /// The tree listed every key, so no other key starts with a prefix.
+    pub whole: bool,
+    /// Keys looked up by prefix: the prefix, and its keys once found.
+    pub found: &'a [(&'a str, Option<&'a [DbObject]>)],
+}
+
+/// How many keys a lookup by prefix asks for.
+pub const KEY_LOOKUP: u32 = 200;
+
+/// Whether `c` belongs to a Redis word: anything but blanks and quotes, so
+/// `user:1:name`, `a-b` and `v1.2` are one word each.
+pub fn redis_word(c: char) -> bool {
+    !c.is_whitespace() && !matches!(c, '"' | '\'')
+}
+
+/// A `SCAN MATCH` glob for keys starting with `prefix`, its glob
+/// characters escaped.
+pub fn key_glob(prefix: &str) -> String {
+    let mut glob = String::with_capacity(prefix.len() + 1);
+    for c in prefix.chars() {
+        if matches!(c, '*' | '?' | '[' | '\\') {
+            glob.push('\\');
+        }
+        glob.push(c);
+    }
+    glob.push('*');
+    glob
+}
+
+/// Whether `line` ends inside a quoted word; a backslash escapes the next
+/// character, and the other kind of quote counts for nothing inside one.
+fn in_quotes(line: &str) -> bool {
+    let mut open = None;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match (open, c) {
+            (Some(_), '\\') => {
+                chars.next();
+            }
+            (Some(quote), c) if c == quote => open = None,
+            (None, '"' | '\'') => open = Some(c),
+            _ => {}
+        }
+    }
+    open.is_some()
+}
+
+/// Whether the lines before `line_start` leave a `MULTI` open: one with no
+/// `EXEC` or `DISCARD` after it.
+fn in_multi(text: &str, line_start: usize) -> bool {
+    let mut open = false;
+    for line in text[..line_start].lines() {
+        let first = line.split_ascii_whitespace().next().unwrap_or("");
+        if first.eq_ignore_ascii_case("MULTI") {
+            open = true;
+        } else if first.eq_ignore_ascii_case("EXEC") || first.eq_ignore_ascii_case("DISCARD") {
+            open = false;
+        }
+    }
+    open
+}
+
+/// Whether argument `index` (0 for the first after the command's name) of
+/// a command with `syntax` is a key: a `key`, `source` or `destination` in
+/// the fixed arguments, or in a repeated group right after them
+/// (`key [key ...]`, `key value [key value ...]`).
+fn takes_key(syntax: &str, index: usize) -> bool {
+    let is_key = |word: &str| matches!(word, "key" | "source" | "destination");
+    let words: Vec<&str> = syntax.split_ascii_whitespace().collect();
+    let fixed = words.iter().take_while(|w| !w.starts_with('[')).count();
+    if index < fixed {
+        return is_key(words[index]);
+    }
+    let rest = &words[fixed..];
+    let Some(end) = rest.iter().position(|w| w.trim_end_matches(']') == "...") else {
+        return false;
+    };
+    let group = &rest[..end];
+    // Only one plain group: `[NX | XX] [GET]` or nested ones are not.
+    if group.is_empty()
+        || group.iter().skip(1).any(|w| w.starts_with('['))
+        || group.iter().any(|w| w.ends_with(']') || *w == "|")
+    {
+        return false;
+    }
+    let word = group[(index - fixed) % group.len()].trim_start_matches('[');
+    is_key(word)
+}
+
 /// Completes a Redis command line: command names (with their syntax) in
-/// the first word, a container's subcommands in the second, and the keys
-/// listed in the tree for `schema` where the command takes keys. `keys` is
-/// `None` while they have not been listed.
+/// the first word, a container's subcommands in the second, and keys where
+/// the command takes one. Keys the tree has not listed are looked up by
+/// prefix through [`Need::KeysMatching`].
 pub fn complete_redis(
     text: &str,
     cursor: usize,
-    schema: Option<&str>,
-    keys: Option<&[DbObject]>,
+    keys: Option<&Keyspace<'_>>,
+    history: &History,
 ) -> Option<Completion> {
     use violet_lang::redis::{COMMANDS, is_container};
     if cursor > text.len() || !text.is_char_boundary(cursor) {
@@ -147,22 +244,29 @@ pub fn complete_redis(
         return None;
     }
     // Inside quotes nothing is offered.
-    if before.chars().filter(|c| *c == '"').count() % 2 == 1
-        || before.chars().filter(|c| *c == '\'').count() % 2 == 1
-    {
+    if in_quotes(before) {
         return None;
     }
     let start = line_start
         + before
-            .rfind(|c: char| c.is_ascii_whitespace())
-            .map_or(0, |at| at + 1);
+            .char_indices()
+            .rev()
+            .find(|(_, c)| !redis_word(*c))
+            .map_or(0, |(at, c)| at + c.len_utf8());
     let end = cursor
         + text[cursor..]
-            .find(|c: char| c.is_ascii_whitespace())
+            .find(|c: char| !redis_word(c))
             .unwrap_or(text.len() - cursor);
     let prefix = text[start..cursor].to_owned();
-    let words: Vec<&str> = text[line_start..start].split_ascii_whitespace().collect();
-    let upper = prefix.to_ascii_uppercase();
+    let head = &text[line_start..start];
+    let words: Vec<String> = match violet_lang::redis::argv(head) {
+        Ok(args) => args
+            .iter()
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect(),
+        Err(_) => head.split_ascii_whitespace().map(str::to_owned).collect(),
+    };
+    let multi = in_multi(text, line_start);
     let mut items = Vec::new();
     let mut needs = Vec::new();
     let command = |name: &str, syntax: &str, insert: String| Item {
@@ -178,7 +282,8 @@ pub fn complete_redis(
             let mut containers = Vec::new();
             for c in COMMANDS {
                 let first = c.name.split(' ').next().unwrap_or(c.name);
-                if !first.starts_with(&upper) {
+                // Inside MULTI another MULTI or a WATCH is an error.
+                if multi && matches!(first, "MULTI" | "WATCH") {
                     continue;
                 }
                 if c.name.contains(' ') {
@@ -195,54 +300,72 @@ pub fn complete_redis(
         [first] if is_container(&first.to_ascii_uppercase()) => {
             let head = format!("{} ", first.to_ascii_uppercase());
             for c in COMMANDS {
-                if let Some(sub) = c.name.strip_prefix(&head)
-                    && sub.starts_with(&upper)
-                {
+                if let Some(sub) = c.name.strip_prefix(&head) {
                     items.push(command(sub, c.syntax, format!("{sub} ")));
                 }
             }
         }
         [first, ..] => {
             let name = violet_lang::redis::command(&words);
-            let takes_keys = name.is_some_and(|c| {
-                c.syntax.contains("key")
-                    || c.syntax.contains("source")
-                    || c.syntax.contains("destination")
-            }) || name.is_none() && !is_container(&first.to_ascii_uppercase());
-            if takes_keys {
-                match keys {
-                    Some(keys) => {
-                        for key in keys.iter().filter(|k| k.name.starts_with(&prefix)) {
-                            let insert = violet_lang::redis::quote(key.name.as_bytes());
-                            items.push(Item {
-                                label: key.name.clone(),
-                                caret: insert.len(),
-                                insert,
-                                kind: Kind::Key,
-                                detail: key.subtype.clone().unwrap_or_default(),
-                                key: key.name.clone(),
-                            });
-                            if items.len() >= MAX_ITEMS {
-                                break;
-                            }
-                        }
-                    }
-                    None => {
-                        if let Some(schema) = schema {
-                            needs.push(Need::Keys(schema.to_owned()));
-                        }
-                    }
-                }
+            let skip = if is_container(&first.to_ascii_uppercase()) {
+                2
+            } else {
+                1
+            };
+            let key_slot = name
+                .is_some_and(|c| words.len() >= skip && takes_key(c.syntax, words.len() - skip));
+            if key_slot && let Some(keys) = keys {
+                key_items(keys, &prefix, &mut items, &mut needs);
             }
         }
     }
-    items.truncate(MAX_ITEMS);
+    let mut items = rank(items, &prefix, history, false);
+    if multi {
+        // What closes the block comes first.
+        items.sort_by_key(|item| {
+            !(item.kind == Kind::Keyword && matches!(item.label.as_str(), "EXEC" | "DISCARD"))
+        });
+    }
     Some(Completion {
         range: start..end,
         prefix,
         items,
         needs,
     })
+}
+
+/// The known keys for a key argument, and what to load for the rest.
+fn key_items(keys: &Keyspace<'_>, prefix: &str, items: &mut Vec<Item>, needs: &mut Vec<Need>) {
+    let found = keys.found.iter().filter(|(by, _)| prefix.starts_with(by));
+    let covered = keys.whole || found.clone().any(|(_, keys)| keys.is_some());
+    let mut seen = HashSet::new();
+    let lists = keys
+        .listed
+        .into_iter()
+        .chain(found.filter_map(|(_, keys)| *keys));
+    for key in lists.flatten() {
+        if !seen.insert(key.name.as_str()) {
+            continue;
+        }
+        let insert = violet_lang::redis::quote(key.name.as_bytes());
+        items.push(Item {
+            label: key.name.clone(),
+            caret: insert.len(),
+            insert,
+            kind: Kind::Key,
+            detail: key.subtype.clone().unwrap_or_default(),
+            key: key.name.clone(),
+        });
+    }
+    if keys.listed.is_none() {
+        needs.push(Need::Keys(keys.schema.to_owned()));
+    }
+    if !covered && !prefix.is_empty() {
+        needs.push(Need::KeysMatching(
+            keys.schema.to_owned(),
+            prefix.to_owned(),
+        ));
+    }
 }
 
 /// What the shell offers on `db.`.
@@ -429,7 +552,12 @@ pub fn complete_mongo(
     } else if head.is_empty() || head.ends_with(';') || head.ends_with('\n') {
         offer(Kind::Keyword, "db", "", "db".to_owned());
         offer(Kind::Keyword, "show dbs", "", "show dbs".to_owned());
-        offer(Kind::Keyword, "show collections", "", "show collections".to_owned());
+        offer(
+            Kind::Keyword,
+            "show collections",
+            "",
+            "show collections".to_owned(),
+        );
         offer(Kind::Keyword, "use", "database", "use ".to_owned());
     }
     let mut items = rank(items, &prefix, &History::default(), false);
@@ -678,8 +806,8 @@ fn inside_literal(text: &str, tokens: &[Token], cursor: usize) -> bool {
                 || !(body.len() >= 4 && body.ends_with("*/"))
         }
         TokenKind::String | TokenKind::QuotedIdentifier => {
-            let closed =
-                body.len() >= 2 && matches!(body.as_bytes()[body.len() - 1], b'\'' | b'"' | b'`' | b'$');
+            let closed = body.len() >= 2
+                && matches!(body.as_bytes()[body.len() - 1], b'\'' | b'"' | b'`' | b'$');
             cursor < token.range.end || !closed
         }
         _ => false,
@@ -698,9 +826,14 @@ fn qualifiers(text: &str, start: usize) -> (Vec<String>, usize, bool) {
         let quote = head.chars().next_back().filter(|c| matches!(c, '"' | '`'));
         let (name, begin) = if let Some(quote) = quote {
             let inner = &head[..head.len() - 1];
-            let Some(open) = inner.rfind(quote) else { break };
+            let Some(open) = inner.rfind(quote) else {
+                break;
+            };
             let doubled = quote.to_string().repeat(2);
-            (inner[open + 1..].replace(&doubled, &quote.to_string()), open)
+            (
+                inner[open + 1..].replace(&doubled, &quote.to_string()),
+                open,
+            )
         } else {
             let begin = word_start(text, dot);
             (text[begin..dot].to_owned(), begin)
@@ -2582,36 +2715,156 @@ mod tests {
         assert_eq!(inserts(&schema), ["orders o", "order_items oi"]);
     }
 
+    fn redis_labels(text: &str, keys: Option<&Keyspace<'_>>) -> Vec<String> {
+        let cursor = text.find('|').expect("cursor");
+        let text = text.replace('|', "");
+        complete_redis(&text, cursor, keys, &History::default())
+            .expect("completion")
+            .items
+            .into_iter()
+            .map(|i| i.label)
+            .collect()
+    }
+
+    fn keyspace<'a>(listed: Option<&'a [DbObject]>) -> Keyspace<'a> {
+        Keyspace {
+            schema: "db0",
+            listed,
+            whole: true,
+            found: &[],
+        }
+    }
+
     #[test]
     fn redis_lines_complete_commands_and_keys() {
-        let labels = |c: Option<Completion>| -> Vec<String> {
-            c.expect("completion")
-                .items
-                .into_iter()
-                .map(|i| i.label)
-                .collect()
-        };
-        let got = labels(complete_redis("hge", 3, None, None));
+        let got = redis_labels("hge|", None);
         assert!(
             got.contains(&"HGET".to_owned()) && got.contains(&"HGETALL".to_owned()),
             "{got:?}"
         );
-        let got = labels(complete_redis("CONFIG g", 8, None, None));
-        assert_eq!(got, ["GET"]);
+        assert_eq!(redis_labels("CONFIG g|", None)[0], "GET");
         let keys = [
             object("user:1", ObjectKind::Key),
             object("order:9", ObjectKind::Key),
         ];
-        let got = labels(complete_redis("GET us", 6, Some("db0"), Some(&keys)));
+        let space = keyspace(Some(&keys));
+        assert_eq!(redis_labels("GET us|", Some(&space)), ["user:1"]);
+        let got = redis_labels("AUTH secret\nMULTI\nHGETALL us|", Some(&space));
         assert_eq!(got, ["user:1"]);
-        let text = "AUTH secret
-MULTI
-HGETALL us";
-        let got = labels(complete_redis(text, text.len(), Some("db0"), Some(&keys)));
-        assert_eq!(got, ["user:1"]);
-        let waiting = complete_redis("GET us", 6, Some("db0"), None).expect("completion");
-        assert_eq!(waiting.needs, [Need::Keys("db0".into())]);
-        assert!(complete_redis("SET k \"open", 11, None, None).is_none());
+        let waiting = keyspace(None);
+        let got = complete_redis("GET us", 6, Some(&waiting), &History::default());
+        assert_eq!(got.expect("completion").needs[0], Need::Keys("db0".into()));
+    }
+
+    #[test]
+    fn redis_results_are_ranked() {
+        // Prefix before fuzzy, shorter first among prefixes.
+        let got = redis_labels("hget|", None);
+        assert_eq!(got[..2], ["HGET", "HGETALL"]);
+        // Keys match in any case, and go in as the database has them.
+        let keys = [
+            object("session:9", ObjectKind::Key),
+            object("User:1", ObjectKind::Key),
+        ];
+        let space = keyspace(Some(&keys));
+        let completion =
+            complete_redis("GET us", 6, Some(&space), &History::default()).expect("completion");
+        assert_eq!(completion.items[0].insert, "User:1");
+        // What was accepted lately comes first among equals.
+        let mut history = History::default();
+        let both = complete_redis("GET ", 4, Some(&space), &history).expect("completion");
+        let last = both.items.last().expect("item").clone();
+        history.accepted(&last);
+        let again = complete_redis("GET ", 4, Some(&space), &history).expect("completion");
+        assert_eq!(again.items[0], last);
+    }
+
+    #[test]
+    fn redis_keys_only_where_a_command_takes_one() {
+        let keys = [object("user:1", ObjectKind::Key)];
+        let space = keyspace(Some(&keys));
+        let has_key = |text: &str| redis_labels(text, Some(&space)).contains(&"user:1".to_owned());
+        assert!(has_key("GET |"));
+        assert!(!has_key("GET user:1 |"));
+        assert!(has_key("SET |"));
+        assert!(!has_key("SET user:1 |"));
+        assert!(has_key("MSET a 1 |"));
+        assert!(!has_key("MSET a 1 b |"));
+        assert!(has_key("DEL a b |"));
+        assert!(has_key("HGET |"));
+        assert!(!has_key("HGET user:1 |"));
+        assert!(has_key("OBJECT ENCODING |"));
+        assert!(!has_key("SET k v |"));
+        // A command Violet does not know takes nothing for granted.
+        assert!(!has_key("FROBNICATE |"));
+        // A quoted argument with a blank counts once.
+        assert!(!has_key("SET \"a b\" |"));
+    }
+
+    #[test]
+    fn redis_keys_not_listed_are_looked_up() {
+        let keys = [object("user:1", ObjectKind::Key)];
+        let mut space = keyspace(Some(&keys));
+        space.whole = false;
+        let needs = |space: &Keyspace<'_>| {
+            complete_redis("GET or", 6, Some(space), &History::default())
+                .expect("completion")
+                .needs
+        };
+        assert_eq!(
+            needs(&space),
+            [Need::KeysMatching("db0".into(), "or".into())]
+        );
+        // Asked for and on its way: still waiting on it.
+        let pending = [("or", None)];
+        space.found = &pending;
+        assert_eq!(needs(&space).len(), 1);
+        // Found under a shorter prefix: done, and offered.
+        let order = [object("order:9", ObjectKind::Key)];
+        let done = [("o", Some(&order[..]))];
+        space.found = &done;
+        assert!(needs(&space).is_empty());
+        let got = redis_labels("GET or|", Some(&space));
+        assert_eq!(got, ["order:9"]);
+        assert_eq!(key_glob("a*b?[c]\\"), "a\\*b\\?\\[c]\\\\*");
+    }
+
+    #[test]
+    fn redis_quotes_respect_escapes() {
+        assert!(in_quotes("SET k \"open"));
+        assert!(!in_quotes("SET k \"a \\\" b\" "));
+        assert!(in_quotes("SET k \"a \\\""));
+        assert!(!in_quotes("SET k \"it's\" "));
+        assert!(!in_quotes("SET k 'say \"hi\"' "));
+        assert!(in_quotes("SET k 'it\\'s"));
+        assert!(complete_redis("SET k \"open", 11, None, &History::default()).is_none());
+        assert!(complete_redis("SET k \"it's\" ", 13, None, &History::default()).is_some());
+    }
+
+    #[test]
+    fn redis_multi_blocks_offer_their_end_first() {
+        let inside = redis_labels("MULTI\nSET a 1\n|", None);
+        assert_eq!(inside[..2], ["DISCARD", "EXEC"]);
+        assert!(!inside.contains(&"MULTI".to_owned()));
+        let after = redis_labels("MULTI\nSET a 1\nEXEC\nmu|", None);
+        assert_eq!(after[0], "MULTI");
+    }
+
+    #[test]
+    fn redis_words_run_through_colons_dashes_and_dots() {
+        let keys = [object("user:1:name", ObjectKind::Key)];
+        let space = keyspace(Some(&keys));
+        let completion = complete_redis(
+            "GET user:1:na-x.y rest",
+            12,
+            Some(&space),
+            &History::default(),
+        )
+        .expect("completion");
+        assert_eq!(completion.range, 4..17);
+        assert_eq!(completion.prefix, "user:1:n");
+        assert!(redis_word(':') && redis_word('-') && redis_word('.'));
+        assert!(!redis_word(' ') && !redis_word('"'));
     }
 
     #[test]
@@ -2690,7 +2943,10 @@ HGETALL us";
                 .insert
         };
         assert_eq!(keyword(KeywordCase::Typed, "sel|"), "select");
-        assert_eq!(keyword(KeywordCase::Typed, "|"), keyword(KeywordCase::Upper, "|"));
+        assert_eq!(
+            keyword(KeywordCase::Typed, "|"),
+            keyword(KeywordCase::Upper, "|")
+        );
         assert_eq!(keyword(KeywordCase::Upper, "sel|"), "SELECT");
         assert_eq!(keyword(KeywordCase::Lower, "SEL|"), "select");
     }

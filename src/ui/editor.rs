@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use egui::text::{CCursor, CCursorRange, LayoutJob};
 use egui::{CornerRadius, Id, Key, Modifiers, Sense, Stroke, TextFormat, Ui, Vec2};
-use violet_core::{ConnectionId, DbObject, Language};
+use violet_core::{ConnectionId, Language};
 
 use super::action::Action;
 use super::icons::Icon;
@@ -382,8 +382,8 @@ pub struct Assist<'a> {
     pub catalog: &'a dyn Catalog,
     pub options: completion::Options<'a>,
     /// For a key-value store: the database the editor is on, and its keys
-    /// listed so far.
-    pub keys: Option<(&'a str, Option<&'a [DbObject]>)>,
+    /// known so far.
+    pub keys: Option<completion::Keyspace<'a>>,
 }
 
 const ROW_HEIGHT: f32 = 24.0;
@@ -774,12 +774,13 @@ fn follow(
     if changed {
         // Typing a name or a dot opens it, anything else closes it.
         let typed = sql[..cursor.min(sql.len())].chars().next_back();
-        // Redis keys go on through `:` and `-`, as in `user:1`.
+        // Redis words go on through `:`, `-` and `.`, as in `user:1:name`.
         let word = |c: char| {
-            c.is_alphanumeric()
-                || c == '_'
-                || c == '.'
-                || (language == Language::Redis && matches!(c, ':' | '-'))
+            if language == Language::Redis {
+                completion::redis_word(c)
+            } else {
+                c.is_alphanumeric() || c == '_' || c == '.'
+            }
         };
         // SQL also opens it where a table or column is sure to follow.
         let sql_slot = !matches!(language, Language::Redis | Language::Mongodb)
@@ -808,14 +809,11 @@ fn refresh(
     assist: &Assist<'_>,
     actions: &mut Vec<Action>,
 ) {
-    let stale = popup
-        .completion
-        .as_ref()
-        .is_none_or(|completion| {
-            popup.cursor != cursor
-                || popup.connection != assist.connection
-                || !completion.needs.is_empty()
-        });
+    let stale = popup.completion.as_ref().is_none_or(|completion| {
+        popup.cursor != cursor
+            || popup.connection != assist.connection
+            || !completion.needs.is_empty()
+    });
     if !stale {
         return;
     }
@@ -825,10 +823,9 @@ fn refresh(
     popup.cursor = cursor;
     popup.connection = assist.connection;
     let completed = match (assist.language, assist.keys) {
-        (Language::Redis, Some((schema, keys))) => {
-            completion::complete_redis(sql, cursor, Some(schema), keys)
+        (Language::Redis, _) => {
+            completion::complete_redis(sql, cursor, assist.keys.as_ref(), assist.options.history)
         }
-        (Language::Redis, None) => completion::complete_redis(sql, cursor, None, None),
         (Language::Mongodb, _) => {
             let schema = assist.options.search.first().map(String::as_str);
             let collections = schema.and_then(|schema| assist.catalog.objects(schema));
