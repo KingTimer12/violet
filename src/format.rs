@@ -7,6 +7,7 @@
 //! again and compared with the source, token by token; any other
 //! difference refuses the formatting instead of changing the script.
 
+use crate::dialect::Family;
 use crate::sql::{self, TokenKind};
 
 const INDENT: &str = "    ";
@@ -91,12 +92,12 @@ pub enum Refused {
     Changed,
 }
 
-/// `source` formatted. `mysql` reads backticks as quotes and `#` as a line
-/// comment, as MySQL does.
-pub fn format(source: &str, mysql: bool) -> Result<String, Refused> {
-    let tokens = significant(source, mysql);
+/// `source` formatted as `family` reads it: MySQL has backticks and `#`
+/// comments, SQLite backticks and `[names]`, and each adds reserved words.
+pub fn format(source: &str, family: Family) -> Result<String, Refused> {
+    let tokens = significant(source, family);
     // MySQL reads `"…"` as a string too, by default.
-    if mysql
+    if family.escapes_with_backslash()
         && tokens.iter().any(|token| {
             (token.kind == TokenKind::String || token.text.starts_with('"'))
                 && token.text.contains('\\')
@@ -105,12 +106,13 @@ pub fn format(source: &str, mysql: bool) -> Result<String, Refused> {
         return Err(Refused::Backslash);
     }
     let mut writer = Writer::default();
+    writer.family = family;
     writer.write(&tokens);
     let mut out = writer.out.trim_end().to_owned();
     if source.ends_with('\n') {
         out.push('\n');
     }
-    if same_tokens(source, &out, mysql) {
+    if same_tokens(source, &out, family) {
         Ok(out)
     } else {
         Err(Refused::Changed)
@@ -141,9 +143,10 @@ impl Token<'_> {
     }
 }
 
-/// The tokens of `source` but whitespace. In MySQL a backticked name is one
-/// quoted token and `#` starts a comment.
-fn significant(source: &str, mysql: bool) -> Vec<Token<'_>> {
+/// The tokens of `source` but whitespace. Where `family` has them, a
+/// backticked or bracketed name is one quoted token and `#` starts a
+/// comment.
+fn significant(source: &str, family: Family) -> Vec<Token<'_>> {
     let mut out = Vec::new();
     let mut space = "";
     let mut skip_to = 0;
@@ -157,11 +160,15 @@ fn significant(source: &str, mysql: bool) -> Vec<Token<'_>> {
                 space = text;
                 continue;
             }
-            (TokenKind::Operator, "`") if mysql => (
+            (TokenKind::Operator, "`") if family.backtick_quotes() => (
                 TokenKind::QuotedIdentifier,
                 backticked_end(source, token.range.end),
             ),
-            (TokenKind::Operator, "#") if mysql => {
+            (TokenKind::Punctuation, "[") if family.bracket_quotes() => (
+                TokenKind::QuotedIdentifier,
+                bracketed_end(source, token.range.end),
+            ),
+            (TokenKind::Operator, "#") if family.hash_comments() => {
                 let end = source[token.range.start..]
                     .find('\n')
                     .map_or(source.len(), |at| token.range.start + at);
@@ -195,12 +202,25 @@ fn backticked_end(source: &str, mut from: usize) -> usize {
     source.len()
 }
 
+/// Where a bracketed name that opens before `from` ends: past its closing
+/// bracket, a doubled one standing for a bracket inside.
+fn bracketed_end(source: &str, mut from: usize) -> usize {
+    while let Some(at) = source[from..].find(']') {
+        let end = from + at + 1;
+        if !source[end..].starts_with(']') {
+            return end;
+        }
+        from = end + 1;
+    }
+    source.len()
+}
+
 /// Whether `formatted` reads as `source`: the same tokens, reserved words
 /// in any case. Quoted tokens next to each other keep whether they touch:
 /// `'a''b'` is one string, `'a' 'b'` two.
-fn same_tokens(source: &str, formatted: &str, mysql: bool) -> bool {
-    let a = significant(source, mysql);
-    let b = significant(formatted, mysql);
+fn same_tokens(source: &str, formatted: &str, family: Family) -> bool {
+    let a = significant(source, family);
+    let b = significant(formatted, family);
     let quoted =
         |token: &Token<'_>| matches!(token.kind, TokenKind::String | TokenKind::QuotedIdentifier);
     a.len() == b.len()
@@ -243,6 +263,8 @@ struct Paren {
 #[derive(Default)]
 struct Writer {
     out: String,
+    /// Whose reserved words are written in upper case.
+    family: Family,
     /// The indentation of the statement's clauses.
     indent: usize,
     clause: Clause,
@@ -446,12 +468,12 @@ impl Writer {
     /// Writes `token` after the space it takes.
     fn emit(&mut self, token: Token<'_>, prev: Option<Token<'_>>, next: Option<Token<'_>>) {
         self.space(token, prev, next);
+        let word = token.text.to_ascii_uppercase();
         let upper = matches!(token.kind, TokenKind::Keyword)
-            && UPPER
-                .binary_search(&token.text.to_ascii_uppercase().as_str())
-                .is_ok();
+            && (UPPER.binary_search(&word.as_str()).is_ok()
+                || self.family.reserved().contains(&word.as_str()));
         if upper {
-            self.out.push_str(&token.text.to_ascii_uppercase());
+            self.out.push_str(&word);
         } else {
             self.out.push_str(token.text);
         }
@@ -484,6 +506,8 @@ impl Writer {
             // Calls and casts, `count(*)`, `varchar(20)`: a parenthesis
             // glued to a word stays so.
             || token.text == "(" && token.kind == TokenKind::Punctuation && token.glued
+            // `tags[1]`: a subscript stays glued where brackets are not names.
+            || token.text == "[" && token.kind == TokenKind::Punctuation && token.glued
             || self.sign
             // `::`, `>=`, `<>`: operators written together stay together.
             || operator(prev) && operator(token) && token.glued && !sign
@@ -501,7 +525,7 @@ mod tests {
     use super::*;
 
     fn formatted(source: &str) -> String {
-        format(source, false).expect("formats")
+        format(source, Family::Other).expect("formats")
     }
 
     #[test]
@@ -546,18 +570,59 @@ mod tests {
     #[test]
     fn mysql_quotes_and_comments_are_kept() {
         assert_eq!(
-            format("select `order`, @x from `my table` # note\nwhere a=1", true),
+            format("select `order`, @x from `my table` # note\nwhere a=1", Family::MySql),
             Ok("SELECT\n    `order`,\n    @x\nFROM `my table` # note\nWHERE a = 1".to_owned())
         );
-        assert_eq!(format("select 'it\\'s'", true), Err(Refused::Backslash));
+        assert_eq!(format("select 'it\\'s'", Family::MySql), Err(Refused::Backslash));
         assert_eq!(
-            format("select \"a\\\" , b\"", true),
+            format("select \"a\\\" , b\"", Family::MySql),
             Err(Refused::Backslash)
         );
         // A doubled backtick is one inside the name.
         assert_eq!(
-            format("select `a``b` from t", true),
+            format("select `a``b` from t", Family::MySql),
             Ok("SELECT\n    `a``b`\nFROM t".to_owned())
+        );
+    }
+
+    #[test]
+    fn each_family_reads_its_own_quotes_and_comments() {
+        // `#` is an operator in PostgreSQL: `#>` digs into JSON.
+        assert_eq!(
+            format("select a #> '{b}' from t", Family::Postgres),
+            Ok("SELECT\n    a #> '{b}'\nFROM t".to_owned())
+        );
+        // Backslashes are text outside MySQL.
+        assert_eq!(
+            format("select 'a\\' from t", Family::Postgres),
+            Ok("SELECT\n    'a\\'\nFROM t".to_owned())
+        );
+        assert_eq!(
+            format("select [my col], `x` from [t t]", Family::Sqlite),
+            Ok("SELECT\n    [my col],\n    `x`\nFROM [t t]".to_owned())
+        );
+        assert_eq!(
+            format("select [a]]b] from t", Family::Sqlite),
+            Ok("SELECT\n    [a]]b]\nFROM t".to_owned())
+        );
+        // Array subscripts are not names where brackets do not quote.
+        assert_eq!(
+            format("select a[1] from t", Family::Postgres),
+            Ok("SELECT\n    a[1]\nFROM t".to_owned())
+        );
+    }
+
+    #[test]
+    fn reserved_words_follow_the_family() {
+        let source = "select * from t where a ilike 'x' offset 5";
+        assert_eq!(
+            format(source, Family::Postgres),
+            Ok("SELECT\n    *\nFROM t\nWHERE a ILIKE 'x' OFFSET 5".to_owned())
+        );
+        // In MySQL `ilike` and `offset` may name columns.
+        assert_eq!(
+            format(source, Family::MySql),
+            Ok("SELECT\n    *\nFROM t\nWHERE a ilike 'x' offset 5".to_owned())
         );
     }
 

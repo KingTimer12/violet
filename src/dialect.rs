@@ -28,6 +28,35 @@ impl Family {
         }
     }
 
+    /// A backtick quotes a name.
+    pub fn backtick_quotes(self) -> bool {
+        matches!(self, Self::MySql | Self::Sqlite)
+    }
+
+    /// `[name]` quotes a name, which SQLite accepts for SQL Server's sake.
+    pub fn bracket_quotes(self) -> bool {
+        self == Self::Sqlite
+    }
+
+    /// `#` starts a line comment.
+    pub fn hash_comments(self) -> bool {
+        self == Self::MySql
+    }
+
+    /// A backslash escapes a quote inside a string.
+    pub fn escapes_with_backslash(self) -> bool {
+        self == Self::MySql
+    }
+
+    /// Words reserved here beyond the ones every family reserves, sorted.
+    pub fn reserved(self) -> &'static [&'static str] {
+        match self {
+            Self::Postgres => &["FETCH", "ILIKE", "OFFSET", "RETURNING"],
+            Self::Sqlite => &["OFFSET", "RETURNING"],
+            Self::MySql | Self::Other => &[],
+        }
+    }
+
     /// Statements offered at the start of one.
     pub fn starts(self) -> Vec<&'static str> {
         let only: &[&str] = match self {
@@ -386,6 +415,13 @@ impl Family {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reserved_words_are_sorted() {
+        for family in [Family::Postgres, Family::MySql, Family::Sqlite, Family::Other] {
+            assert!(family.reserved().windows(2).all(|pair| pair[0] < pair[1]));
+        }
+    }
 
     #[test]
     fn each_database_gets_its_own_words() {

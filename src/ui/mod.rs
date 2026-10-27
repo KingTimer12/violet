@@ -1608,11 +1608,11 @@ impl VioletApp {
     /// Formats an editor's selection, or its whole script, keeping the
     /// formatted text selected.
     fn format_sql(&mut self, ctx: &egui::Context, tab_id: TabId) {
-        let mysql = self
+        let family = self
             .workspace
             .get(tab_id)
             .and_then(|tab| tab.connection)
-            .is_some_and(|id| self.dialect(id).quote_open == '`');
+            .map_or_else(Default::default, |id| self.family(id));
         let Some(tab) = self.workspace.get_mut(tab_id) else {
             return;
         };
@@ -1624,7 +1624,7 @@ impl VioletApp {
         let Some(source) = tab.sql.get(range.clone()) else {
             return;
         };
-        let formatted = match crate::format::format(source, mysql) {
+        let formatted = match crate::format::format(source, family) {
             Ok(formatted) => formatted,
             Err(refused) => {
                 let why = match refused {
