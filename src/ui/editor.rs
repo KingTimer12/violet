@@ -1022,15 +1022,24 @@ fn insert(
     popup.close();
     let item = completion.items.get(index)?;
     let range = completion.range.start.min(sql.len())..completion.range.end.min(sql.len());
-    sql.replace_range(range.clone(), &item.insert);
-    *snippet = Snippet::new(range.start + item.caret, &item.stops, sql.len());
-    let caret = sql[..range.start + item.caret].chars().count();
+    let (stops, caret) = place(sql, range, item);
+    *snippet = stops;
+    let caret = sql[..caret].chars().count();
     let mut state = egui::text_edit::TextEditState::load(ctx, text_id).unwrap_or_default();
     state
         .cursor
         .set_char_range(Some(CCursorRange::one(CCursor::new(caret))));
     state.store(ctx, text_id);
     Some(item.clone())
+}
+
+/// Replaces `range` of `sql` with `item`, and returns the stops Tab visits
+/// after it and the byte offset of the caret.
+fn place(sql: &mut String, range: Range<usize>, item: &Item) -> (Option<Snippet>, usize) {
+    sql.replace_range(range.clone(), &item.insert);
+    // `caret` and `stops` are offsets into the inserted text.
+    let stops = Snippet::new(range.start, &item.stops, sql.len());
+    (stops, range.start + item.caret)
 }
 
 fn kind_style(kind: Kind, palette: &Palette) -> (Icon, egui::Color32) {
@@ -1231,6 +1240,87 @@ mod tests {
         assert!(!opened("FROM ", Language::Redis));
         assert!(!opened("db.find({ FROM ", Language::Mongodb));
         assert!(opened("db.", Language::Mongodb));
+    }
+
+    /// One table, `t(a, b, c)`, in `public`.
+    struct Table {
+        schemas: Vec<String>,
+        objects: Vec<DbObject>,
+        columns: Vec<ColumnInfo>,
+    }
+
+    impl Table {
+        fn new() -> Self {
+            let column = |name: &str| ColumnInfo {
+                name: name.into(),
+                data_type: "integer".into(),
+                nullable: true,
+                default: None,
+                primary_key: false,
+                comment: None,
+            };
+            Self {
+                schemas: vec!["public".into()],
+                objects: vec![DbObject {
+                    schema: "public".into(),
+                    name: "t".into(),
+                    kind: violet_core::ObjectKind::Table,
+                    comment: None,
+                    estimated_rows: None,
+                    subtype: None,
+                    detail: None,
+                }],
+                columns: vec![column("a"), column("b"), column("c")],
+            }
+        }
+    }
+
+    impl Catalog for Table {
+        fn schemas(&self) -> &[String] {
+            &self.schemas
+        }
+        fn objects(&self, _: &str) -> Option<&[DbObject]> {
+            Some(&self.objects)
+        }
+        fn columns(&self, _: &str, _: &str) -> Option<&[ColumnInfo]> {
+            Some(&self.columns)
+        }
+        fn foreign_keys(&self, _: &str) -> Option<&[ForeignKey]> {
+            None
+        }
+    }
+
+    #[test]
+    fn an_inserted_template_keeps_every_stop_at_its_place() {
+        let catalog = Table::new();
+        let history = History::default();
+        let search = vec!["public".to_owned()];
+        let quote = |name: &str| name.to_owned();
+        let options = Options {
+            search: &search,
+            database: None,
+            quote: &quote,
+            family: Family::Other,
+            case: KeywordCase::default(),
+            history: &history,
+        };
+        let mut sql = "INSERT INTO t ".to_owned();
+        let completion =
+            completion::complete(&sql, sql.len(), &catalog, &options).expect("completion");
+        let item = completion
+            .items
+            .iter()
+            .find(|item| item.detail == "template")
+            .expect("template");
+        let (stops, caret) = place(&mut sql, completion.range.clone(), item);
+        assert_eq!(&sql[..caret], "INSERT INTO t (a, b, c) VALUES (");
+        let mut stops = stops.expect("stops");
+        // Each Tab lands at the next value, not shifted by the caret.
+        let second = stops.next(caret).expect("second");
+        assert_eq!(&sql[..second], "INSERT INTO t (a, b, c) VALUES (, ");
+        let third = stops.next(second).expect("third");
+        assert_eq!(&sql[..third], "INSERT INTO t (a, b, c) VALUES (, , ");
+        assert!(stops.is_empty());
     }
 
     use std::cell::Cell;
