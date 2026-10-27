@@ -630,6 +630,22 @@ pub fn plan(source: &str) -> Plan {
     }
 }
 
+/// Whether a statement of `source` changes the schema (`CREATE`, `ALTER`,
+/// `DROP`, `RENAME`, `TRUNCATE`), so what was loaded about it is stale.
+#[must_use]
+pub fn changes_schema(source: &str) -> bool {
+    statements(source).iter().any(|range| {
+        words(&source[range.clone()])
+            .first()
+            .is_some_and(|(word, _)| {
+                matches!(
+                    word.as_str(),
+                    "CREATE" | "ALTER" | "DROP" | "RENAME" | "TRUNCATE"
+                )
+            })
+    })
+}
+
 /// What `source`'s own transaction statements do: `BEGIN` and
 /// `START TRANSACTION` open one; `COMMIT`, `END`, `ROLLBACK` and `ABORT`
 /// end it, except a rollback to a savepoint, a prepared transaction's, or a
@@ -1148,6 +1164,16 @@ mod tests {
         assert!(!plan("SELECT now()").cacheable);
         assert!(!plan("DELETE FROM t").reads_only);
         assert!(!plan("SELECT 1; UPDATE t SET a = 1").reads_only);
+    }
+
+    #[test]
+    fn ddl_changes_the_schema() {
+        assert!(changes_schema("CREATE TABLE t (a int)"));
+        assert!(changes_schema("select 1; drop table t"));
+        assert!(changes_schema("-- note\nALTER TABLE t ADD b int"));
+        assert!(!changes_schema("SELECT 1"));
+        assert!(!changes_schema("INSERT INTO t VALUES (1)"));
+        assert!(!changes_schema("SELECT 'drop table t'"));
     }
 
     fn kinds(source: &str) -> Vec<(TokenKind, &str)> {

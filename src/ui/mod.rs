@@ -820,6 +820,12 @@ impl VioletApp {
                             self.explorer.language(profile.driver.as_str())
                         })
                 });
+                // DDL that ran leaves the loaded catalog behind.
+                let ddl = connection.filter(|_| {
+                    result.is_ok()
+                        && language == Language::Sql
+                        && crate::sql::changes_schema(&running.executed.sql)
+                });
                 // Runs from editors go to the history; pages and data tabs
                 // do not.
                 let entry = (!running.append && tab.data().is_none()).then(|| HistoryEntry {
@@ -912,6 +918,9 @@ impl VioletApp {
                 });
                 if let Some(entry) = entry {
                     self.record(entry);
+                }
+                if let Some(id) = ddl {
+                    self.reload_catalog(id);
                 }
             }
             Event::Counted { request, result } => {
@@ -1007,6 +1016,17 @@ impl VioletApp {
                     };
                 }
             }
+        }
+    }
+
+    /// Forgets what was loaded for a connection and loads it again.
+    fn reload_catalog(&mut self, id: ConnectionId) {
+        self.explorer.forget(id);
+        self.explorer.schemas.insert(id, Loadable::Loading);
+        self.backend.load_schemas(id);
+        if self.shows_all_databases(id) {
+            self.explorer.databases.insert(id, Loadable::Loading);
+            self.backend.load_databases(id);
         }
     }
 
@@ -1853,15 +1873,7 @@ impl VioletApp {
                     self.open_task(id, kind, Vec::new());
                 }
             }
-            Action::Refresh(id) => {
-                self.explorer.forget(id);
-                self.explorer.schemas.insert(id, Loadable::Loading);
-                self.backend.load_schemas(id);
-                if self.shows_all_databases(id) {
-                    self.explorer.databases.insert(id, Loadable::Loading);
-                    self.backend.load_databases(id);
-                }
-            }
+            Action::Refresh(id) => self.reload_catalog(id),
             Action::LoadObjects(id, schema) => self.load_objects(id, schema),
             Action::LoadKeys(id, schema, more) => self.load_keys(id, schema, more),
             Action::KeyDialog {
