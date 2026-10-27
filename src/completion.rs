@@ -127,7 +127,8 @@ const HISTORY_SIZE: usize = 200;
 pub struct History {
     /// Counts acceptances; the higher, the more recent.
     clock: u64,
-    used: HashMap<(Kind, String), u64>,
+    /// By kind, then lower-cased key, so a lookup allocates nothing.
+    used: HashMap<Kind, HashMap<String, u64>>,
 }
 
 impl History {
@@ -135,24 +136,36 @@ impl History {
     pub fn accepted(&mut self, item: &Item) {
         self.clock += 1;
         self.used
-            .insert((item.kind, item.key.to_lowercase()), self.clock);
-        if self.used.len() > HISTORY_SIZE
-            && let Some(oldest) = self
+            .entry(item.kind)
+            .or_default()
+            .insert(item.key.to_lowercase(), self.clock);
+        if self.used.values().map(HashMap::len).sum::<usize>() > HISTORY_SIZE
+            && let Some((kind, oldest)) = self
                 .used
                 .iter()
-                .min_by_key(|(_, at)| **at)
-                .map(|(key, _)| key.clone())
+                .flat_map(|(kind, keys)| keys.iter().map(move |(key, at)| (*kind, key, *at)))
+                .min_by_key(|(.., at)| *at)
+                .map(|(kind, key, _)| (kind, key.clone()))
+            && let Some(keys) = self.used.get_mut(&kind)
         {
-            self.used.remove(&oldest);
+            keys.remove(&oldest);
         }
     }
 
-    /// When `item` was last accepted; 0 when never.
-    fn recency(&self, item: &Item) -> u64 {
-        self.used
-            .get(&(item.kind, item.key.to_lowercase()))
-            .copied()
-            .unwrap_or(0)
+    /// When an item of `kind` called `key` was last accepted; 0 when never.
+    fn recency(&self, kind: Kind, key: &str) -> u64 {
+        if self.used.is_empty() {
+            return 0;
+        }
+        let Some(keys) = self.used.get(&kind) else {
+            return 0;
+        };
+        let at = if key.bytes().any(|b| b.is_ascii_uppercase()) || !key.is_ascii() {
+            keys.get(&key.to_lowercase())
+        } else {
+            keys.get(key)
+        };
+        at.copied().unwrap_or(0)
     }
 }
 
@@ -731,13 +744,15 @@ pub fn complete(
         cursor: qualified_start,
         alias_tables,
         items: Vec::new(),
+        pending: Vec::new(),
+        taken: Vec::new(),
         needs: Vec::new(),
         prefix: &text[start..cursor],
     };
     builder.fill(&context);
     let prefix = text[start..cursor].to_owned();
     let relation = matches!(context, Context::Relation { .. });
-    let mut items = rank(builder.items, &prefix, options.history, relation);
+    let mut items = builder.ranked(relation);
     if items.len() == 1 && items[0].insert.eq_ignore_ascii_case(&prefix) {
         items.clear();
     }
@@ -1817,8 +1832,23 @@ struct Builder<'a> {
     /// Tables are inserted with an alias: `usuarios u`.
     alias_tables: bool,
     items: Vec<Item>,
+    /// Catalog tables and views that match, built into items only if they
+    /// rank among the first [`MAX_ITEMS`].
+    pending: Vec<Pending<'a>>,
+    /// The aliases [`Self::build`] avoids.
+    taken: Vec<String>,
     needs: Vec<Need>,
     prefix: &'a str,
+}
+
+/// A catalog table or view that matches what was typed, not built yet.
+struct Pending<'a> {
+    kind: Kind,
+    schema: &'a str,
+    name: &'a str,
+    /// Listed as `schema.name`.
+    qualified: bool,
+    score: u8,
 }
 
 impl<'a> Builder<'a> {
@@ -1876,19 +1906,63 @@ impl<'a> Builder<'a> {
         detail: String,
         key: String,
     ) {
+        self.items
+            .push(Self::item(kind, label, insert, detail, key));
+    }
+
+    fn item(kind: Kind, label: String, insert: String, detail: String, key: String) -> Item {
         let caret = if insert.ends_with("()") {
             insert.len() - 1
         } else {
             insert.len()
         };
-        self.items.push(Item {
+        Item {
             label,
             insert,
             caret,
             kind,
             detail,
             key,
-        });
+        }
+    }
+
+    /// Builds a pending table or view into its item.
+    fn build(&self, pending: &Pending<'_>) -> Item {
+        let (label, insert) = if pending.qualified {
+            (
+                format!("{}.{}", pending.schema, pending.name),
+                format!(
+                    "{}.{}",
+                    self.ident(pending.schema),
+                    self.ident(pending.name)
+                ),
+            )
+        } else {
+            (pending.name.to_owned(), self.ident(pending.name))
+        };
+        let (label, insert) = self.aliased_among(&self.taken, label, insert, pending.name);
+        Self::item(
+            pending.kind,
+            label,
+            insert,
+            pending.schema.to_owned(),
+            pending.name.to_owned(),
+        )
+    }
+
+    /// The items, best first: what was built, and the pending ones that rank
+    /// high enough to be built at all.
+    fn ranked(&mut self, relation: bool) -> Vec<Item> {
+        let items = std::mem::take(&mut self.items);
+        let pending = std::mem::take(&mut self.pending);
+        rank_pending(
+            items,
+            pending,
+            &|pending| self.build(pending),
+            self.prefix,
+            self.options.history,
+            relation,
+        )
     }
 
     /// A keyword in the case the settings ask for: by default the case the
@@ -2069,7 +2143,7 @@ impl<'a> Builder<'a> {
         // The catalog outlives the builder: its lists are read in place, and
         // names that cannot match what is typed are not built at all.
         let (catalog, options, prefix) = (self.catalog, self.options, self.prefix);
-        let taken = self.taken();
+        self.taken = self.taken();
         for schema in options.search {
             let objects = catalog.objects(schema);
             if objects.is_none() {
@@ -2077,12 +2151,15 @@ impl<'a> Builder<'a> {
             }
             for object in objects.unwrap_or_default() {
                 if let Some(kind) = relation_kind(object.kind)
-                    && score(&object.name, prefix).is_some()
+                    && let Some(score) = score(&object.name, prefix)
                 {
-                    let insert = self.ident(&object.name);
-                    let (label, insert) =
-                        self.aliased_among(&taken, object.name.clone(), insert, &object.name);
-                    self.push_keyed(kind, label, insert, schema.clone(), object.name.clone());
+                    self.pending.push(Pending {
+                        kind,
+                        schema,
+                        name: &object.name,
+                        qualified: false,
+                        score,
+                    });
                 }
             }
         }
@@ -2094,13 +2171,15 @@ impl<'a> Builder<'a> {
                 }
                 for object in catalog.objects(schema).unwrap_or_default() {
                     if let Some(kind) = relation_kind(object.kind)
-                        && score(&object.name, prefix).is_some()
+                        && let Some(score) = score(&object.name, prefix)
                     {
-                        let insert = format!("{}.{}", self.ident(schema), self.ident(&object.name));
-                        let label = format!("{schema}.{}", object.name);
-                        let (label, insert) =
-                            self.aliased_among(&taken, label, insert, &object.name);
-                        self.push_keyed(kind, label, insert, schema.clone(), object.name.clone());
+                        self.pending.push(Pending {
+                            kind,
+                            schema,
+                            name: &object.name,
+                            qualified: true,
+                            score,
+                        });
                     }
                 }
             }
@@ -2612,6 +2691,9 @@ fn score(key: &str, prefix: &str) -> Option<u8> {
     if prefix.is_empty() {
         return Some(0);
     }
+    if key.is_ascii() && prefix.is_ascii() {
+        return score_ascii(key.as_bytes(), prefix.as_bytes());
+    }
     let key = key.to_lowercase();
     let prefix = prefix.to_lowercase();
     if key.starts_with(&prefix) {
@@ -2629,6 +2711,34 @@ fn score(key: &str, prefix: &str) -> Option<u8> {
     prefix
         .chars()
         .all(|wanted| letters.any(|c| c == wanted))
+        .then_some(2)
+}
+
+/// [`score`] for ASCII, which allocates nothing: it runs for every name in a
+/// large catalog.
+fn score_ascii(key: &[u8], prefix: &[u8]) -> Option<u8> {
+    let starts = |part: &[u8]| {
+        part.len() >= prefix.len() && part[..prefix.len()].eq_ignore_ascii_case(prefix)
+    };
+    if starts(key) {
+        return Some(0);
+    }
+    let mut initials = key
+        .split(|b| *b == b'_')
+        .filter_map(|part| part.first().copied());
+    if key.split(|b| *b == b'_').skip(1).any(starts)
+        || prefix.iter().all(|wanted| {
+            initials
+                .next()
+                .is_some_and(|c| c.eq_ignore_ascii_case(wanted))
+        })
+    {
+        return Some(1);
+    }
+    let mut letters = key.iter();
+    prefix
+        .iter()
+        .all(|wanted| letters.any(|c| c.eq_ignore_ascii_case(wanted)))
         .then_some(2)
 }
 
@@ -2652,40 +2762,137 @@ fn kind_order(kind: Kind, relation: bool) -> (bool, Kind) {
 /// Best matches first, the latest accepted first among them; with nothing
 /// typed, each kind keeps its own order (columns as the table has them).
 fn rank(items: Vec<Item>, prefix: &str, history: &History, relation: bool) -> Vec<Item> {
-    // What the comparison reads is worked out once per item, not once per
-    // comparison: a large catalog sorts thousands of them.
-    let mut scored: Vec<(u8, u64, String, Item)> = items
-        .into_iter()
-        .filter_map(|item| {
-            let score = score(&item.key, prefix)?;
-            let recency = history.recency(&item);
-            let label = if prefix.is_empty() {
+    rank_pending(
+        items,
+        Vec::new(),
+        &|_| unreachable!(),
+        prefix,
+        history,
+        relation,
+    )
+}
+
+/// One candidate of [`rank_pending`], with what the comparison reads worked
+/// out once, not once per comparison: a large catalog sorts thousands.
+struct Ranked<'a> {
+    score: u8,
+    recency: u64,
+    order: (bool, Kind),
+    key_len: usize,
+    /// Where it came in, to keep equal candidates in that order.
+    seq: usize,
+    /// The label, lower-cased, of a built item.
+    label: String,
+    entry: Entry<'a>,
+}
+
+enum Entry<'a> {
+    Built(Item),
+    Pending(Pending<'a>),
+    /// Taken already.
+    Done,
+}
+
+impl Ranked<'_> {
+    /// The label's characters, lower-cased, as [`Item::label`] would give.
+    fn label_chars(&self) -> impl Iterator<Item = char> + '_ {
+        let (schema, name) = match &self.entry {
+            Entry::Pending(p) => (p.qualified.then_some(p.schema), p.name),
+            _ => (None, ""),
+        };
+        schema
+            .into_iter()
+            .flat_map(|schema| {
+                schema
+                    .chars()
+                    .flat_map(char::to_lowercase)
+                    .chain(std::iter::once('.'))
+            })
+            .chain(name.chars().flat_map(char::to_lowercase))
+            .chain(self.label.chars())
+    }
+}
+
+/// [`rank`] for built items and for catalog tables not built yet: those are
+/// ranked on references, and only the first [`MAX_ITEMS`] are built.
+fn rank_pending<'a>(
+    items: Vec<Item>,
+    pending: Vec<Pending<'a>>,
+    build: &dyn Fn(&Pending<'a>) -> Item,
+    prefix: &str,
+    history: &History,
+    relation: bool,
+) -> Vec<Item> {
+    let mut ranked: Vec<Ranked<'a>> = Vec::with_capacity(items.len() + pending.len());
+    for item in items {
+        let Some(score) = score(&item.key, prefix) else {
+            continue;
+        };
+        ranked.push(Ranked {
+            score,
+            recency: history.recency(item.kind, &item.key),
+            order: kind_order(item.kind, relation),
+            key_len: item.key.len(),
+            seq: ranked.len(),
+            label: if prefix.is_empty() {
                 String::new()
             } else {
                 item.label.to_lowercase()
-            };
-            Some((score, recency, label, item))
-        })
-        .collect();
-    scored.sort_by(|(a, recent_x, label_x, x), (b, recent_y, label_y, y)| {
-        let order = a
-            .cmp(b)
-            .then_with(|| recent_y.cmp(recent_x))
-            .then(kind_order(x.kind, relation).cmp(&kind_order(y.kind, relation)));
+            },
+            entry: Entry::Built(item),
+        });
+    }
+    for pending in pending {
+        ranked.push(Ranked {
+            score: pending.score,
+            recency: history.recency(pending.kind, pending.name),
+            order: kind_order(pending.kind, relation),
+            key_len: pending.name.len(),
+            seq: ranked.len(),
+            label: String::new(),
+            entry: Entry::Pending(pending),
+        });
+    }
+    let compare = |x: &Ranked<'_>, y: &Ranked<'_>| {
+        let order = x
+            .score
+            .cmp(&y.score)
+            .then_with(|| y.recency.cmp(&x.recency))
+            .then(x.order.cmp(&y.order));
         if prefix.is_empty() {
-            return order;
+            return order.then(x.seq.cmp(&y.seq));
         }
         order
-            .then(x.key.len().cmp(&y.key.len()))
-            .then_with(|| label_x.cmp(label_y))
-    });
+            .then(x.key_len.cmp(&y.key_len))
+            .then_with(|| x.label_chars().cmp(y.label_chars()))
+            .then(x.seq.cmp(&y.seq))
+    };
+    // Sort only as far as the list needs: the best few, and more if
+    // duplicates leave it short.
     let mut seen = HashSet::new();
-    scored
-        .into_iter()
-        .map(|(.., item)| item)
-        .filter(|item| seen.insert(item.insert.clone()))
-        .take(MAX_ITEMS)
-        .collect()
+    let mut out = Vec::with_capacity(MAX_ITEMS.min(ranked.len()));
+    let (mut sorted, mut next) = (0, 0);
+    while out.len() < MAX_ITEMS && next < ranked.len() {
+        if next == sorted {
+            let upto = (sorted + (MAX_ITEMS - out.len()) * 2).min(ranked.len());
+            if upto < ranked.len() {
+                ranked[sorted..].select_nth_unstable_by(upto - sorted - 1, compare);
+            }
+            ranked[sorted..upto].sort_by(compare);
+            sorted = upto;
+        }
+        let entry = std::mem::replace(&mut ranked[next].entry, Entry::Done);
+        next += 1;
+        let item = match entry {
+            Entry::Built(item) => item,
+            Entry::Pending(pending) => build(&pending),
+            Entry::Done => continue,
+        };
+        if seen.insert(item.insert.clone()) {
+            out.push(item);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -3444,6 +3651,69 @@ mod tests {
         assert!(!inserts(&quoted).contains(&"total"));
         let exact = at(&shop, "SELECT tot| FROM \"orders\"");
         assert_eq!(inserts(&exact)[0], "total");
+    }
+
+    #[test]
+    fn only_the_best_items_of_a_large_catalog_are_built() {
+        let (fake, _) = large();
+        let found = at(&fake, "SELECT * FROM tab|");
+        assert_eq!(found.items.len(), MAX_ITEMS);
+        // The order is the one of ranking everything: shorter names first,
+        // then by label, which puts other schemas' qualified names first.
+        let mut all: Vec<(usize, String, String)> = fake
+            .objects
+            .iter()
+            .flat_map(|(schema, objects)| {
+                objects.iter().map(move |o| {
+                    let label = if schema == "public" {
+                        o.name.clone()
+                    } else {
+                        format!("{schema}.{}", o.name)
+                    };
+                    (o.name.len(), label, o.name.clone())
+                })
+            })
+            .collect();
+        all.sort();
+        let expected: Vec<&str> = all
+            .iter()
+            .take(MAX_ITEMS)
+            .map(|(.., n)| n.as_str())
+            .collect();
+        let keys: Vec<&str> = found.items.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, expected);
+        // What is built is complete: qualified, with its alias.
+        let first = &found.items[0];
+        assert_eq!(first.insert, "s1.table_1_0 t");
+        assert_eq!(first.detail, "s1");
+        // A typed word that matches little leaves a short list.
+        let few = at(&fake, "SELECT * FROM table_0_49|");
+        assert!(few.items.len() < MAX_ITEMS);
+        assert_eq!(few.items[0].insert, "table_0_49 t");
+    }
+
+    #[test]
+    fn duplicates_do_not_shorten_the_list() {
+        let mut fake = shop();
+        let many = (0..MAX_ITEMS + 50)
+            .map(|n| object(&format!("order_{n:04}"), ObjectKind::Table))
+            .collect();
+        fake.objects.insert("public".into(), many);
+        let found = at(&fake, "SELECT * FROM ord|");
+        assert_eq!(found.items.len(), MAX_ITEMS);
+        let mut seen = HashSet::new();
+        assert!(found.items.iter().all(|i| seen.insert(&i.insert)));
+    }
+
+    #[test]
+    fn scoring_ignores_case_without_changing_what_matches() {
+        assert_eq!(score("Order_Items", "ord"), Some(0));
+        assert_eq!(score("order_items", "ITEMS"), Some(1));
+        assert_eq!(score("order_items", "oi"), Some(1));
+        assert_eq!(score("order_items", "otm"), Some(2));
+        assert_eq!(score("order_items", "xyz"), None);
+        assert_eq!(score("Ação", "aç"), Some(0));
+        assert_eq!(score("anything", ""), Some(0));
     }
 
     #[test]
