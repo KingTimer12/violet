@@ -725,17 +725,7 @@ pub fn complete(
     let end = word_end(text, cursor);
     let (qualifiers, qualified_start, quoted) = qualifiers(text, start);
 
-    let after = separators
-        .iter()
-        .rfind(|separator| separator.end <= qualified_start)
-        .map_or(0, |separator| separator.end);
-    let until = separators
-        .iter()
-        .find(|separator| separator.start >= cursor)
-        .map_or(text.len(), |separator| separator.start);
-    let statement_start = significant.partition_point(|token| token.range.start < after);
-    let statement_end = significant.partition_point(|token| token.range.end <= until);
-    let statement = &significant[statement_start..statement_end.max(statement_start)];
+    let statement = statement_at(significant, separators, qualified_start, cursor);
     let before: Vec<&Token> = statement
         .iter()
         .filter(|token| token.range.end <= qualified_start)
@@ -786,6 +776,26 @@ pub fn complete(
         items,
         needs,
     })
+}
+
+/// The tokens of the statement that holds `from..until`.
+fn statement_at<'t>(
+    tokens: &'t [Token],
+    separators: &[Range<usize>],
+    from: usize,
+    until: usize,
+) -> &'t [Token] {
+    let after = separators
+        .iter()
+        .rfind(|separator| separator.end <= from)
+        .map_or(0, |separator| separator.end);
+    let until = separators
+        .iter()
+        .find(|separator| separator.start >= until)
+        .map_or(usize::MAX, |separator| separator.start);
+    let first = tokens.partition_point(|token| token.range.start < after);
+    let last = tokens.partition_point(|token| token.range.end <= until);
+    &tokens[first..last.max(first)]
 }
 
 /// Whether the list opens by itself with the cursor at `cursor`, right
@@ -1837,6 +1847,300 @@ fn context(text: &str, before: &[&Token], scope: &Scope) -> Context {
         return Context::JoinOn;
     }
     Context::Expression
+}
+
+/// What lies under the pointer, for a tooltip.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hover {
+    /// The word it is about.
+    pub range: Range<usize>,
+    pub title: String,
+    pub detail: String,
+}
+
+/// What the SQL word at byte `offset` names, from what the catalog has
+/// loaded: a table or view with its columns, a column with its type, a
+/// function. Never asks the catalog for more.
+pub fn hover(
+    text: &str,
+    offset: usize,
+    catalog: &dyn Catalog,
+    options: &Options<'_>,
+) -> Option<Hover> {
+    if offset > text.len() || !text.is_char_boundary(offset) {
+        return None;
+    }
+    let analysis = analyze(text, options.family);
+    if inside_literal(text, &analysis.all, offset) {
+        return None;
+    }
+    let (start, end) = (word_start(text, offset), word_end(text, offset));
+    let word = &text[start..end];
+    if word.is_empty() || word.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    let (qualifiers, qualified_start, quoted) = qualifiers(text, start);
+    let statement = statement_at(
+        &analysis.significant,
+        &analysis.separators,
+        qualified_start,
+        end,
+    );
+    let script = &analysis.script;
+    let mut scope = Scope::read(text, statement, qualified_start);
+    // The word itself is no table of the statement it is typed in.
+    scope.relations.retain(|r| r.at != start);
+    let mut builder = Builder {
+        catalog,
+        options,
+        script,
+        scope: &scope,
+        cursor: qualified_start,
+        alias_tables: false,
+        items: Vec::new(),
+        pending: Vec::new(),
+        taken: Vec::new(),
+        needs: Vec::new(),
+        prefix: "",
+    };
+    let (title, detail) = builder.describe(word, &qualifiers, quoted)?;
+    Some(Hover {
+        range: start..end,
+        title,
+        detail,
+    })
+}
+
+impl Builder<'_> {
+    /// The title and detail of what `word` names, after `qualifiers`.
+    fn describe(
+        &mut self,
+        word: &str,
+        qualifiers: &[String],
+        quoted: bool,
+    ) -> Option<(String, String)> {
+        let scope = self.scope;
+        let Some(owner) = qualifiers.last() else {
+            if let Some(relation) = scope.by_handle(word) {
+                let relation = relation.clone();
+                return Some(self.relation_hover(&relation));
+            }
+            for relation in &scope.relations {
+                if let Some(found) = self.column_hover(relation, word) {
+                    return Some(found);
+                }
+            }
+            if let Some((schema, name)) = self.find(None, word, quoted)
+                && let Some(object) = self
+                    .catalog
+                    .objects(&schema)
+                    .and_then(|objects| objects.iter().find(|o| o.name == name))
+                    .cloned()
+            {
+                return Some(self.object_hover(&schema, &object));
+            }
+            let function = self
+                .options
+                .family
+                .functions()
+                .into_iter()
+                .find(|f| f.eq_ignore_ascii_case(word))?;
+            return Some((format!("{function}()"), "built-in function".to_owned()));
+        };
+        if let Some(relation) = scope.by_handle(owner) {
+            return self.column_hover(relation, word);
+        }
+        let schema = self.schema_named(owner)?;
+        let object = self
+            .objects(&schema)?
+            .iter()
+            .find(|o| same(&o.name, word, quoted))?
+            .clone();
+        Some(self.object_hover(&schema, &object))
+    }
+
+    fn object_hover(&mut self, schema: &str, object: &DbObject) -> (String, String) {
+        let title = format!("{schema}.{}", object.name);
+        let mut detail = object_label(object.kind);
+        if object.kind.is_relation()
+            && let Some(columns) = self.catalog.columns(schema, &object.name)
+        {
+            detail.push_str(&columns_summary(columns));
+        }
+        (title, detail)
+    }
+
+    fn relation_hover(&mut self, relation: &Relation) -> (String, String) {
+        if let Some((schema, name)) = self.resolved(relation)
+            && let Some(object) = self
+                .catalog
+                .objects(&schema)
+                .and_then(|objects| objects.iter().find(|o| o.name == name))
+        {
+            return self.object_hover(&schema, &object.clone());
+        }
+        let detail = if self.scope.cte(&relation.name).is_some() {
+            "CTE"
+        } else if relation.columns.is_some() {
+            "subquery"
+        } else if self.created(relation.schema.as_deref(), &relation.name).is_some() {
+            "defined in this script"
+        } else {
+            "table"
+        };
+        (relation.name.clone(), detail.to_owned())
+    }
+
+    /// `column` of `relation`, when it has one so named.
+    fn column_hover(&mut self, relation: &Relation, column: &str) -> Option<(String, String)> {
+        let title = format!("{}.{column}", relation.handle());
+        if let Some((schema, name)) = self.resolved(relation) {
+            let info = self
+                .catalog
+                .columns(&schema, &name)?
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(column))?;
+            let mut detail = vec![info.data_type.clone()];
+            detail.push(if info.nullable { "nullable" } else { "not null" }.to_owned());
+            if info.primary_key {
+                detail.push("primary key".to_owned());
+            }
+            if let Some(default) = &info.default {
+                detail.push(format!("default {default}"));
+            }
+            if let Some(comment) = &info.comment {
+                detail.push(comment.clone());
+            }
+            return Some((title, detail.join(" · ")));
+        }
+        let names = self.column_names(relation)?;
+        names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(column))
+            .then(|| (title, format!("column of {}", relation.name)))
+    }
+}
+
+/// ` · 3 columns: a, b, c`, the list cut short past a few.
+fn columns_summary(columns: &[ColumnInfo]) -> String {
+    const SHOWN: usize = 8;
+    let names: Vec<&str> = columns.iter().take(SHOWN).map(|c| c.name.as_str()).collect();
+    let more = columns.len().saturating_sub(SHOWN);
+    format!(
+        " · {} columns: {}{}",
+        columns.len(),
+        names.join(", "),
+        if more > 0 { ", …" } else { "" }
+    )
+}
+
+/// A Redis command's syntax with the argument being typed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Signature {
+    /// The command and its arguments, as the documentation writes them.
+    pub label: String,
+    /// The argument the cursor is in, as a byte range of `label`; none
+    /// past the last fixed argument of a command that repeats none.
+    pub active: Option<Range<usize>>,
+}
+
+/// The syntax of the Redis command the cursor's line holds, once its name
+/// is complete (a space after it), and which argument the cursor is in.
+pub fn redis_signature(text: &str, cursor: usize) -> Option<Signature> {
+    use violet_lang::redis::{command, is_container};
+    if cursor > text.len() || !text.is_char_boundary(cursor) {
+        return None;
+    }
+    let line_start = text[..cursor].rfind('\n').map_or(0, |at| at + 1);
+    let head = &text[line_start..cursor];
+    let words: Vec<String> = match violet_lang::redis::argv(head) {
+        Ok(args) => args
+            .iter()
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect(),
+        Err(_) => head.split_ascii_whitespace().map(str::to_owned).collect(),
+    };
+    // The name is done once a blank follows it (both words, for a container).
+    let typing = !head.ends_with(char::is_whitespace);
+    let completed = words.len() - usize::from(typing && !words.is_empty());
+    let skip = words.first().map_or(1, |w| {
+        if is_container(&w.to_ascii_uppercase()) {
+            2
+        } else {
+            1
+        }
+    });
+    if completed < skip {
+        return None;
+    }
+    let found = command(&words)?;
+    let label = format!("{} {}", found.name, found.syntax)
+        .trim_end()
+        .to_owned();
+    // The argument the cursor is in, or at the start of: 0 for the first
+    // after the name.
+    let index = completed - skip;
+    let tokens: Vec<Range<usize>> = {
+        let mut at = found.name.len();
+        label[at..]
+            .split(' ')
+            .filter_map(|part| {
+                let start = label[at..].find(part).map(|found| at + found);
+                let start = start?;
+                at = start + part.len();
+                (!part.is_empty()).then_some(start..at)
+            })
+            .collect()
+    };
+    // Past the fixed arguments, the repeated group `[... ...]` is what is
+    // being filled; keep it simple and mark the last token that is not `...`.
+    let active = tokens.get(index).cloned().or_else(|| {
+        tokens
+            .iter()
+            .rev()
+            .find(|range| !label[range.start..range.end].contains("..."))
+            .cloned()
+    });
+    Some(Signature { label, active })
+}
+
+/// The Redis command syntax for the command name at byte `offset`, when
+/// that is the first word of its line (or a container's second).
+pub fn redis_hover(text: &str, offset: usize) -> Option<Hover> {
+    use violet_lang::redis::{command, is_container};
+    if offset > text.len() || !text.is_char_boundary(offset) {
+        return None;
+    }
+    let line_start = text[..offset].rfind('\n').map_or(0, |at| at + 1);
+    let line_end = text[offset..].find('\n').map_or(text.len(), |at| offset + at);
+    let line = &text[line_start..line_end];
+    let blank = |c: char| c.is_ascii_whitespace();
+    let words: Vec<(usize, &str)> = line
+        .split(blank)
+        .scan(0, |at, part| {
+            let start = *at;
+            *at += part.len() + 1;
+            Some((start, part))
+        })
+        .filter(|(_, part)| !part.is_empty())
+        .collect();
+    let at = offset - line_start;
+    let hit = words
+        .iter()
+        .position(|(start, part)| (*start..=*start + part.len()).contains(&at))?;
+    let names: Vec<&str> = words.iter().take(2).map(|(_, part)| *part).collect();
+    let container = is_container(&names.first()?.to_ascii_uppercase());
+    // The command's own words: one, or two for a container.
+    if hit > usize::from(container) {
+        return None;
+    }
+    let found = command(&names)?;
+    let (start, part) = words[hit];
+    Some(Hover {
+        range: line_start + start..line_start + start + part.len(),
+        title: found.name.to_owned(),
+        detail: found.syntax.to_owned(),
+    })
 }
 
 // ---- building the list ----------------------------------------------------
@@ -3110,6 +3414,104 @@ mod tests {
 
     fn inserts(completion: &Completion) -> Vec<&str> {
         completion.items.iter().map(|i| i.insert.as_str()).collect()
+    }
+
+    /// What hovering at `|` in `text` shows, as title and detail.
+    fn hovering(catalog: &Fake, text: &str) -> Option<(String, String)> {
+        let offset = text.find('|').expect("a pointer");
+        let text = text.replacen('|', "", 1);
+        let search = vec!["public".to_owned()];
+        let quote = |name: &str| format!("\"{name}\"");
+        let found = hover(
+            &text,
+            offset,
+            catalog,
+            &Options {
+                search: &search,
+                database: Some("shop"),
+                quote: &quote,
+                family: Family::Postgres,
+                case: KeywordCase::default(),
+                history: &History::default(),
+            },
+        )?;
+        assert!(found.range.contains(&offset) || found.range.end == offset);
+        Some((found.title, found.detail))
+    }
+
+    #[test]
+    fn hover_names_tables_columns_and_functions() {
+        let shop = shop();
+        let (title, detail) = hovering(&shop, "SELECT 1 FROM cust|omers c").expect("table");
+        assert_eq!(title, "public.customers");
+        assert_eq!(detail, "table · 3 columns: id, name, country");
+        // An alias is its table.
+        let (title, _) = hovering(&shop, "SELECT c.name FROM customers c WHERE |c.id = 1")
+            .expect("alias");
+        assert_eq!(title, "public.customers");
+        let (title, detail) =
+            hovering(&shop, "SELECT c.na|me FROM customers c").expect("qualified column");
+        assert_eq!(title, "c.name");
+        assert_eq!(detail, "integer · nullable");
+        // The primary key says so; a bare column is found among the tables.
+        let (_, detail) = hovering(&shop, "SELECT i|d FROM customers").expect("column");
+        assert_eq!(detail, "integer · not null · primary key");
+        let (title, detail) = hovering(&shop, "SELECT slug|ify(name) FROM customers")
+            .expect("function");
+        assert_eq!((title.as_str(), detail.as_str()), ("public.slugify", "function"));
+        let (title, detail) = hovering(&shop, "SELECT coal|esce(a, b)").expect("built-in");
+        assert_eq!((title.as_str(), detail.as_str()), ("coalesce()", "built-in function"));
+        // Strings, comments, numbers and unknown words say nothing.
+        assert_eq!(hovering(&shop, "SELECT 'cust|omers'"), None);
+        assert_eq!(hovering(&shop, "-- cust|omers"), None);
+        assert_eq!(hovering(&shop, "SELECT 4|2"), None);
+        assert_eq!(hovering(&shop, "SELECT xyz|zy FROM customers"), None);
+    }
+
+    #[test]
+    fn hover_reads_columns_of_subqueries_and_the_catalog_not_loaded() {
+        let shop = shop();
+        let (title, detail) =
+            hovering(&shop, "SELECT s.to|tal FROM (SELECT total FROM orders) s").expect("derived");
+        assert_eq!(title, "s.total");
+        assert_eq!(detail, "column of s");
+        // Nothing loaded for `targets`: it is a table, nothing more.
+        let (_, detail) = hovering(&shop, "SELECT 1 FROM sales.tar|gets").expect("schema table");
+        assert_eq!(detail, "table");
+    }
+
+    #[test]
+    fn redis_signature_marks_the_argument() {
+        let marked = |text: &str| {
+            let signature = redis_signature(text, text.len()).expect("a signature");
+            let active = signature.active.expect("an argument");
+            (signature.label.clone(), signature.label[active].to_owned())
+        };
+        let (label, active) = marked("SET ");
+        assert!(label.starts_with("SET key value"));
+        assert_eq!(active, "key");
+        assert_eq!(marked("SET key ").1, "value");
+        assert_eq!(marked("SET key va").1, "value");
+        assert_eq!(marked("set \"a b\" ").1, "value");
+        // A container's name has two words.
+        assert!(redis_signature("CONFIG ", 7).is_none());
+        assert_eq!(marked("CONFIG GET ").1, "parameter");
+        // Still typing the name: the list is what helps.
+        assert!(redis_signature("SE", 2).is_none());
+        assert!(redis_signature("NOPE x ", 7).is_none());
+        // Only the line under the cursor counts.
+        assert!(redis_signature("SET a b\n", 8).is_none());
+    }
+
+    #[test]
+    fn redis_hover_shows_the_command_syntax() {
+        let hint = redis_hover("GET a\nconfig get x", 14).expect("container");
+        assert_eq!(hint.title, "CONFIG GET");
+        assert_eq!(&"GET a\nconfig get x"[hint.range], "get");
+        assert!(redis_hover("GET a", 5).is_none());
+        assert_eq!(redis_hover("GET a", 1).expect("command").title, "GET");
+        assert!(redis_hover("GET a", 4).is_none());
+        assert!(redis_hover("NOPE a", 1).is_none());
     }
 
     #[test]

@@ -662,6 +662,28 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
                     anchor = Some(output.galley_pos + rect.left_bottom().to_vec2());
                 }
 
+                // Tooltips for the word under the pointer; the syntax of the
+                // command being written, under the cursor.
+                if !popup.showing() {
+                    let hint = hovered_word(&output, sql, assist);
+                    if let Some(hint) = hint {
+                        output
+                            .response
+                            .response
+                            .clone()
+                            .on_hover_ui_at_pointer(|ui| hover_card(ui, &hint, &palette));
+                    }
+                    if output.response.has_focus()
+                        && assist.language == Language::Redis
+                        && let Some(signature) = completion::redis_signature(sql, selection.start)
+                    {
+                        let at = sql[..selection.start].chars().count();
+                        let rect = output.galley.pos_from_cursor(CCursor::new(at));
+                        let anchor = output.galley_pos + rect.left_bottom().to_vec2();
+                        signature_card(ui, *id, anchor, &signature, &palette);
+                    }
+                }
+
                 // Matches of the find bar, the picked one stronger.
                 let mut chars = 0;
                 let mut at = 0;
@@ -746,6 +768,91 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
         ui.ctx().memory_mut(|memory| memory.request_focus(text_id));
         ui.ctx().request_repaint();
     }
+}
+
+/// What the word under the pointer is, when the pointer is on one.
+fn hovered_word(
+    output: &egui::text_edit::TextEditOutput,
+    sql: &str,
+    assist: &Assist<'_>,
+) -> Option<completion::Hover> {
+    let pointer = output.response.hover_pos()?;
+    let local = pointer - output.galley_pos;
+    let index = output.galley.cursor_from_pos(local).index.0;
+    let offset = sql.char_indices().nth(index).map_or(sql.len(), |(at, _)| at);
+    let hint = match assist.language {
+        Language::Redis => completion::redis_hover(sql, offset),
+        Language::Sql => completion::hover(sql, offset, assist.catalog, &assist.options),
+        Language::Mongodb => None,
+    }?;
+    // The nearest character is not the one under the pointer past a row's
+    // end or off its word.
+    let chars = |at: usize| sql[..at].chars().count();
+    let from = output.galley.pos_from_cursor(CCursor::new(chars(hint.range.start)));
+    let to = output.galley.pos_from_cursor(CCursor::new(chars(hint.range.end)));
+    let on_word = local.y >= from.top()
+        && local.y <= from.bottom()
+        && to.top() == from.top()
+        && local.x >= from.left()
+        && local.x <= to.right();
+    on_word.then_some(hint)
+}
+
+/// The tooltip of a word: what it is, and what is known of it.
+fn hover_card(ui: &mut Ui, hint: &completion::Hover, palette: &Palette) {
+    ui.set_max_width(420.0);
+    ui.label(
+        egui::RichText::new(&hint.title)
+            .font(theme::mono(FONT_SIZE))
+            .color(palette.text),
+    );
+    if !hint.detail.is_empty() {
+        ui.label(egui::RichText::new(&hint.detail).color(palette.dim));
+    }
+}
+
+/// A command's syntax under the cursor, the argument being written marked.
+fn signature_card(
+    ui: &Ui,
+    tab: u64,
+    anchor: egui::Pos2,
+    signature: &completion::Signature,
+    palette: &Palette,
+) {
+    let font = theme::mono(12.0);
+    let mut job = LayoutJob::default();
+    let plain = TextFormat {
+        font_id: font.clone(),
+        color: palette.dim,
+        ..TextFormat::default()
+    };
+    let active = TextFormat {
+        font_id: font,
+        color: palette.accent,
+        underline: Stroke::new(1.0, palette.accent),
+        ..TextFormat::default()
+    };
+    let label = &signature.label;
+    match &signature.active {
+        Some(range) => {
+            job.append(&label[..range.start], 0.0, plain.clone());
+            job.append(&label[range.clone()], 0.0, active);
+            job.append(&label[range.end..], 0.0, plain);
+        }
+        None => job.append(label, 0.0, plain),
+    }
+    egui::Area::new(Id::new(("signature", tab)))
+        .order(egui::Order::Foreground)
+        .fixed_pos(anchor + Vec2::new(-6.0, 4.0))
+        .interactable(false)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::new()
+                .fill(palette.surface)
+                .stroke(Stroke::new(1.0, palette.outline))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(egui::Margin::symmetric(8, 4))
+                .show(ui, |ui| ui.label(job));
+        });
 }
 
 /// While a selection is dragged near or past the top or bottom of the
