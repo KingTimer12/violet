@@ -732,6 +732,17 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
                 {
                     *snippet = None;
                 }
+                // Moving out of the snippet or pressing Esc abandons it.
+                let escaped = output.response.has_focus()
+                    && ui.input(|input| input.key_pressed(Key::Escape));
+                if escaped
+                    || (output.cursor_range.is_some()
+                        && snippet.as_ref().is_some_and(|open| {
+                            open.left(selection.start) || open.left(selection.end)
+                        }))
+                {
+                    *snippet = None;
+                }
                 follow(
                     popup,
                     sql,

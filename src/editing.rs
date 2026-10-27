@@ -55,6 +55,8 @@ impl CharIndex {
 /// The stops left in an inserted snippet, which Tab visits in turn.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Snippet {
+    /// Where the item was inserted.
+    start: usize,
     /// Byte ranges in the text, ascending; empty for a bare caret.
     stops: Vec<Range<usize>>,
     /// The text's length when the stops were last placed.
@@ -66,6 +68,7 @@ impl Snippet {
     /// `len` long; none when the item has no more stops.
     pub fn new(start: usize, stops: &[Range<usize>], len: usize) -> Option<Self> {
         (!stops.is_empty()).then(|| Self {
+            start,
             stops: stops
                 .iter()
                 .map(|stop| start + stop.start..start + stop.end)
@@ -91,6 +94,12 @@ impl Snippet {
             }
         }
         self.stops.first().is_some_and(|stop| stop.start >= cursor)
+    }
+
+    /// Whether `cursor` is outside the inserted item, from where it went in
+    /// to the end of its last stop: the snippet is then abandoned.
+    pub fn left(&self, cursor: usize) -> bool {
+        cursor < self.start || self.stops.last().is_none_or(|stop| cursor > stop.end)
     }
 
     /// The next stop after `cursor`, which is dropped; `None` when the
@@ -285,6 +294,17 @@ mod tests {
                 assert_eq!(index.byte(text, at), expected, "{at} of {}", text.len());
             }
         }
+    }
+
+    #[test]
+    fn snippet_is_left_when_the_cursor_leaves_its_range() {
+        // Stops at 14 and 16, inserted at 10.
+        let snippet = Snippet::new(10, &[4..4, 6..8], 20).expect("stops");
+        assert!(!snippet.left(10));
+        assert!(!snippet.left(14));
+        assert!(!snippet.left(18));
+        assert!(snippet.left(9));
+        assert!(snippet.left(19));
     }
 
     #[test]
