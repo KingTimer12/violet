@@ -10,6 +10,58 @@ pub struct Edited {
     pub selection: Range<usize>,
 }
 
+/// The stops left in an inserted snippet, which Tab visits in turn.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Snippet {
+    /// Byte offsets in the text, ascending.
+    stops: Vec<usize>,
+    /// The text's length when the stops were last placed.
+    len: usize,
+}
+
+impl Snippet {
+    /// The stops of an item inserted at byte `start` into a text now
+    /// `len` long; none when the item has no more stops.
+    pub fn new(start: usize, stops: &[usize], len: usize) -> Option<Self> {
+        (!stops.is_empty()).then(|| Self {
+            stops: stops.iter().map(|stop| start + stop).collect(),
+            len,
+        })
+    }
+
+    /// Follows an edit that left the text `len` long with the cursor at
+    /// `cursor`: the stops past the edit move with it. False when what was
+    /// typed passed the next stop, so the snippet is over.
+    pub fn follow(&mut self, len: usize, cursor: usize) -> bool {
+        let delta = len as isize - self.len as isize;
+        self.len = len;
+        if delta == 0 {
+            return true;
+        }
+        let at = cursor.saturating_sub(delta.max(0) as usize);
+        for stop in &mut self.stops {
+            if *stop >= at {
+                *stop = stop.saturating_add_signed(delta);
+            }
+        }
+        self.stops.first().is_some_and(|stop| *stop >= cursor)
+    }
+
+    /// The next stop after `cursor`, which is dropped; `None` when the
+    /// cursor is already past them all.
+    pub fn next(&mut self, cursor: usize) -> Option<usize> {
+        let index = self.stops.iter().position(|stop| *stop > cursor)?;
+        let stop = self.stops[index];
+        self.stops.drain(..=index);
+        Some(stop)
+    }
+
+    /// Whether any stop is left.
+    pub fn is_empty(&self) -> bool {
+        self.stops.is_empty()
+    }
+}
+
 /// Comments out the lines `selection` touches with `-- `, at their common
 /// indentation, or uncomments them when every one that is not blank
 /// already is. A selection ending at the start of a line leaves that line
@@ -169,5 +221,23 @@ mod tests {
             replace_all(text, &find_all(text, "nome", true), "name"),
             "Select name FROM t WHERE name = 'NOME'"
         );
+    }
+
+    #[test]
+    fn snippet_stops_are_visited_and_follow_typing() {
+        // `(a, b) VALUES (|, |)` inserted at 10.
+        let mut snippet = Snippet::new(10, &[4, 6], 20).expect("stops");
+        assert_eq!(snippet.next(14), Some(16));
+        assert_eq!(snippet.next(16), None);
+        assert!(snippet.is_empty());
+        assert!(Snippet::new(0, &[], 5).is_none());
+
+        // Typing `42` at the first stop moves the second one along.
+        let mut snippet = Snippet::new(10, &[4, 6], 20).expect("stops");
+        assert!(snippet.follow(22, 16));
+        assert_eq!(snippet.next(16), Some(18));
+        // Moving the cursor past the stop with edits ends it.
+        let mut snippet = Snippet::new(0, &[2], 10).expect("stops");
+        assert!(!snippet.follow(14, 9));
     }
 }

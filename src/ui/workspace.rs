@@ -136,6 +136,8 @@ pub struct QueryTab {
     pub highlighter: Highlighter,
     /// Completion, while it shows.
     pub popup: Popup,
+    /// The stops Tab still visits in an inserted snippet.
+    pub snippet: Option<crate::editing::Snippet>,
     /// The file the script is saved in, and its text as last read or
     /// written there.
     pub file: Option<ScriptFile>,
@@ -297,6 +299,7 @@ impl Workspace {
             last_run: None,
             highlighter: Highlighter::default(),
             popup: Popup::default(),
+            snippet: None,
             file: None,
             source: None,
             edits: BTreeMap::new(),

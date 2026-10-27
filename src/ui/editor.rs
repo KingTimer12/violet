@@ -16,7 +16,7 @@ use super::theme::{self, Palette};
 use super::widgets::{self, Tone};
 use super::workspace::QueryTab;
 use crate::completion::{self, Catalog, Completion, Item, Kind};
-use crate::editing::{self, Edited};
+use crate::editing::{self, Edited, Snippet};
 use crate::sql::{self, TokenKind};
 
 const FONT_SIZE: f32 = 13.5;
@@ -400,6 +400,7 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
         selection,
         highlighter,
         popup,
+        snippet,
         find,
         ..
     } = tab;
@@ -535,6 +536,20 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
             }
         });
     }
+    // Tab moves through what is left of an inserted snippet.
+    if focused
+        && !popup.open
+        && let Some(open) = snippet.as_mut()
+        && ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Tab))
+    {
+        if let Some(stop) = open.next(selection.start) {
+            select(ui.ctx(), text_id, sql, stop..stop);
+            *selection = stop..stop;
+        }
+        if open.is_empty() {
+            *snippet = None;
+        }
+    }
     let summoned = focused
         && ui.input_mut(|input| {
             let pressed = input.consume_key(Modifiers::CTRL, Key::Space);
@@ -547,7 +562,7 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
             pressed
         });
     if let Some(index) = accept {
-        let item = insert(ui.ctx(), text_id, sql, popup, index);
+        let item = insert(ui.ctx(), text_id, sql, popup, snippet, index);
         accepted(assist, item, actions);
     }
     let over_list = popup
@@ -620,6 +635,12 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
                 if let Some(range) = output.cursor_range {
                     let [start, end] = range.sorted_cursors();
                     *selection = byte_offset(sql, start)..byte_offset(sql, end);
+                }
+                if output.response.changed()
+                    && let Some(open) = snippet.as_mut()
+                    && !open.follow(sql.len(), selection.start)
+                {
+                    *snippet = None;
                 }
                 follow(
                     popup,
@@ -720,7 +741,7 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
     if let Some(anchor) = anchor
         && let Some(index) = list(ui, *id, popup, anchor, &palette)
     {
-        let item = insert(ui.ctx(), text_id, sql, popup, index);
+        let item = insert(ui.ctx(), text_id, sql, popup, snippet, index);
         accepted(assist, item, actions);
         ui.ctx().memory_mut(|memory| memory.request_focus(text_id));
         ui.ctx().request_repaint();
@@ -880,6 +901,7 @@ fn insert(
     text_id: Id,
     sql: &mut String,
     popup: &mut Popup,
+    snippet: &mut Option<Snippet>,
     index: usize,
 ) -> Option<Item> {
     let completion = popup.completion.take()?;
@@ -887,6 +909,7 @@ fn insert(
     let item = completion.items.get(index)?;
     let range = completion.range.start.min(sql.len())..completion.range.end.min(sql.len());
     sql.replace_range(range.clone(), &item.insert);
+    *snippet = Snippet::new(range.start + item.caret, &item.stops, sql.len());
     let caret = sql[..range.start + item.caret].chars().count();
     let mut state = egui::text_edit::TextEditState::load(ctx, text_id).unwrap_or_default();
     state

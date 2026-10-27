@@ -85,6 +85,9 @@ pub struct Item {
     pub insert: String,
     /// Where the cursor goes, as a byte offset into `insert`.
     pub caret: usize,
+    /// Where Tab moves on to after the caret, as byte offsets into
+    /// `insert`.
+    pub stops: Vec<usize>,
     pub kind: Kind,
     /// Shown after the label: a type, a table, a schema.
     pub detail: String,
@@ -324,6 +327,7 @@ pub fn complete_redis(
     let command = |name: &str, syntax: &str, insert: String| Item {
         label: name.to_owned(),
         caret: insert.len(),
+        stops: Vec::new(),
         insert,
         kind: Kind::Keyword,
         detail: syntax.to_owned(),
@@ -403,6 +407,7 @@ fn key_items(keys: &Keyspace<'_>, prefix: &str, items: &mut Vec<Item>, needs: &m
         items.push(Item {
             label: key.name.clone(),
             caret: insert.len(),
+            stops: Vec::new(),
             insert,
             kind: Kind::Key,
             detail: key.subtype.clone().unwrap_or_default(),
@@ -553,6 +558,7 @@ pub fn complete_mongo(
                 insert.len()
             },
             insert,
+            stops: Vec::new(),
             kind,
             detail: detail.to_owned(),
             key: name.to_owned(),
@@ -1686,6 +1692,8 @@ enum Context {
     AfterRelation,
     /// `INSERT INTO table (` columns.
     InsertColumns(String),
+    /// `INSERT INTO table `: the next clause, and a template to fill in.
+    InsertTable(String),
     /// After `JOIN ... ON`: conditions along foreign keys, then columns.
     JoinOn,
     /// `JOIN t USING (`: the columns `t` shares with the tables before it,
@@ -1814,6 +1822,12 @@ fn context(text: &str, before: &[&Token], scope: &Scope) -> Context {
         // `FROM t a` then a new word is the next clause; so is a word after
         // a subquery's closing bracket.
         let named = scope.relations.iter().any(|r| r.at <= last.range.start);
+        if clause.as_deref() == Some("INTO")
+            && is_word(text, before.first().copied(), "INSERT")
+            && let Some(table) = name(text, last)
+        {
+            return Context::InsertTable(table);
+        }
         if named || is(text, last, ")") {
             return Context::AfterRelation;
         }
@@ -1876,6 +1890,10 @@ impl<'a> Builder<'a> {
             Context::AfterRelation => {
                 self.keywords(&self.options.family.after_relation());
             }
+            Context::InsertTable(table) => {
+                self.keywords(&self.options.family.after_relation());
+                self.insert_template(table);
+            }
             Context::InsertColumns(table) => {
                 let relation = self
                     .scope
@@ -1932,6 +1950,7 @@ impl<'a> Builder<'a> {
             label,
             insert,
             caret,
+            stops: Vec::new(),
             kind,
             detail,
             key,
@@ -1975,6 +1994,37 @@ impl<'a> Builder<'a> {
             self.options.history,
             relation,
         )
+    }
+
+    /// `(columns) VALUES ()` for `table`, with a stop inside each value.
+    fn insert_template(&mut self, table: &str) {
+        let relation = self
+            .scope
+            .relations
+            .iter()
+            .find(|r| r.name.eq_ignore_ascii_case(table))
+            .cloned()
+            .unwrap_or_else(|| Relation {
+                name: table.to_owned(),
+                ..Relation::default()
+            });
+        let Some(columns) = self.column_names(&relation) else {
+            return;
+        };
+        let (columns, stops, insert) = values_template(
+            &columns.iter().map(|c| self.ident(c)).collect::<Vec<_>>(),
+            &self.cased("VALUES"),
+        );
+        let Some(&caret) = stops.first() else {
+            return;
+        };
+        let label = format!("({columns}) VALUES");
+        self.push(Kind::Keyword, label, insert, "template".to_owned());
+        if let Some(item) = self.items.last_mut() {
+            item.caret = caret;
+            item.stops = stops[1..].to_vec();
+            item.key = "VALUES".to_owned();
+        }
     }
 
     /// A keyword in the case the settings ask for: by default the case the
@@ -2661,6 +2711,23 @@ fn relation_kind(kind: ObjectKind) -> Option<Kind> {
     }
 }
 
+/// `(a, b) VALUES (, )`: the column list, the offsets between the commas of
+/// the values, and the text.
+fn values_template(columns: &[String], values: &str) -> (String, Vec<usize>, String) {
+    let list = columns.join(", ");
+    let head = format!("({list}) {values} (");
+    let mut stops = Vec::new();
+    let mut insert = head;
+    for index in 0..columns.len() {
+        if index > 0 {
+            insert.push_str(", ");
+        }
+        stops.push(insert.len());
+    }
+    insert.push(')');
+    (list, stops, insert)
+}
+
 fn object_label(kind: ObjectKind) -> String {
     match kind {
         ObjectKind::Table => "table",
@@ -3043,6 +3110,29 @@ mod tests {
 
     fn inserts(completion: &Completion) -> Vec<&str> {
         completion.items.iter().map(|i| i.insert.as_str()).collect()
+    }
+
+    #[test]
+    fn insert_offers_a_template_with_a_stop_per_value() {
+        let completion = at(&shop(), "INSERT INTO customers |");
+        let template = completion
+            .items
+            .iter()
+            .find(|item| item.detail == "template")
+            .expect("template");
+        assert_eq!(template.insert, "(id, name, country) VALUES (, , )");
+        // The caret and the stops sit inside each value's place.
+        let places: Vec<usize> = std::iter::once(template.caret)
+            .chain(template.stops.iter().copied())
+            .collect();
+        assert_eq!(places.len(), 3);
+        for place in &places {
+            assert!(template.insert[..*place].ends_with(['(', ' ']));
+        }
+        assert_eq!(&template.insert[places[2]..], ")");
+        // Other statements get none.
+        let select = at(&shop(), "SELECT * FROM customers |");
+        assert!(select.items.iter().all(|item| item.detail != "template"));
     }
 
     #[test]
