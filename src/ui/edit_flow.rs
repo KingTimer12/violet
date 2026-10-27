@@ -194,7 +194,7 @@ impl VioletApp {
                 Some(Loadable::Loading | Loadable::Idle) | None => return Found::Loading,
                 Some(Loadable::Failed(_)) => return Found::Missing,
             },
-            None => self.explorer.search_path(connection),
+            None => self.search_path(connection),
         };
         let mut loading = false;
         for schema in schemas {

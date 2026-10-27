@@ -10,6 +10,7 @@
 mod agent;
 mod ai;
 mod completion;
+mod dialect;
 mod editing;
 mod export;
 mod format;

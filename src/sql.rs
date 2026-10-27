@@ -272,6 +272,11 @@ impl Iterator for Tokens<'_> {
                 at = quoted_end(bytes, at, b'"');
                 TokenKind::QuotedIdentifier
             }
+            // MySQL's quotes; nothing else uses a backtick.
+            b'`' => {
+                at = quoted_end(bytes, at, b'`');
+                TokenKind::QuotedIdentifier
+            }
             b'$' => match dollar_tag(bytes, at) {
                 Some(tag_end) => {
                     at = dollar_body_end(bytes, at, tag_end);

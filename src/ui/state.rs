@@ -3,6 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::dialect::Family;
+
 use violet_core::{
     ColumnInfo, ConnectionId, DbObject, ForeignKey, Language, ObjectKind, ServerInfo,
 };
@@ -249,32 +251,17 @@ impl Explorer {
         }
     }
 
-    /// Schemas whose objects completion offers unqualified: PostgreSQL's
-    /// `public` and the user's own, or the database itself where schemas
-    /// are databases; else the first one.
-    pub fn search_path(&self, id: ConnectionId) -> Vec<String> {
+    /// Schemas whose objects completion offers unqualified, as `family`
+    /// looks names up.
+    pub fn search_path(&self, id: ConnectionId, family: Family) -> Vec<String> {
         let Some(Loadable::Ready(schemas)) = self.schemas.get(&id) else {
             return Vec::new();
         };
-        let mut path: Vec<String> = Vec::new();
-        let mut add = |name: &str| {
-            if schemas.iter().any(|schema| schema == name) && !path.iter().any(|p| p == name) {
-                path.push(name.to_owned());
-            }
+        let (user, database) = match self.link(id) {
+            Link::Online(server) => (server.user.as_str(), server.database.as_str()),
+            _ => ("", ""),
         };
-        if let Link::Online(server) = self.link(id) {
-            add(&server.user);
-        }
-        add("public");
-        if let Link::Online(server) = self.link(id) {
-            add(&server.database);
-        }
-        if path.is_empty()
-            && let Some(first) = schemas.first()
-        {
-            path.push(first.clone());
-        }
-        path
+        family.search_path(schemas, user, database)
     }
 
     /// The session opened on `database` of connection `parent`.

@@ -172,7 +172,7 @@ impl VioletApp {
                     )));
                 }
             },
-            None => crate::ai::schemas_to_describe(self.explorer.search_path(id), all),
+            None => crate::ai::schemas_to_describe(self.search_path(id), all),
         };
         let described = crate::ai::describe(&catalog, &schemas, self.language(id) == Language::Sql);
         let mut text = format!(
@@ -202,7 +202,7 @@ impl VioletApp {
         let schemas = match schema {
             Some(schema) => vec![schema.to_owned()],
             None => {
-                crate::ai::schemas_to_describe(self.explorer.search_path(id), catalog.schemas())
+                crate::ai::schemas_to_describe(self.search_path(id), catalog.schemas())
             }
         };
         // The table, in the first schema that has it.

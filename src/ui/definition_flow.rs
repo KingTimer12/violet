@@ -26,29 +26,7 @@ pub struct PendingDefinition {
     suffix: &'static str,
 }
 
-/// The database family a driver speaks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Family {
-    Postgres,
-    MySql,
-    Sqlite,
-    Other,
-}
-
-impl Family {
-    pub(super) fn of(driver: &str) -> Self {
-        let driver = driver.to_ascii_lowercase();
-        if driver.contains("postgres") {
-            Self::Postgres
-        } else if driver.contains("mysql") || driver.contains("maria") {
-            Self::MySql
-        } else if driver.contains("sqlite") {
-            Self::Sqlite
-        } else {
-            Self::Other
-        }
-    }
-}
+pub(super) use crate::dialect::Family;
 
 /// The query that reads `name`'s definition, a second one to try if it
 /// fails, and what to append to the text. `None` when the names cannot be

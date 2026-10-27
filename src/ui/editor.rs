@@ -346,6 +346,9 @@ pub struct Popup {
     completion: Option<Completion>,
     /// The cursor the list was made for; moving away closes it.
     cursor: usize,
+    /// The connection the list was made for: switching it remakes the
+    /// list in the new connection's language.
+    connection: Option<ConnectionId>,
     /// Keyboard moved the selection: scroll it into view.
     reveal: bool,
     /// Where the list was drawn, so clicking it does not count as leaving
@@ -803,17 +806,29 @@ fn refresh(
     let stale = popup
         .completion
         .as_ref()
-        .is_none_or(|completion| popup.cursor != cursor || !completion.needs.is_empty());
+        .is_none_or(|completion| {
+            popup.cursor != cursor
+                || popup.connection != assist.connection
+                || !completion.needs.is_empty()
+        });
     if !stale {
         return;
     }
-    let fresh = popup.completion.is_none() || popup.cursor != cursor;
+    let fresh = popup.completion.is_none()
+        || popup.cursor != cursor
+        || popup.connection != assist.connection;
     popup.cursor = cursor;
+    popup.connection = assist.connection;
     let completed = match (assist.language, assist.keys) {
         (Language::Redis, Some((schema, keys))) => {
             completion::complete_redis(sql, cursor, Some(schema), keys)
         }
         (Language::Redis, None) => completion::complete_redis(sql, cursor, None, None),
+        (Language::Mongodb, _) => {
+            let schema = assist.options.search.first().map(String::as_str);
+            let collections = schema.and_then(|schema| assist.catalog.objects(schema));
+            completion::complete_mongo(sql, cursor, schema, collections)
+        }
         _ => completion::complete(sql, cursor, assist.catalog, &assist.options),
     };
     let Some(completion) = completed else {

@@ -11,6 +11,7 @@ use std::ops::Range;
 
 use violet_core::{ColumnInfo, DbObject, ForeignKey, ObjectKind};
 
+use crate::dialect::Family;
 use crate::sql::{self, Token, TokenKind};
 
 /// What completion reads from the database. `None` means not loaded yet;
@@ -78,6 +79,8 @@ pub struct Options<'a> {
     pub search: &'a [String],
     /// Quotes an identifier in the connection's dialect.
     pub quote: &'a dyn Fn(&str) -> String,
+    /// Which statements, keywords, functions and types to offer.
+    pub family: Family,
 }
 
 const MAX_ITEMS: usize = 200;
@@ -200,54 +203,202 @@ pub fn complete_redis(
     })
 }
 
-/// Statements, for an empty editor or after a `;`.
-const STARTS: &[&str] = &[
-    "SELECT",
-    "WITH",
-    "INSERT INTO",
-    "UPDATE",
-    "DELETE FROM",
-    "CREATE TABLE",
-    "CREATE VIEW",
-    "CREATE INDEX",
-    "ALTER TABLE",
-    "DROP TABLE",
-    "TRUNCATE",
-    "EXPLAIN",
-    "EXPLAIN ANALYZE",
-    "BEGIN",
-    "COMMIT",
-    "ROLLBACK",
-    "SHOW",
-    "VALUES",
+/// What the shell offers on `db.`.
+const MONGO_DB: &[&str] = &[
+    "aggregate",
+    "createCollection",
+    "dropDatabase",
+    "getCollection",
+    "getCollectionNames",
+    "runCommand",
+    "stats",
 ];
 
-/// What may follow a table in `FROM`, `JOIN` or `UPDATE`.
-const AFTER_RELATION: &[&str] = &[
-    "AS",
-    "WHERE",
-    "JOIN",
-    "INNER JOIN",
-    "LEFT JOIN",
-    "RIGHT JOIN",
-    "FULL JOIN",
-    "CROSS JOIN",
-    "ON",
-    "USING",
-    "GROUP BY",
-    "ORDER BY",
-    "HAVING",
-    "LIMIT",
-    "OFFSET",
-    "UNION",
-    "UNION ALL",
-    "EXCEPT",
-    "INTERSECT",
-    "SET",
-    "VALUES",
-    "RETURNING",
-    "WINDOW",
+/// What the shell offers on `db.collection.`.
+const MONGO_COLLECTION: &[&str] = &[
+    "aggregate",
+    "bulkWrite",
+    "countDocuments",
+    "createIndex",
+    "deleteMany",
+    "deleteOne",
+    "distinct",
+    "drop",
+    "dropIndex",
+    "estimatedDocumentCount",
+    "find",
+    "findOne",
+    "findOneAndDelete",
+    "findOneAndReplace",
+    "findOneAndUpdate",
+    "getIndexes",
+    "insertMany",
+    "insertOne",
+    "replaceOne",
+    "updateMany",
+    "updateOne",
 ];
+
+/// What a cursor, such as `find(...)`'s, offers after `).`.
+const MONGO_CURSOR: &[&str] = &[
+    "batchSize",
+    "collation",
+    "count",
+    "explain",
+    "forEach",
+    "hint",
+    "limit",
+    "map",
+    "pretty",
+    "project",
+    "skip",
+    "sort",
+    "toArray",
+];
+
+/// Query, update and aggregation operators.
+const MONGO_OPERATORS: &[&str] = &[
+    "$addFields",
+    "$addToSet",
+    "$all",
+    "$and",
+    "$avg",
+    "$count",
+    "$elemMatch",
+    "$eq",
+    "$exists",
+    "$expr",
+    "$facet",
+    "$group",
+    "$gt",
+    "$gte",
+    "$in",
+    "$inc",
+    "$limit",
+    "$lookup",
+    "$lt",
+    "$lte",
+    "$match",
+    "$max",
+    "$min",
+    "$ne",
+    "$nin",
+    "$nor",
+    "$not",
+    "$or",
+    "$project",
+    "$pull",
+    "$push",
+    "$regex",
+    "$set",
+    "$size",
+    "$skip",
+    "$sort",
+    "$sum",
+    "$type",
+    "$unset",
+    "$unwind",
+];
+
+/// Completes a MongoDB shell statement: `db`, `show` and `use` to start
+/// one, the collections listed in the tree for `schema` and the database's
+/// methods after `db.`, a collection's methods after `db.name.`, a
+/// cursor's after `).`, and operators on `$`. `collections` is `None`
+/// while they have not been listed.
+pub fn complete_mongo(
+    text: &str,
+    cursor: usize,
+    schema: Option<&str>,
+    collections: Option<&[DbObject]>,
+) -> Option<Completion> {
+    if cursor > text.len() || !text.is_char_boundary(cursor) {
+        return None;
+    }
+    let line_start = text[..cursor].rfind('\n').map_or(0, |at| at + 1);
+    let line = &text[line_start..cursor];
+    if line.trim_start().starts_with("//")
+        || line.chars().filter(|c| *c == '"').count() % 2 == 1
+        || line.chars().filter(|c| *c == '\'').count() % 2 == 1
+    {
+        return None;
+    }
+    let start = word_start(text, cursor);
+    let end = word_end(text, cursor);
+    let prefix = text[start..cursor].to_owned();
+    let mut items = Vec::new();
+    let mut needs = Vec::new();
+    let mut offer = |kind: Kind, name: &str, detail: &str, insert: String| {
+        items.push(Item {
+            label: name.to_owned(),
+            caret: if insert.ends_with("()") {
+                insert.len() - 1
+            } else {
+                insert.len()
+            },
+            insert,
+            kind,
+            detail: detail.to_owned(),
+            key: name.to_owned(),
+        });
+    };
+    let head = text[..start].trim_end_matches(|c: char| c == ' ' || c == '\t');
+    if prefix.starts_with('$') {
+        for operator in MONGO_OPERATORS {
+            offer(Kind::Keyword, operator, "", (*operator).to_owned());
+        }
+    } else if let Some(owner) = head.strip_suffix('.') {
+        let methods = |list: &[&str], offer: &mut dyn FnMut(Kind, &str, &str, String)| {
+            for method in list {
+                offer(Kind::Function, method, "", format!("{method}()"));
+            }
+        };
+        let owner_start = word_start(owner, owner.len());
+        let name = &owner[owner_start..];
+        let parent = owner[..owner_start].strip_suffix('.');
+        if owner.ends_with(')') {
+            methods(MONGO_CURSOR, &mut offer);
+        } else if name == "db" && parent.is_none() {
+            methods(MONGO_DB, &mut offer);
+            match collections {
+                Some(collections) => {
+                    for collection in collections {
+                        let plain = collection
+                            .name
+                            .chars()
+                            .all(|c| c.is_alphanumeric() || c == '_')
+                            && !collection.name.starts_with(|c: char| c.is_ascii_digit());
+                        let insert = if plain {
+                            collection.name.clone()
+                        } else {
+                            format!("getCollection({:?})", collection.name)
+                        };
+                        offer(Kind::Table, &collection.name, "collection", insert);
+                    }
+                }
+                None => {
+                    if let Some(schema) = schema {
+                        needs.push(Need::Objects(schema.to_owned()));
+                    }
+                }
+            }
+        } else if parent.is_some_and(|parent| parent.ends_with("db")) {
+            methods(MONGO_COLLECTION, &mut offer);
+        }
+    } else if head.is_empty() || head.ends_with(';') || head.ends_with('\n') {
+        offer(Kind::Keyword, "db", "", "db".to_owned());
+        offer(Kind::Keyword, "show dbs", "", "show dbs".to_owned());
+        offer(Kind::Keyword, "show collections", "", "show collections".to_owned());
+        offer(Kind::Keyword, "use", "database", "use ".to_owned());
+    }
+    let mut items = rank(items, &prefix);
+    items.truncate(MAX_ITEMS);
+    Some(Completion {
+        range: start..end,
+        prefix,
+        items,
+        needs,
+    })
+}
 
 /// Phrases offered with the keywords in expressions.
 const PHRASES: &[&str] = &[
@@ -260,43 +411,6 @@ const PHRASES: &[&str] = &[
     "INNER JOIN",
     "PARTITION BY",
     "UNION ALL",
-];
-
-/// Common functions most databases share.
-const FUNCTIONS: &[&str] = &[
-    "abs",
-    "array_agg",
-    "avg",
-    "cast",
-    "ceil",
-    "coalesce",
-    "concat",
-    "count",
-    "date_trunc",
-    "dense_rank",
-    "extract",
-    "floor",
-    "greatest",
-    "json_agg",
-    "lag",
-    "lead",
-    "least",
-    "length",
-    "lower",
-    "max",
-    "min",
-    "now",
-    "nullif",
-    "rank",
-    "replace",
-    "round",
-    "row_number",
-    "string_agg",
-    "substring",
-    "sum",
-    "to_char",
-    "trim",
-    "upper",
 ];
 
 /// Keywords that can never name a table here: they start or end a clause.
@@ -483,7 +597,7 @@ fn inside_literal(text: &str, tokens: &[Token], cursor: usize) -> bool {
         }
         TokenKind::String | TokenKind::QuotedIdentifier => {
             let closed =
-                body.len() >= 2 && matches!(body.as_bytes()[body.len() - 1], b'\'' | b'"' | b'$');
+                body.len() >= 2 && matches!(body.as_bytes()[body.len() - 1], b'\'' | b'"' | b'`' | b'$');
             cursor < token.range.end || !closed
         }
         _ => false,
@@ -498,9 +612,12 @@ fn qualifiers(text: &str, start: usize) -> (Vec<String>, usize) {
     while names.len() < 2 && text[..at].ends_with('.') {
         let dot = at - 1;
         let head = &text[..dot];
-        let (name, begin) = if let Some(inner) = head.strip_suffix('"') {
-            let Some(open) = inner.rfind('"') else { break };
-            (inner[open + 1..].replace("\"\"", "\""), open)
+        let quote = head.chars().next_back().filter(|c| matches!(c, '"' | '`'));
+        let (name, begin) = if let Some(quote) = quote {
+            let inner = &head[..head.len() - 1];
+            let Some(open) = inner.rfind(quote) else { break };
+            let doubled = quote.to_string().repeat(2);
+            (inner[open + 1..].replace(&doubled, &quote.to_string()), open)
         } else {
             let begin = word_start(text, dot);
             (text[begin..dot].to_owned(), begin)
@@ -544,8 +661,9 @@ fn name(text: &str, token: &Token) -> Option<String> {
             (!RESERVED.contains(&upper.as_str())).then(|| body.to_owned())
         }
         TokenKind::QuotedIdentifier => {
-            let inner = body.strip_prefix('"')?.strip_suffix('"')?;
-            Some(inner.replace("\"\"", "\""))
+            let quote = body.chars().next().filter(|c| matches!(c, '"' | '`'))?;
+            let inner = body.strip_prefix(quote)?.strip_suffix(quote)?;
+            Some(inner.replace(&quote.to_string().repeat(2), &quote.to_string()))
         }
         _ => None,
     }
@@ -1219,14 +1337,16 @@ struct Builder<'a> {
 impl<'a> Builder<'a> {
     fn fill(&mut self, context: &Context) {
         match context {
-            Context::Start => self.keywords(STARTS),
+            Context::Start => self.keywords(&self.options.family.starts()),
             Context::Relation { join, .. } => {
                 if *join {
                     self.joins();
                 }
                 self.relations();
             }
-            Context::AfterRelation => self.keywords(AFTER_RELATION),
+            Context::AfterRelation => {
+                self.keywords(&self.options.family.after_relation());
+            }
             Context::InsertColumns(table) => {
                 let relation = self
                     .scope
@@ -1245,7 +1365,7 @@ impl<'a> Builder<'a> {
                 self.expression();
             }
             Context::Type => {
-                for name in sql::TYPES {
+                for name in self.options.family.types() {
                     let insert = self.cased(name);
                     self.push(Kind::Type, insert.clone(), insert, String::new());
                 }
@@ -1562,7 +1682,7 @@ impl<'a> Builder<'a> {
                 }
             }
         }
-        for function in FUNCTIONS {
+        for function in self.options.family.functions() {
             let name = self.cased(function);
             self.push_keyed(
                 Kind::Function,
@@ -1573,7 +1693,7 @@ impl<'a> Builder<'a> {
             );
         }
         self.keywords(PHRASES);
-        self.keywords(sql::KEYWORDS);
+        self.keywords(&self.options.family.keywords());
     }
 
     fn qualified(&mut self, names: &[String]) {
@@ -2076,6 +2196,7 @@ mod tests {
             &Options {
                 search: &search,
                 quote: &quote,
+                family: Family::Other,
             },
         )
         .expect("a completion")
@@ -2217,6 +2338,7 @@ mod tests {
                 &Options {
                     search: &[],
                     quote: &quote,
+                    family: Family::Other,
                 },
             )
         };
@@ -2256,6 +2378,67 @@ mod tests {
             inserts(&found)
         );
         assert_eq!(short_alias("order_items", &["oi".into()]), "oi2");
+    }
+
+    #[test]
+    fn mongo_completes_collections_methods_and_operators() {
+        let orders = [object("orders", ObjectKind::Table)];
+        let mongo = |text: &str, collections: Option<&[DbObject]>| {
+            let cursor = text.find('|').expect("a cursor");
+            let text = text.replacen('|', "", 1);
+            complete_mongo(&text, cursor, Some("shop"), collections).expect("a completion")
+        };
+        let labels = |completion: &Completion| -> Vec<String> {
+            completion.items.iter().map(|i| i.label.clone()).collect()
+        };
+        assert!(labels(&mongo("d|", None)).contains(&"db".to_owned()));
+        let collections = mongo("db.o|", Some(&orders));
+        assert_eq!(inserts(&collections)[0], "orders");
+        assert_eq!(
+            mongo("db.|", None).needs,
+            vec![Need::Objects("shop".into())]
+        );
+        assert!(inserts(&mongo("db.orders.fi|", None)).contains(&"find()"));
+        assert!(inserts(&mongo("db.orders.find({}).so|", None)).contains(&"sort()"));
+        assert_eq!(
+            inserts(&mongo("db.orders.find({ total: { $g|", None))[..3],
+            ["$gt", "$gte", "$group"]
+        );
+    }
+
+    #[test]
+    fn each_database_family_gets_its_own_words() {
+        let shop = shop();
+        let search = vec!["public".to_owned()];
+        let quote = |name: &str| format!("`{}`", name.replace('`', "``"));
+        let with = |family: Family, text: &str| {
+            let cursor = text.find('|').expect("a cursor");
+            let text = text.replacen('|', "", 1);
+            let options = Options {
+                search: &search,
+                quote: &quote,
+                family,
+            };
+            complete(&text, cursor, &shop, &options).expect("a completion")
+        };
+        let mysql = with(Family::MySql, "SELECT ar| FROM orders");
+        assert!(!inserts(&mysql).contains(&"array_agg()"));
+        let postgres = with(Family::Postgres, "SELECT ar| FROM orders");
+        assert!(inserts(&postgres).contains(&"array_agg()"));
+        assert!(inserts(&with(Family::Sqlite, "PR|")).contains(&"PRAGMA"));
+        assert!(inserts(&with(Family::MySql, "DESC|")).contains(&"DESCRIBE"));
+        assert!(!inserts(&with(Family::Sqlite, "EXPLAIN A|")).contains(&"EXPLAIN ANALYZE"));
+    }
+
+    #[test]
+    fn backticks_quote_names() {
+        let shop = shop();
+        let columns = at(&shop, "SELECT o.| FROM `orders` o");
+        assert_eq!(inserts(&columns), ["id", "customer_id", "total"]);
+        let qualified = at(&shop, "SELECT `o`.| FROM orders o");
+        assert_eq!(inserts(&qualified), ["id", "customer_id", "total"]);
+        let schema = at(&shop, "SELECT * FROM `public`.ord|");
+        assert_eq!(inserts(&schema), ["orders o", "order_items oi"]);
     }
 
     #[test]

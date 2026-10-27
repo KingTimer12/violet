@@ -559,6 +559,11 @@ impl VioletApp {
             .map_or(Language::Sql, |id| self.language(id))
     }
 
+    /// Schemas whose objects need no qualifier on a connection.
+    fn search_path(&self, id: ConnectionId) -> Vec<String> {
+        self.explorer.search_path(id, self.family(id))
+    }
+
     /// The SQL dialect of a connection's driver.
     fn dialect(&self, id: ConnectionId) -> violet_core::SqlDialect {
         connections(&self.profiles, &self.explorer)
@@ -2498,9 +2503,15 @@ impl VioletApp {
             });
         self.layout.results = (total > 0.0).then(|| results.response.rect.height() / total);
 
+        let family = tab
+            .connection
+            .and_then(|id| profiles.iter().find(|profile| profile.id == id))
+            .map_or_else(Default::default, |profile| {
+                crate::dialect::Family::of(profile.driver.as_str())
+            });
         let search = tab
             .connection
-            .map(|id| explorer.search_path(id))
+            .map(|id| explorer.search_path(id, family))
             .unwrap_or_default();
         let quote = |name: &str| violet_core::Dialect::quote_ident(&dialect, name);
         // A key-value store's editor completes the keys of its database.
@@ -2528,6 +2539,7 @@ impl VioletApp {
             options: completion::Options {
                 search: &search,
                 quote: &quote,
+                family,
             },
             keys,
         };
