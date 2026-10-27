@@ -17,6 +17,7 @@ mod edit_flow;
 mod editor;
 mod export_flow;
 mod fonts;
+mod hints_flow;
 mod history;
 pub mod icons;
 mod key_flow;
@@ -155,6 +156,8 @@ pub struct VioletApp {
     rename_requests: HashMap<violet_app::RequestId, rename_flow::Pending>,
     /// Commands the tree ran on keys, waiting for their answer.
     key_requests: HashMap<violet_app::RequestId, key_flow::Pending>,
+    /// Index lists being read: the table they are of.
+    index_requests: HashMap<violet_app::RequestId, (ConnectionId, String, String)>,
     /// Pings sent, by the connection they measure.
     ping_requests: HashMap<violet_app::RequestId, ConnectionId>,
     /// Actions to run once their connection opens.
@@ -334,6 +337,7 @@ impl VioletApp {
             rename_requests: HashMap::new(),
             key_requests: HashMap::new(),
             ping_requests: HashMap::new(),
+            index_requests: HashMap::new(),
             copy_choice: (crate::export::Format::Tsv, true),
             confirm_delete: None,
             confirm_project_delete: None,
@@ -786,6 +790,7 @@ impl VioletApp {
                     result.map(Into::into),
                     Instant::now(),
                 );
+                self.explorer.hint_rev += 1;
             }
             Event::Entries {
                 id,
@@ -817,6 +822,10 @@ impl VioletApp {
             Event::QueryFinished { request, result } => {
                 if let Some(pending) = self.rename_requests.remove(&request) {
                     self.renamed(ctx, pending, &result);
+                    return;
+                }
+                if let Some(table) = self.index_requests.remove(&request) {
+                    self.indexes_read(table, &result);
                     return;
                 }
                 if let Some(connection) = self.ping_requests.remove(&request) {
@@ -2106,6 +2115,9 @@ impl VioletApp {
                 self.run_data(ctx, tab, CachePolicy::Use);
             }
             Action::Run(tab, scope) => self.run(ctx, tab, scope),
+            Action::LoadIndexes(connection, schema, table) => {
+                self.load_indexes(connection, schema, table);
+            }
             Action::ToggleExplain(tab, flag) => {
                 if let Some(tab) = self.workspace.get_mut(tab) {
                     match flag {
@@ -2713,6 +2725,7 @@ impl VioletApp {
             .map_or_else(Default::default, |profile| {
                 crate::dialect::Family::of(profile.driver.as_str())
             });
+        hints_flow::refresh(tab, explorer, language, family, actions);
         let search = tab
             .connection
             .map(|id| explorer.search_path(id, family))

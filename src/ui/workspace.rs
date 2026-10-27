@@ -142,6 +142,8 @@ pub struct QueryTab {
     pub snippet: Option<crate::editing::Snippet>,
     /// How an explain's result is shown.
     pub plan_view: super::plan_view::View,
+    /// Performance hints on the text.
+    pub hints: super::hints_flow::Hints,
     /// When the shown result reached the app, until it is on screen.
     pub received: Option<Instant>,
     /// How long the shown result took to reach the screen.
@@ -314,6 +316,7 @@ impl Workspace {
             diagnostics: crate::diagnostics::Tracker::default(),
             snippet: None,
             plan_view: super::plan_view::View::default(),
+            hints: super::hints_flow::Hints::default(),
             received: None,
             render: None,
             rtt: None,

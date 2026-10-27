@@ -467,6 +467,7 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
         snippet,
         find,
         diagnostics,
+        hints,
         ..
     } = tab;
     let text_id = Id::new(("violet-editor", *id));
@@ -828,6 +829,37 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
                     if current && reveal {
                         ui.scroll_to_rect(rect.expand(24.0), Some(egui::Align::Center));
                     }
+                }
+
+                // Performance hints, underlined; the tooltip tells why.
+                for (index, hint) in hints.list.iter().enumerate() {
+                    if hint.range.end > sql.len() || !sql.is_char_boundary(hint.range.start) || !sql.is_char_boundary(hint.range.end) {
+                        continue;
+                    }
+                    let start = sql[..hint.range.start].chars().count();
+                    let end = start + sql[hint.range.clone()].chars().count();
+                    let from = output.galley.pos_from_cursor(CCursor::new(start));
+                    let to = output.galley.pos_from_cursor(CCursor::new(end));
+                    if to.top() != from.top() {
+                        continue;
+                    }
+                    let rect = egui::Rect::from_min_max(from.min, egui::pos2(to.left(), from.max.y))
+                        .translate(output.galley_pos.to_vec2());
+                    ui.painter().hline(
+                        rect.x_range(),
+                        rect.bottom() - 1.0,
+                        Stroke::new(1.5, palette.warning),
+                    );
+                    let response = ui.interact(rect, Id::new(("hint", *id, index)), egui::Sense::hover());
+                    response.on_hover_ui_at_pointer(|ui| {
+                        ui.set_max_width(380.0);
+                        ui.label(
+                            egui::RichText::new(hint.kind.label())
+                                .font(theme::semibold(12.5))
+                                .color(palette.warning),
+                        );
+                        ui.label(&hint.message);
+                    });
                 }
 
                 // Line numbers: one per logical line, not per wrapped row.

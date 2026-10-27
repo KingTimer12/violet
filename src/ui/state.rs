@@ -305,6 +305,11 @@ pub struct Explorer {
     pub database_filters: BTreeMap<String, BTreeSet<String>>,
     /// Each connection's transaction, as the backend last reported it.
     pub transactions: HashMap<ConnectionId, violet_app::Transaction>,
+    /// Each table's indexes, for hints.
+    pub indexes: HashMap<RelationKey, Loadable<Arc<[crate::hints::Index]>>>,
+    /// Counts what hints depend on that arrived since, so they are made
+    /// again.
+    pub hint_rev: u64,
     /// Each connection's recent round trips.
     pub latency: HashMap<ConnectionId, crate::metrics::Latency>,
     /// A node was clicked since this was last cleared.
@@ -462,6 +467,7 @@ impl Explorer {
         self.object_index.remove(&id);
         self.objects.retain(|(owner, _), _| *owner != id);
         self.columns.retain(|(owner, _, _), _| *owner != id);
+        self.indexes.retain(|(owner, _, _), _| *owner != id);
         self.foreign_keys.retain(|(owner, _), _| *owner != id);
         self.retries.forget(id);
         self.folders.retain(|(owner, _), _| *owner != id);
@@ -613,6 +619,89 @@ impl crate::completion::Catalog for ConnectionCatalog<'_> {
             self.explorer.foreign_keys.get(&(id, schema.to_owned())),
             &[],
         )
+    }
+}
+
+/// What the catalog loaded so far says of tables, for hints.
+pub struct ConnectionFacts<'a> {
+    pub explorer: &'a Explorer,
+    pub id: ConnectionId,
+    pub family: Family,
+}
+
+impl ConnectionFacts<'_> {
+    /// The schema and name a statement's table is, by the search path: the
+    /// first schema that lists it.
+    pub fn resolve(&self, table: &crate::completion::TableUse) -> (String, String) {
+        let catalog = ConnectionCatalog {
+            explorer: self.explorer,
+            id: Some(self.id),
+        };
+        let schema = match &table.schema {
+            Some(schema) => schema.clone(),
+            None => {
+                let path = self.explorer.search_path(self.id, self.family);
+                path.iter()
+                    .find(|schema| {
+                        crate::completion::Catalog::objects(&catalog, schema).is_some_and(
+                            |objects| {
+                                objects
+                                    .iter()
+                                    .any(|object| object.name.eq_ignore_ascii_case(&table.name))
+                            },
+                        )
+                    })
+                    .or(path.first())
+                    .cloned()
+                    .unwrap_or_default()
+            }
+        };
+        let name = crate::completion::Catalog::objects(&catalog, &schema)
+            .and_then(|objects| {
+                objects
+                    .iter()
+                    .find(|object| object.name.eq_ignore_ascii_case(&table.name))
+            })
+            .map_or_else(|| table.name.clone(), |object| object.name.clone());
+        (schema, name)
+    }
+}
+
+impl crate::hints::Facts for ConnectionFacts<'_> {
+    fn table(&self, table: &crate::completion::TableUse) -> Option<crate::hints::TableFacts> {
+        let (schema, name) = self.resolve(table);
+        let catalog = ConnectionCatalog {
+            explorer: self.explorer,
+            id: Some(self.id),
+        };
+        let rows = crate::completion::Catalog::objects(&catalog, &schema)
+            .and_then(|objects| objects.iter().find(|object| object.name == name))
+            .and_then(|object| object.estimated_rows)
+            .filter(|rows| *rows >= 0);
+        let columns = crate::completion::Catalog::columns(&catalog, &schema, &name);
+        let key = (self.id, schema, name);
+        let leading = match self.explorer.indexes.get(&key) {
+            Some(Loadable::Ready(indexes)) => {
+                let mut leading: Vec<String> = indexes
+                    .iter()
+                    .filter_map(|index| index.columns.first().cloned())
+                    .collect();
+                // The primary key is an index too, and SQLite's rowid one
+                // is not listed.
+                leading.extend(
+                    columns
+                        .and_then(|columns| columns.iter().find(|column| column.primary_key))
+                        .map(|column| column.name.clone()),
+                );
+                Some(leading)
+            }
+            _ => None,
+        };
+        Some(crate::hints::TableFacts {
+            rows,
+            columns: columns.map(|columns| columns.iter().map(|c| c.name.clone()).collect()),
+            leading,
+        })
     }
 }
 

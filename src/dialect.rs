@@ -2,6 +2,8 @@
 //! statements, keywords, functions and types completion offers on it.
 //! [`Family::Other`] gets everything, as before databases were told apart.
 
+use violet_core::string_literal;
+
 use crate::sql;
 
 /// What an explain asks of the server beyond the plan.
@@ -132,6 +134,36 @@ impl Family {
         } else {
             format!("{begin};\n{inner};\nROLLBACK")
         })
+    }
+
+    /// The query that lists a table's indexes: a row per index, its name
+    /// and its columns in order, separated by commas. `None` where the
+    /// database's catalog is not known, or a name cannot be sent safely.
+    pub fn index_query(self, schema: &str, table: &str) -> Option<String> {
+        let (schema, table) = (string_literal(schema)?, string_literal(table)?);
+        match self {
+            Self::Postgres => Some(format!(
+                "SELECT c.relname, array_to_string(ARRAY(SELECT pg_catalog.pg_get_indexdef(i.indexrelid, k + 1, true) \
+                 FROM generate_series(0, i.indnkeyatts - 1) k ORDER BY k), ',') \
+                 FROM pg_catalog.pg_index i \
+                 JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid \
+                 JOIN pg_catalog.pg_class t ON t.oid = i.indrelid \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace \
+                 WHERE n.nspname = {schema} AND t.relname = {table}"
+            )),
+            Self::MySql => Some(format!(
+                "SELECT index_name, GROUP_CONCAT(column_name ORDER BY seq_in_index) \
+                 FROM information_schema.statistics \
+                 WHERE table_schema = {schema} AND table_name = {table} AND column_name IS NOT NULL \
+                 GROUP BY index_name"
+            )),
+            Self::Sqlite => Some(format!(
+                "SELECT il.name, (SELECT group_concat(name, ',') FROM \
+                 (SELECT name FROM pragma_index_info(il.name, {schema}) ORDER BY seqno)) \
+                 FROM pragma_index_list({table}, {schema}) il"
+            )),
+            Self::Other => None,
+        }
     }
 
     /// Statements offered at the start of one.
@@ -727,6 +759,22 @@ mod tests {
             Family::Sqlite.explain_rolled_back("DELETE FROM t", &analyze, false),
             None
         );
+    }
+
+    #[test]
+    fn lists_indexes_per_database() {
+        let pg = Family::Postgres
+            .index_query("public", "orders")
+            .expect("query");
+        assert!(pg.contains("pg_index") && pg.contains("t.relname = 'orders'"));
+        let my = Family::MySql.index_query("shop", "orders").expect("query");
+        assert!(
+            my.contains("information_schema.statistics") && my.contains("table_schema = 'shop'")
+        );
+        let lite = Family::Sqlite.index_query("main", "o'x").expect("query");
+        assert!(lite.contains("pragma_index_list('o''x', 'main')"));
+        assert_eq!(Family::Other.index_query("a", "b"), None);
+        assert_eq!(Family::Postgres.index_query("a", "b\\c"), None);
     }
 
     #[test]

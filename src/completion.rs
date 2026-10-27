@@ -1496,6 +1496,42 @@ impl Scope {
     }
 }
 
+/// A table a statement reads, as it names it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableUse {
+    pub schema: Option<String>,
+    pub name: String,
+    pub alias: Option<String>,
+}
+
+impl TableUse {
+    /// What the statement calls it.
+    pub fn handle(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.name)
+    }
+}
+
+/// The tables `text`'s tokens read, in order: not subqueries nor the names
+/// a `WITH` defines.
+pub fn tables_used(text: &str, tokens: &[Token]) -> Vec<TableUse> {
+    let defined = ctes(text, tokens);
+    relations(text, tokens)
+        .into_iter()
+        .filter(|relation| {
+            relation.columns.is_none()
+                && !(relation.schema.is_none()
+                    && defined
+                        .iter()
+                        .any(|cte| cte.name.eq_ignore_ascii_case(&relation.name)))
+        })
+        .map(|relation| TableUse {
+            schema: relation.schema,
+            name: relation.name,
+            alias: relation.alias,
+        })
+        .collect()
+}
+
 /// The tables after `FROM`, `JOIN`, `UPDATE`, `INTO` and `TABLE`, with their
 /// aliases, and subqueries with theirs.
 fn relations(text: &str, tokens: &[Token]) -> Vec<Relation> {
