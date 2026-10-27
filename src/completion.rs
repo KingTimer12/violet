@@ -1022,6 +1022,11 @@ pub fn opens_by_itself(text: &str, cursor: usize) -> bool {
             context(text, &before, &Scope::default()),
             Context::InsertColumns(_)
         ),
+        // The list of columns is done: `VALUES` is next.
+        Some(')') => matches!(
+            context(text, &before, &Scope::default()),
+            Context::InsertValues(_)
+        ),
         _ => false,
     }
 }
@@ -1896,6 +1901,9 @@ enum Context {
     InsertColumns(String),
     /// `INSERT INTO table `: the next clause, and a template to fill in.
     InsertTable(String),
+    /// `INSERT INTO table (a, b) `: the next clause, and `VALUES` with a
+    /// place for each column typed.
+    InsertValues(usize),
     /// After `JOIN ... ON`: conditions along foreign keys, then columns.
     JoinOn,
     /// `JOIN t USING (`: the columns `t` shares with the tables before it,
@@ -1906,6 +1914,39 @@ enum Context {
     Expression,
     /// After `name.` or `schema.table.`; the last name in quotes.
     Qualified(Vec<String>, bool),
+}
+
+/// How many columns the list `INSERT INTO [schema.]table (a, b)` ending
+/// `before` names; `None` when the bracket is not right after the table.
+fn typed_columns(text: &str, before: &[&Token]) -> Option<usize> {
+    let mut depth = 0usize;
+    let open = before.iter().rposition(|token| {
+        if is(text, token, ")") {
+            depth += 1;
+        } else if is(text, token, "(") {
+            depth -= 1;
+        }
+        depth == 0
+    })?;
+    // The table, maybe with its schema, then `INTO`.
+    let mut at = open;
+    while at > 0 && name(text, before[at - 1]).is_some() {
+        at -= 1;
+        if at > 0 && is(text, before[at - 1], ".") {
+            at -= 1;
+        } else {
+            break;
+        }
+    }
+    if at == open || at == 0 || !is_word(text, Some(before[at - 1]), "INTO") {
+        return None;
+    }
+    let inner: Vec<Token> = before[open + 1..before.len() - 1]
+        .iter()
+        .map(|token| (*token).clone())
+        .collect();
+    let count = split_commas(text, &inner).len();
+    (count > 0).then_some(count)
 }
 
 /// The innermost clause keyword before the cursor at its bracket depth, or
@@ -2029,6 +2070,13 @@ fn context(text: &str, before: &[&Token], scope: &Scope) -> Context {
             && let Some(table) = name(text, last)
         {
             return Context::InsertTable(table);
+        }
+        if is(text, last, ")")
+            && clause.as_deref() == Some("INTO")
+            && is_word(text, before.first().copied(), "INSERT")
+            && let Some(columns) = typed_columns(text, &before)
+        {
+            return Context::InsertValues(columns);
         }
         if named || is(text, last, ")") {
             return Context::AfterRelation;
@@ -2650,6 +2698,10 @@ impl<'a> Builder<'a> {
                 self.keywords(&self.options.family.after_relation());
                 self.insert_template(table);
             }
+            Context::InsertValues(count) => {
+                self.keywords(&self.options.family.after_relation());
+                self.values_snippet(*count);
+            }
             Context::InsertColumns(table) => {
                 let relation = self
                     .scope
@@ -2777,6 +2829,25 @@ impl<'a> Builder<'a> {
         };
         let label = format!("({columns}) VALUES");
         self.push(Kind::Keyword, label, insert, "template".to_owned());
+        if let Some(item) = self.items.last_mut() {
+            item.caret = caret;
+            item.stops = stops[1..].iter().map(|stop| *stop..*stop).collect();
+            item.key = "VALUES".to_owned();
+        }
+    }
+
+    /// `VALUES (, )` with a stop inside each of `count` values.
+    fn values_snippet(&mut self, count: usize) {
+        let (stops, insert) = values_tail(count, &self.cased("VALUES"));
+        let Some(&caret) = stops.first() else {
+            return;
+        };
+        self.push(
+            Kind::Keyword,
+            "VALUES".to_owned(),
+            insert,
+            "template".to_owned(),
+        );
         if let Some(item) = self.items.last_mut() {
             item.caret = caret;
             item.stops = stops[1..].iter().map(|stop| *stop..*stop).collect();
@@ -3523,17 +3594,24 @@ fn call_template(name: &str, signature: Option<&str>) -> Call {
 /// the values, and the text.
 fn values_template(columns: &[String], values: &str) -> (String, Vec<usize>, String) {
     let list = columns.join(", ");
-    let head = format!("({list}) {values} (");
+    let head = format!("({list}) ");
+    let (stops, tail) = values_tail(columns.len(), values);
+    let stops = stops.into_iter().map(|stop| head.len() + stop).collect();
+    (list, stops, head + &tail)
+}
+
+/// `VALUES (, )` for `count` values, and the offsets of each value's place.
+fn values_tail(count: usize, values: &str) -> (Vec<usize>, String) {
+    let mut insert = format!("{values} (");
     let mut stops = Vec::new();
-    let mut insert = head;
-    for index in 0..columns.len() {
+    for index in 0..count {
         if index > 0 {
             insert.push_str(", ");
         }
         stops.push(insert.len());
     }
     insert.push(')');
-    (list, stops, insert)
+    (stops, insert)
 }
 
 fn object_label(kind: ObjectKind) -> String {
@@ -4137,6 +4215,52 @@ mod tests {
             );
         }
         assert!(MONGO_SYNTAX.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    }
+
+    #[test]
+    fn typed_columns_get_a_values_snippet() {
+        let completion = at(&shop(), "INSERT INTO customers (id, name) |");
+        let values = completion
+            .items
+            .iter()
+            .find(|item| item.detail == "template")
+            .expect("template");
+        assert_eq!(values.insert, "VALUES (, )");
+        let stops: Vec<usize> = std::iter::once(values.caret)
+            .chain(values.stops.iter().map(|stop| stop.start))
+            .collect();
+        assert_eq!(stops, [8, 10]);
+        // The keywords stay.
+        assert!(
+            completion
+                .items
+                .iter()
+                .any(|item| item.insert == "RETURNING")
+        );
+        let lower = at(&shop(), "insert into public.orders (customer_id) |");
+        let values = lower
+            .items
+            .iter()
+            .find(|i| i.detail == "template")
+            .expect("one");
+        assert_eq!(values.insert, "VALUES ()");
+        // Not after other brackets, nor with no columns.
+        for text in [
+            "INSERT INTO customers () |",
+            "SELECT * FROM customers (id) |",
+            "INSERT INTO customers (id, name) VALUES (1, 'a') |",
+            "INSERT INTO customers |",
+        ] {
+            let completion = at(&shop(), text);
+            let found = completion
+                .items
+                .iter()
+                .any(|item| item.insert.starts_with("VALUES ("));
+            assert!(!found, "{text}");
+        }
+        // Typing the bracket's end opens the list by itself.
+        assert!(opens_by_itself("INSERT INTO customers (id)", 26));
+        assert!(!opens_by_itself("SELECT (a)", 10));
     }
 
     #[test]
