@@ -177,6 +177,9 @@ fn facts(step: &PlanNode) -> Vec<String> {
         (None, Some(actual)) => facts.push(format!("rows {actual:.0}")),
         (None, None) => {}
     }
+    if let Some(examined) = step.examined {
+        facts.push(format!("examined {examined:.0}"));
+    }
     if let Some(ms) = step.time_ms {
         facts.push(millis(ms));
     }

@@ -534,31 +534,55 @@ pub fn toolbar(
         if response.on_hover_text(script_tip).clicked() {
             actions.push(Action::Run(tab.id, RunScope::Script));
         }
-        // Only SQL has plans to explain.
-        let explain = (language == violet_core::Language::Sql).then(|| {
-            ui.add_enabled_ui(!running, |ui| {
-                widgets::button(ui, Tone::Secondary, Some(Icon::Zap), "Explain")
+        // SQL and MongoDB explain a query. Redis has no plans: its button
+        // profiles the key of a command.
+        let redis = language == violet_core::Language::Redis;
+        let (button, tip) = if redis {
+            (
+                "Analyze",
+                "The type, size, encoding and time to live of the key the command uses",
+            )
+        } else {
+            (
+                "Explain",
+                "How the server runs the statement under the cursor",
+            )
+        };
+        let explain = ui
+            .add_enabled_ui(!running, |ui| {
+                widgets::button(ui, Tone::Secondary, Some(Icon::Zap), button)
             })
             .inner
-            .on_hover_text("How the server runs the statement under the cursor")
-        });
-        if let Some(explain) = &explain {
-            egui::Popup::menu(explain).show(|ui| {
+            .on_hover_text(tip);
+        {
+            egui::Popup::menu(&explain).show(|ui| {
                 let ctx = ui.ctx().clone();
-                for (icon, label, shortcut, scope) in [
+                let analyze = if language == violet_core::Language::Sql {
+                    "Explain analyze (writes rolled back)"
+                } else {
+                    "Explain analyze (reads only)"
+                };
+                let items = [
                     (
                         Icon::Zap,
-                        "Explain plan",
+                        if redis {
+                            "Profile the key"
+                        } else {
+                            "Explain plan"
+                        },
                         shortcuts::get(Command::Explain),
                         RunScope::Explain,
                     ),
                     (
                         Icon::Clock,
-                        "Explain analyze (writes rolled back)",
+                        analyze,
                         shortcuts::get(Command::ExplainAnalyze),
                         RunScope::ExplainAnalyze,
                     ),
-                ] {
+                ];
+                for (icon, label, shortcut, scope) in
+                    items.into_iter().take(if redis { 1 } else { 2 })
+                {
                     if mode_item(ui, icon, label, &ctx.format_shortcut(&shortcut)) {
                         actions.push(Action::Run(tab.id, scope));
                     }

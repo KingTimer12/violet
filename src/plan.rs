@@ -27,6 +27,8 @@ pub enum Warning {
     Misestimate,
     /// Wrote temporary files: a hash or a sort that did not fit in memory.
     TempFiles,
+    /// Examined many documents to return few.
+    Unselective,
 }
 
 impl Warning {
@@ -38,6 +40,7 @@ impl Warning {
             Self::ExpensiveLoop => "Expensive loop",
             Self::Misestimate => "Bad estimate",
             Self::TempFiles => "Temp files",
+            Self::Unselective => "Unselective",
         }
     }
 
@@ -51,6 +54,9 @@ impl Warning {
             }
             Self::Misestimate => "Estimated and actual rows differ a lot. Statistics may be stale.",
             Self::TempFiles => "Spilled to temporary files. More work memory may help.",
+            Self::Unselective => {
+                "Many documents were examined for the few returned. An index on the filtered fields may help."
+            }
         }
     }
 }
@@ -113,6 +119,8 @@ pub struct PlanNode {
     /// Milliseconds spent in the step, with its children.
     pub time_ms: Option<f64>,
     pub loops: Option<f64>,
+    /// Documents or index keys examined, where the database counts them.
+    pub examined: Option<f64>,
     /// Pages touched; only `ANALYZE, BUFFERS` knows.
     pub buffers: Option<Buffers>,
     pub warnings: Vec<Warning>,
@@ -241,6 +249,16 @@ impl Plan {
     /// knows: one cell of JSON, or SQLite's `id`, `parent`, `detail` rows.
     pub fn from_result(set: &ResultSet) -> Option<Self> {
         let names: Vec<&str> = set.columns.iter().map(|c| c.name.as_str()).collect();
+        // A document database may spread the explain over several cells.
+        if names.len() > 1 && names.first() != Some(&"id") {
+            return set
+                .rows
+                .row(0)?
+                .iter()
+                .flatten()
+                .filter(|cell| cell.contains("queryPlanner"))
+                .find_map(Self::from_json);
+        }
         if let [_] = names.as_slice() {
             let text = set.rows.get(0, 0)??;
             return if text.trim_start().starts_with("->") {
@@ -274,6 +292,11 @@ impl Plan {
         let mut plan = match &value {
             Value::Array(items) => Self::postgres(items.first()?)?,
             Value::Object(map) if map.contains_key("query_block") => Self::mysql(&value)?,
+            Value::Object(map)
+                if map.contains_key("queryPlanner") || map.contains_key("stages") =>
+            {
+                Self::mongo(&value)?
+            }
             _ => return None,
         };
         for root in &mut plan.roots {
@@ -289,6 +312,23 @@ impl Plan {
             planning_ms: number(top, "Planning Time"),
             execution_ms: number(top, "Execution Time"),
             planning_buffers: top.get("Planning").and_then(Buffers::postgres),
+        })
+    }
+
+    /// Reads MongoDB's `explain()`: `queryPlanner` with the winning plan,
+    /// and `executionStats` when it was run; an aggregation lists its
+    /// `stages`.
+    fn mongo(value: &Value) -> Option<Self> {
+        let roots = if let Some(Value::Array(stages)) = value.get("stages") {
+            stages.iter().filter_map(mongo_pipeline_stage).collect()
+        } else {
+            vec![mongo_query(value)?]
+        };
+        let stats = value.get("executionStats");
+        Some(Self {
+            roots,
+            execution_ms: stats.and_then(|stats| number(stats, "executionTimeMillis")),
+            ..Self::default()
         })
     }
 
@@ -362,11 +402,111 @@ impl Plan {
 /// Whether `sql` holds an `EXPLAIN` statement: alone, or among the ones an
 /// analyzed write is wrapped in.
 pub fn is_explain(sql: &str) -> bool {
-    sql.lines().any(|line| {
-        line.trim_start()
-            .get(..7)
-            .is_some_and(|start| start.eq_ignore_ascii_case("explain"))
-    })
+    // MongoDB's explain follows the query: `db.c.find().explain(..)`.
+    sql.contains(".explain(")
+        || sql.lines().any(|line| {
+            line.trim_start()
+                .get(..7)
+                .is_some_and(|start| start.eq_ignore_ascii_case("explain"))
+        })
+}
+
+/// A stage of the winning plan, with the stages it reads from.
+fn mongo_stage(value: &Value, stats: Option<&Value>) -> Option<PlanNode> {
+    let stage = text(value, "stage")?;
+    let mut node = PlanNode::new(stage.as_str());
+    node.target = text(value, "indexName").or_else(|| text(value, "namespace"));
+    for (key, name) in [
+        ("direction", "Direction"),
+        ("keyPattern", "Key"),
+        ("filter", "Filter"),
+        ("sortPattern", "Sort"),
+        ("indexBounds", "Bounds"),
+    ] {
+        if let Some(found) = value.get(key) {
+            node.details.push(format!("{name}: {found}"));
+        }
+    }
+    // The stats mirror the plan's shape: the same stage under the same name.
+    if let Some(run) = stats {
+        node.actual_rows = number(run, "nReturned");
+        node.time_ms = number(run, "executionTimeMillisEstimate");
+        node.examined = number(run, "docsExamined").or_else(|| number(run, "keysExamined"));
+        if run.get("usedDisk").and_then(Value::as_bool) == Some(true) {
+            node.warnings.push(Warning::DiskSort);
+        }
+        if let (Some(examined), Some(returned)) = (node.examined, node.actual_rows)
+            && examined >= 100.0
+            && examined >= returned.max(1.0) * MISESTIMATE
+        {
+            node.warnings.push(Warning::Unselective);
+        }
+    }
+    match stage.as_str() {
+        "COLLSCAN" => node.warnings.push(Warning::FullScan),
+        "SORT" => node.warnings.push(Warning::Filesort),
+        _ => {}
+    }
+    let mut inputs: Vec<(&Value, Option<&Value>)> = Vec::new();
+    for key in [
+        "inputStage",
+        "thenStage",
+        "elseStage",
+        "outerStage",
+        "innerStage",
+    ] {
+        if let Some(input) = value.get(key) {
+            inputs.push((input, stats.and_then(|run| run.get(key))));
+        }
+    }
+    if let Some(Value::Array(many)) = value.get("inputStages") {
+        let ran = stats.and_then(|run| run.get("inputStages")?.as_array());
+        for (at, input) in many.iter().enumerate() {
+            inputs.push((input, ran.and_then(|ran| ran.get(at))));
+        }
+    }
+    node.children = inputs
+        .into_iter()
+        .filter_map(|(input, run)| mongo_stage(input, run))
+        .collect();
+    Some(node)
+}
+
+/// A `find` or one `$cursor` stage's explain: its plan, with the stats of
+/// the run when there were any.
+fn mongo_query(value: &Value) -> Option<PlanNode> {
+    let planner = value.get("queryPlanner")?;
+    let winning = planner.get("winningPlan")?;
+    // Newer servers nest the classic plan under `queryPlan`.
+    let winning = winning.get("queryPlan").unwrap_or(winning);
+    let stats = value
+        .get("executionStats")
+        .and_then(|stats| stats.get("executionStages"));
+    let mut root = mongo_stage(winning, stats)?;
+    if let Some(namespace) = text(planner, "namespace") {
+        root.details.insert(0, format!("Namespace: {namespace}"));
+    }
+    if let Some(run) = value.get("executionStats") {
+        if let Some(docs) = number(run, "totalDocsExamined") {
+            root.details.push(format!("Documents examined: {docs}"));
+        }
+        if let Some(keys) = number(run, "totalKeysExamined") {
+            root.details.push(format!("Keys examined: {keys}"));
+        }
+    }
+    Some(root)
+}
+
+/// One stage of an aggregation's explain: `$cursor` holds the query, the
+/// others are named by their operator.
+fn mongo_pipeline_stage(stage: &Value) -> Option<PlanNode> {
+    let (name, body) = stage.as_object()?.iter().next()?;
+    if name == "$cursor" {
+        return mongo_query(body);
+    }
+    let mut node = PlanNode::new(name.as_str());
+    node.details.push(body.to_string());
+    Some(node)
 }
 
 /// Lays `nodes` side by side from `start` across `width`, each as wide as
@@ -914,6 +1054,69 @@ mod tests {
         assert_eq!((bars[2].depth, bars[2].start, bars[2].width), (1, 0.0, 0.5));
     }
 
+    const MONGO: &str = r#"{
+      "queryPlanner": {"namespace": "shop.orders",
+        "winningPlan": {"stage": "SORT", "sortPattern": {"total": -1},
+          "inputStage": {"stage": "COLLSCAN", "direction": "forward",
+                         "filter": {"status": {"$eq": "paid"}}}}},
+      "executionStats": {"executionSuccess": true, "nReturned": 12,
+        "executionTimeMillis": 40, "totalKeysExamined": 0, "totalDocsExamined": 5000,
+        "executionStages": {"stage": "SORT", "nReturned": 12,
+          "executionTimeMillisEstimate": 38, "usedDisk": false,
+          "inputStage": {"stage": "COLLSCAN", "nReturned": 12, "docsExamined": 5000,
+                         "executionTimeMillisEstimate": 30}}}}"#;
+
+    #[test]
+    fn reads_and_flags_mongo_explain() {
+        let plan = Plan::from_json(MONGO).expect("a plan");
+        assert!(plan.analyzed());
+        assert_eq!(plan.execution_ms, Some(40.0));
+        let sort = &plan.roots[0];
+        assert_eq!(sort.label, "SORT");
+        assert_eq!(sort.warnings, [Warning::Filesort]);
+        assert_eq!(sort.actual_rows, Some(12.0));
+        assert!(sort.details.contains(&"Namespace: shop.orders".to_owned()));
+        assert!(
+            sort.details
+                .contains(&"Documents examined: 5000".to_owned())
+        );
+        let scan = &sort.children[0];
+        assert_eq!(scan.warnings, [Warning::Unselective, Warning::FullScan]);
+        assert_eq!(scan.examined, Some(5000.0));
+        assert_eq!(scan.time_ms, Some(30.0));
+        assert_eq!(plan.max_weight(), 38.0);
+    }
+
+    #[test]
+    fn reads_mongo_index_plan_and_pipelines() {
+        let plan = Plan::from_json(
+            r#"{"queryPlanner": {"winningPlan": {"stage": "FETCH",
+                "inputStage": {"stage": "IXSCAN", "indexName": "status_1"}}}}"#,
+        )
+        .expect("a plan");
+        assert!(!plan.analyzed());
+        assert_eq!(
+            plan.roots[0].children[0].target.as_deref(),
+            Some("status_1")
+        );
+        assert!(plan.roots[0].children[0].warnings.is_empty());
+        let pipeline = Plan::from_json(
+            r#"{"stages": [
+                {"$cursor": {"queryPlanner": {"winningPlan": {"stage": "COLLSCAN"}}}},
+                {"$group": {"_id": "$a"}}]}"#,
+        )
+        .expect("a plan");
+        assert_eq!(pipeline.roots.len(), 2);
+        assert_eq!(pipeline.roots[0].warnings, [Warning::FullScan]);
+        assert_eq!(pipeline.roots[1].label, "$group");
+        // Mongo 5+ nests the classic plan.
+        let nested = Plan::from_json(
+            r#"{"queryPlanner": {"winningPlan": {"queryPlan": {"stage": "COLLSCAN"}, "slotBasedPlan": {}}}}"#,
+        )
+        .expect("a plan");
+        assert_eq!(nested.roots[0].label, "COLLSCAN");
+    }
+
     #[test]
     fn reads_sqlite_tree() {
         let steps = [
@@ -938,6 +1141,7 @@ mod tests {
             "BEGIN;\nexplain analyze DELETE FROM t;\nROLLBACK"
         ));
         assert!(!is_explain("SELECT 'explain'"));
+        assert!(is_explain("db.t.find().explain(\"executionStats\")"));
     }
 
     #[test]

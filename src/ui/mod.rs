@@ -928,7 +928,14 @@ impl VioletApp {
                     tab.grid_selection.clear();
                 }
                 tab.outcome = Some(match result {
-                    Ok(output) => {
+                    Ok(mut output) => {
+                        // A key's profile is four answers: show it as one.
+                        if language == Language::Redis
+                            && running.executed.sql.starts_with("TYPE ")
+                            && let Some(report) = crate::lang::redis_profile_report(&output.sets)
+                        {
+                            output.sets = vec![report];
+                        }
                         // Show the last set with rows: usually what was asked for.
                         tab.active_set = output
                             .sets
@@ -1267,8 +1274,7 @@ impl VioletApp {
             + (tab.sql[range.clone()].len() - tab.sql[range.clone()].trim_start().len());
         if explain {
             if language != Language::Sql {
-                self.toasts
-                    .push(ctx, Toast::info("This database has no query plans to show"));
+                self.explain_other(ctx, tab_id, connection, language, offset, &text, scope);
                 return;
             }
             self.explain(ctx, tab_id, connection, offset, &text, scope);
@@ -1411,6 +1417,42 @@ impl VioletApp {
             );
         }
         pending
+    }
+
+    /// Explains a statement of a language that is not SQL: MongoDB's
+    /// `explain()`, or what a Redis command's key weighs.
+    #[allow(clippy::too_many_arguments)]
+    fn explain_other(
+        &mut self,
+        ctx: &egui::Context,
+        tab_id: TabId,
+        connection: ConnectionId,
+        language: Language,
+        offset: usize,
+        text: &str,
+        scope: RunScope,
+    ) {
+        let analyze = scope == RunScope::ExplainAnalyze;
+        let sent = match crate::lang::explain_script(language, text, analyze) {
+            Ok(sent) => sent,
+            Err(reason) => {
+                self.toasts.push(ctx, Toast::info(reason));
+                return;
+            }
+        };
+        if analyze && language == Language::Mongodb && crate::mongo::plans_only(text) {
+            self.toasts.push(
+                ctx,
+                Toast::info("MongoDB analyzes reads only; this shows the planner's choice"),
+            );
+        }
+        let shift = sent.find(text).map_or(0, |at| sent[..at].chars().count());
+        let executed = Executed {
+            offset,
+            sql: sent,
+            shift,
+        };
+        self.start(tab_id, connection, executed, ExecOptions::WRITE, false);
     }
 
     /// Runs one statement under `EXPLAIN`, or `EXPLAIN ANALYZE` when it

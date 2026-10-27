@@ -18,6 +18,7 @@ mod format;
 mod geometry;
 mod lang;
 mod mcp;
+mod mongo;
 mod plan;
 mod settings;
 mod sql;
