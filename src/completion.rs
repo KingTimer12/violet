@@ -80,6 +80,8 @@ pub struct Completion {
 pub struct Options<'a> {
     /// Schemas whose objects need no qualifier, first match wins.
     pub search: &'a [String],
+    /// The database connected to, which may lead `database.schema.table`.
+    pub database: Option<&'a str>,
     /// Quotes an identifier in the connection's dialect.
     pub quote: &'a dyn Fn(&str) -> String,
     /// Which statements, keywords, functions and types to offer.
@@ -814,13 +816,13 @@ fn inside_literal(text: &str, tokens: &[Token], cursor: usize) -> bool {
     }
 }
 
-/// The names before the word, as in `schema.table.` + word: at most two,
-/// where the first starts, and whether the last is quoted.
+/// The names before the word, as in `catalog.schema.table.` + word: at most
+/// three, where the first starts, and whether the last is quoted.
 fn qualifiers(text: &str, start: usize) -> (Vec<String>, usize, bool) {
     let mut names = Vec::new();
     let mut quoted = false;
     let mut at = start;
-    while names.len() < 2 && text[..at].ends_with('.') {
+    while names.len() < 3 && text[..at].ends_with('.') {
         let dot = at - 1;
         let head = &text[..dot];
         let quote = head.chars().next_back().filter(|c| matches!(c, '"' | '`'));
@@ -1987,7 +1989,21 @@ impl<'a> Builder<'a> {
     }
 
     fn qualified(&mut self, names: &[String], quoted: bool) {
+        let current = |name: &str| {
+            self.options
+                .database
+                .is_some_and(|database| database.eq_ignore_ascii_case(name))
+        };
         match names {
+            // Another database's names are not loaded: nothing beats wrong.
+            [catalog, rest @ ..]
+                if names.len() == 3
+                    || (current(catalog) && self.schema_named(catalog).is_none()) =>
+            {
+                if current(catalog) {
+                    self.qualified(rest, quoted);
+                }
+            }
             [handle] => {
                 if let Some(relation) = self.scope.by_handle(handle).cloned() {
                     self.columns_of(&relation, None);
@@ -2556,6 +2572,7 @@ mod tests {
             catalog,
             &Options {
                 search: &search,
+                database: Some("shop"),
                 quote: &quote,
                 family: Family::Other,
                 case,
@@ -2706,6 +2723,7 @@ mod tests {
                 &shop,
                 &Options {
                     search: &[],
+                    database: None,
                     quote: &quote,
                     family: Family::Other,
                     case: KeywordCase::default(),
@@ -2787,6 +2805,7 @@ mod tests {
             let text = text.replacen('|', "", 1);
             let options = Options {
                 search: &search,
+                database: Some("shop"),
                 quote: &quote,
                 family,
                 case: KeywordCase::default(),
@@ -3093,5 +3112,23 @@ mod tests {
             "{found:?}"
         );
         assert!(inserts(&at(&shop, "DELETE FROM orders USING cust|")).contains(&"customers c"));
+    }
+
+    #[test]
+    fn three_part_names_start_with_the_database() {
+        let shop = shop();
+        let columns = at(&shop, "SELECT shop.public.customers.| FROM customers");
+        assert_eq!(inserts(&columns), ["id", "name", "country"]);
+        let quoted = at(&shop, "SELECT \"shop\".\"public\".\"orders\".tot|");
+        assert_eq!(inserts(&quoted), ["total"]);
+        let tables = at(&shop, "SELECT * FROM shop.sales.|");
+        assert_eq!(inserts(&tables), ["targets t"]);
+        // Another database: nothing rather than this one's names.
+        assert!(
+            at(&shop, "SELECT other.public.customers.|")
+                .items
+                .is_empty()
+        );
+        assert!(at(&shop, "SELECT * FROM other.public.|").items.is_empty());
     }
 }

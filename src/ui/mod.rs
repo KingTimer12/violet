@@ -2548,6 +2548,10 @@ impl VioletApp {
             .map(|id| explorer.search_path(id, family))
             .unwrap_or_default();
         let quote = |name: &str| violet_core::Dialect::quote_ident(&dialect, name);
+        let connected = match tab.connection.map(|id| explorer.link(id)) {
+            Some(state::Link::Online(server)) => Some(server.database.clone()),
+            _ => None,
+        };
         // A key-value store's editor completes the keys of its database.
         let database = match tab.connection.map(|id| explorer.link(id)) {
             Some(state::Link::Online(server)) if language == Language::Redis => {
@@ -2593,6 +2597,7 @@ impl VioletApp {
             },
             options: completion::Options {
                 search: &search,
+                database: connected.as_deref(),
                 quote: &quote,
                 family,
                 case: keyword_case,
