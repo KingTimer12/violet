@@ -18,6 +18,7 @@ mod format;
 mod geometry;
 mod lang;
 mod mcp;
+mod plan;
 mod settings;
 mod sql;
 mod ui;

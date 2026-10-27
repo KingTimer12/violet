@@ -6,12 +6,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use egui::{Align, CornerRadius, Layout, RichText, Sense, Stroke, Ui, Vec2};
 use egui_extras::{Column, TableBuilder};
+use violet_app::ExecOptions;
 use violet_core::{DbError, ResultSet};
 
 use super::action::Action;
 use super::cells::{self, Cell, Look};
 use super::edit_flow::{EditTarget, Editing};
 use super::icons::Icon;
+use super::plan_view;
 use super::reference::{self, Reference};
 use super::selection::{Mode, Selection};
 use super::theme::{self, Palette};
@@ -20,6 +22,7 @@ use super::workspace::{
     Count, Executed, InlineCell, Outcome, Paging, QueryTab, TabKind, format_duration, thousands,
 };
 use crate::export::{to_delimited, write_row};
+use crate::plan::Plan;
 use crate::sql;
 
 const ROW_HEIGHT: f32 = 26.0;
@@ -96,6 +99,7 @@ pub fn show(
             tab.active_set = tab.active_set.min(count - 1);
             let elapsed = output.elapsed;
             let set = &output.sets[tab.active_set];
+            let plan = explained(tab.last_run.as_ref(), set);
             let server_rows = set.rows.len();
             let pending = Pending {
                 cells: tab
@@ -137,6 +141,12 @@ pub fn show(
                                     .font(theme::semibold(13.0))
                                     .color(palette.text),
                             );
+                        }
+                        if plan.is_some() {
+                            let mut view = usize::from(tab.plan_raw);
+                            if widgets::segmented(ui, &mut view, &[(0, "Plan"), (1, "Rows")]) {
+                                tab.plan_raw = view == 1;
+                            }
                         }
                         if set.has_rows() {
                             edit_bar(ui, tab.id, &pending, editing, actions);
@@ -218,7 +228,9 @@ pub fn show(
                 Stroke::new(1.0, palette.outline),
             );
 
-            if set.has_rows() {
+            if let Some(plan) = plan.filter(|_| !tab.plan_raw) {
+                plan_view::show(ui, tab.id, &plan);
+            } else if set.has_rows() {
                 if let Some(paging) = &tab.paging {
                     let fetching = tab.running.as_ref().is_some_and(|r| r.append);
                     egui::Panel::bottom(egui::Id::new(("paging", tab.id)))
@@ -292,6 +304,16 @@ pub fn show(
             }
         }
     }
+}
+
+/// The plan an explain run returned, when the last run was one and the
+/// result is in a form Violet reads.
+fn explained(last_run: Option<&(Executed, ExecOptions)>, set: &ResultSet) -> Option<Plan> {
+    let (executed, _) = last_run?;
+    let sql = executed.sql.trim_start();
+    sql.get(..7)
+        .is_some_and(|start| start.eq_ignore_ascii_case("explain"))
+        .then(|| Plan::from_result(set))?
 }
 
 /// DBeaver's result footer: how much is loaded, and buttons to read more

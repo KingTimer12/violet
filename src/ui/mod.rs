@@ -22,6 +22,7 @@ pub mod icons;
 mod key_flow;
 mod keys_flow;
 mod mcp_flow;
+mod plan_view;
 mod project_flow;
 mod providers;
 mod reference;
@@ -1414,7 +1415,18 @@ impl VioletApp {
             return;
         }
         let statement = text.trim_end().trim_end_matches(';').trim_end();
-        let Some(sent) = self.backend.explain_sql(connection, statement, analyze) else {
+        let family = self.family(connection);
+        if analyze && family == crate::dialect::Family::Sqlite {
+            self.toasts.push(
+                ctx,
+                Toast::info("SQLite has no EXPLAIN ANALYZE; Explain shows its query plan"),
+            );
+            return;
+        }
+        // Where the database has a tree form, the results pane draws it.
+        let tree = family.explain_tree(statement, analyze);
+        let Some(sent) = tree.or_else(|| self.backend.explain_sql(connection, statement, analyze))
+        else {
             return;
         };
         let shift = sent

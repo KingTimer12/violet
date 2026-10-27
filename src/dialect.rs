@@ -57,6 +57,20 @@ impl Family {
         }
     }
 
+    /// The statement that explains `sql` in a form the plan view reads:
+    /// JSON on Postgres and MySQL, `QUERY PLAN` rows on SQLite. `None`
+    /// where the database has no such form: SQLite cannot analyze, MySQL
+    /// analyzes in text only, and other databases are not known.
+    pub fn explain_tree(self, sql: &str, analyze: bool) -> Option<String> {
+        match (self, analyze) {
+            (Self::Postgres, false) => Some(format!("EXPLAIN (FORMAT JSON) {sql}")),
+            (Self::Postgres, true) => Some(format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}")),
+            (Self::MySql, false) => Some(format!("EXPLAIN FORMAT=JSON {sql}")),
+            (Self::Sqlite, false) => Some(format!("EXPLAIN QUERY PLAN {sql}")),
+            _ => None,
+        }
+    }
+
     /// Statements offered at the start of one.
     pub fn starts(self) -> Vec<&'static str> {
         let only: &[&str] = match self {
@@ -564,6 +578,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn explains_as_a_tree_where_the_database_can() {
+        let explain = |family: Family, analyze| family.explain_tree("SELECT 1", analyze);
+        assert_eq!(
+            explain(Family::Postgres, false).as_deref(),
+            Some("EXPLAIN (FORMAT JSON) SELECT 1")
+        );
+        assert_eq!(
+            explain(Family::Postgres, true).as_deref(),
+            Some("EXPLAIN (ANALYZE, FORMAT JSON) SELECT 1")
+        );
+        assert_eq!(
+            explain(Family::MySql, false).as_deref(),
+            Some("EXPLAIN FORMAT=JSON SELECT 1")
+        );
+        assert_eq!(
+            explain(Family::Sqlite, false).as_deref(),
+            Some("EXPLAIN QUERY PLAN SELECT 1")
+        );
+        assert_eq!(explain(Family::MySql, true), None);
+        assert_eq!(explain(Family::Sqlite, true), None);
+        assert_eq!(explain(Family::Other, false), None);
     }
 
     #[test]
