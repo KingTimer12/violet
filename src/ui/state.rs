@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::dialect::Family;
 
@@ -32,9 +33,85 @@ impl<T> Loadable<T> {
     }
 }
 
-/// How many times a schema's foreign keys are asked for before a failure
+/// How many times a load for completion is asked for before a failure
 /// stands.
-const FOREIGN_KEY_TRIES: u8 = 3;
+const LOAD_TRIES: u8 = 3;
+
+/// The wait before a failed load is asked again; each retry waits twice as
+/// long as the one before.
+const RETRY_WAIT: Duration = Duration::from_millis(250);
+
+/// A catalog load that is asked again when it fails.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum LoadKey {
+    Objects(ConnectionId, String),
+    Columns(ConnectionId, String, String),
+    ForeignKeys(ConnectionId, String),
+}
+
+impl LoadKey {
+    pub fn owner(&self) -> ConnectionId {
+        match self {
+            Self::Objects(id, _) | Self::Columns(id, ..) | Self::ForeignKeys(id, _) => *id,
+        }
+    }
+}
+
+/// Which loads failed, how many times, and when each is asked again.
+#[derive(Default)]
+pub struct Retries {
+    tries: HashMap<LoadKey, u8>,
+    due: HashMap<LoadKey, Instant>,
+}
+
+impl Retries {
+    /// `key` failed at `now`: how long to wait before asking again, or `None`
+    /// when it was asked [`LOAD_TRIES`] times and the failure stands.
+    pub fn failed(&mut self, key: LoadKey, now: Instant) -> Option<Duration> {
+        let tries = self.tries.entry(key.clone()).or_insert(1);
+        if *tries >= LOAD_TRIES {
+            self.tries.remove(&key);
+            return None;
+        }
+        let wait = RETRY_WAIT * 2u32.pow(u32::from(*tries - 1));
+        *tries += 1;
+        self.due.insert(key, now + wait);
+        Some(wait)
+    }
+
+    /// `key` loaded: its failures are forgotten.
+    pub fn succeeded(&mut self, key: &LoadKey) {
+        self.tries.remove(key);
+        self.due.remove(key);
+    }
+
+    /// The loads whose wait is over at `now`, to be asked again.
+    pub fn due(&mut self, now: Instant) -> Vec<LoadKey> {
+        let keys: Vec<LoadKey> = self
+            .due
+            .iter()
+            .filter(|(_, at)| **at <= now)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in &keys {
+            self.due.remove(key);
+        }
+        keys
+    }
+
+    /// How long until the next load is due, if any waits.
+    pub fn next_due(&self, now: Instant) -> Option<Duration> {
+        self.due
+            .values()
+            .map(|at| at.saturating_duration_since(now))
+            .min()
+    }
+
+    fn forget(&mut self, id: ConnectionId) {
+        self.tries.retain(|key, _| key.owner() != id);
+        self.due.retain(|key, _| key.owner() != id);
+    }
+}
 
 /// A schema's objects, found by name without scanning them.
 pub struct ObjectIndex {
@@ -208,9 +285,8 @@ pub struct Explorer {
     pub columns: HashMap<RelationKey, Loadable<Arc<[ColumnInfo]>>>,
     /// Foreign keys from or to each schema's tables, for completion.
     pub foreign_keys: HashMap<(ConnectionId, String), Loadable<Arc<[ForeignKey]>>>,
-    /// How many times each schema's foreign keys were asked for, while they
-    /// are not loaded.
-    pub foreign_key_tries: HashMap<(ConnectionId, String), u8>,
+    /// Failed loads waiting to be asked again.
+    pub retries: Retries,
     /// The triggers, roles and extensions of each session's database.
     pub folders: HashMap<(ConnectionId, Folder), Loadable<Arc<[FolderItem]>>>,
     /// The keys of each key-value database.
@@ -267,37 +343,90 @@ impl Explorer {
         }
     }
 
-    /// Stores a schema's foreign keys as loaded. A failure is asked again, up
-    /// to [`FOREIGN_KEY_TRIES`] times in all; returns whether to ask now.
+    /// Stores a schema's foreign keys as loaded. A failure is asked again
+    /// (see [`Retries`]), staying loading meanwhile; returns the wait.
     pub fn foreign_keys_loaded(
         &mut self,
         id: ConnectionId,
         schema: String,
         result: violet_core::Result<Arc<[ForeignKey]>>,
-    ) -> bool {
-        let key = (id, schema);
-        if result.is_err() {
-            let tries = self.foreign_key_tries.entry(key.clone()).or_insert(1);
-            if *tries < FOREIGN_KEY_TRIES {
-                *tries += 1;
-                self.foreign_keys.insert(key, Loadable::Loading);
-                return true;
-            }
+        now: Instant,
+    ) -> Option<Duration> {
+        let key = LoadKey::ForeignKeys(id, schema.clone());
+        let wait = self.settled(key, result.is_err(), now);
+        let loaded = if wait.is_some() {
+            Loadable::Loading
         } else {
-            self.foreign_key_tries.remove(&key);
-        }
-        self.foreign_keys.insert(key, Loadable::from_result(result));
-        false
+            Loadable::from_result(result)
+        };
+        self.foreign_keys.insert((id, schema), loaded);
+        wait
     }
 
-    /// Stores a schema's objects as loaded, and indexes them by name.
+    /// Stores a relation's columns as loaded, a failure being asked again.
+    pub fn columns_loaded(
+        &mut self,
+        id: ConnectionId,
+        schema: String,
+        relation: String,
+        result: violet_core::Result<Arc<[ColumnInfo]>>,
+        now: Instant,
+    ) -> Option<Duration> {
+        let key = LoadKey::Columns(id, schema.clone(), relation.clone());
+        let wait = self.settled(key, result.is_err(), now);
+        let loaded = if wait.is_some() {
+            Loadable::Loading
+        } else {
+            Loadable::from_result(result)
+        };
+        self.columns.insert((id, schema, relation), loaded);
+        wait
+    }
+
+    /// Whether a load that finished stands, or waits to be asked again.
+    fn settled(&mut self, key: LoadKey, failed: bool, now: Instant) -> Option<Duration> {
+        if failed {
+            return self.retries.failed(key, now);
+        }
+        self.retries.succeeded(&key);
+        None
+    }
+
+    /// Gives up on a load that was to be asked again: it counts as failed.
+    pub fn abandon(&mut self, key: LoadKey, reason: &str) {
+        match key {
+            LoadKey::Objects(id, schema) => {
+                self.drop_object_index(id, &schema);
+                self.objects
+                    .insert((id, schema), Loadable::Failed(reason.to_owned()));
+            }
+            LoadKey::Columns(id, schema, relation) => {
+                self.columns
+                    .insert((id, schema, relation), Loadable::Failed(reason.to_owned()));
+            }
+            LoadKey::ForeignKeys(id, schema) => {
+                self.foreign_keys
+                    .insert((id, schema), Loadable::Failed(reason.to_owned()));
+            }
+        }
+    }
+
+    /// Stores a schema's objects as loaded, and indexes them by name. A
+    /// failure is asked again, staying loading meanwhile; returns the wait.
     pub fn objects_loaded(
         &mut self,
         id: ConnectionId,
         schema: String,
         result: violet_core::Result<Arc<[DbObject]>>,
-    ) {
-        let loaded = Loadable::from_result(result);
+        now: Instant,
+    ) -> Option<Duration> {
+        let key = LoadKey::Objects(id, schema.clone());
+        let wait = self.settled(key, result.is_err(), now);
+        let loaded = if wait.is_some() {
+            Loadable::Loading
+        } else {
+            Loadable::from_result(result)
+        };
         match &loaded {
             Loadable::Ready(list) => {
                 self.object_index
@@ -308,6 +437,7 @@ impl Explorer {
             _ => self.drop_object_index(id, &schema),
         }
         self.objects.insert((id, schema), loaded);
+        wait
     }
 
     /// Marks a schema's objects as loading, which drops their index.
@@ -331,7 +461,7 @@ impl Explorer {
         self.objects.retain(|(owner, _), _| *owner != id);
         self.columns.retain(|(owner, _, _), _| *owner != id);
         self.foreign_keys.retain(|(owner, _), _| *owner != id);
-        self.foreign_key_tries.retain(|(owner, _), _| *owner != id);
+        self.retries.forget(id);
         self.folders.retain(|(owner, _), _| *owner != id);
         self.keys.retain(|(owner, _), _| *owner != id);
     }
@@ -517,7 +647,7 @@ mod tests {
             object("Items", Table),
         ]
         .into();
-        explorer.objects_loaded(id, "public".into(), Ok(list));
+        explorer.objects_loaded(id, "public".into(), Ok(list), Instant::now());
         let catalog = ConnectionCatalog {
             explorer: &explorer,
             id: Some(id),
@@ -559,16 +689,33 @@ mod tests {
         assert!(catalog.objects("public").is_none());
     }
 
+    fn objects_failure() -> violet_core::Result<Arc<[DbObject]>> {
+        Err(DbError::new(ErrorKind::Connection, "dropped"))
+    }
+
     #[test]
     fn failed_foreign_keys_are_asked_again_a_few_times() {
         let mut explorer = Explorer::default();
         let id = ConnectionId::new();
         let key = (id, "public".to_owned());
-        assert!(explorer.foreign_keys_loaded(id, "public".into(), failure()));
+        let now = Instant::now();
+        assert!(
+            explorer
+                .foreign_keys_loaded(id, "public".into(), failure(), now)
+                .is_some()
+        );
         assert!(explorer.foreign_keys[&key].is_loading());
-        assert!(explorer.foreign_keys_loaded(id, "public".into(), failure()));
+        assert!(
+            explorer
+                .foreign_keys_loaded(id, "public".into(), failure(), now)
+                .is_some()
+        );
         // The third failure stands.
-        assert!(!explorer.foreign_keys_loaded(id, "public".into(), failure()));
+        assert!(
+            explorer
+                .foreign_keys_loaded(id, "public".into(), failure(), now)
+                .is_none()
+        );
         assert!(matches!(explorer.foreign_keys[&key], Loadable::Failed(_)));
     }
 
@@ -576,12 +723,123 @@ mod tests {
     fn foreign_keys_loaded_after_a_retry_are_kept() {
         let mut explorer = Explorer::default();
         let id = ConnectionId::new();
-        assert!(explorer.foreign_keys_loaded(id, "public".into(), failure()));
-        assert!(!explorer.foreign_keys_loaded(id, "public".into(), Ok(Arc::from(Vec::new()))));
+        let now = Instant::now();
+        assert!(
+            explorer
+                .foreign_keys_loaded(id, "public".into(), failure(), now)
+                .is_some()
+        );
+        let kept = Ok(Arc::from(Vec::new()));
+        assert!(
+            explorer
+                .foreign_keys_loaded(id, "public".into(), kept, now)
+                .is_none()
+        );
         assert!(matches!(
             explorer.foreign_keys[&(id, "public".to_owned())],
             Loadable::Ready(_)
         ));
-        assert!(explorer.foreign_key_tries.is_empty());
+        assert!(explorer.retries.next_due(now).is_none());
+    }
+
+    #[test]
+    fn failed_loads_wait_longer_each_time_and_are_due_after_the_wait() {
+        let mut retries = Retries::default();
+        let key = LoadKey::Objects(ConnectionId::new(), "public".into());
+        let now = Instant::now();
+        let first = retries.failed(key.clone(), now).expect("a retry");
+        let second = retries.failed(key.clone(), now).expect("a retry");
+        assert_eq!(second, first * 2);
+        assert!(retries.failed(key.clone(), now).is_none());
+        // A stood failure leaves nothing waiting, and the next load starts over.
+        assert!(retries.next_due(now).is_some());
+        assert!(retries.due(now).is_empty());
+        assert_eq!(retries.due(now + second), std::slice::from_ref(&key));
+        assert!(retries.due(now + second).is_empty());
+        assert_eq!(retries.failed(key, now), Some(first));
+    }
+
+    #[test]
+    fn failed_objects_and_columns_are_asked_again_then_stand() {
+        let mut explorer = Explorer::default();
+        let id = ConnectionId::new();
+        let now = Instant::now();
+        let objects = (id, "public".to_owned());
+        for _ in 0..2 {
+            let wait = explorer.objects_loaded(id, "public".into(), objects_failure(), now);
+            assert!(wait.is_some());
+            assert!(explorer.objects[&objects].is_loading());
+        }
+        let wait = explorer.objects_loaded(id, "public".into(), objects_failure(), now);
+        assert!(wait.is_none());
+        assert!(matches!(explorer.objects[&objects], Loadable::Failed(_)));
+
+        let columns = (id, "public".to_owned(), "orders".to_owned());
+        let failed = || Err(DbError::new(ErrorKind::Connection, "dropped"));
+        let load = |explorer: &mut Explorer, result| {
+            explorer.columns_loaded(id, "public".into(), "orders".into(), result, now)
+        };
+        assert!(load(&mut explorer, failed()).is_some());
+        assert!(explorer.columns[&columns].is_loading());
+        assert!(load(&mut explorer, failed()).is_some());
+        assert!(load(&mut explorer, failed()).is_none());
+        assert!(matches!(explorer.columns[&columns], Loadable::Failed(_)));
+        // A load that works clears the count.
+        assert!(load(&mut explorer, failed()).is_some());
+        assert!(load(&mut explorer, Ok(Arc::from(Vec::new()))).is_none());
+        assert!(load(&mut explorer, failed()).is_some());
+        assert!(load(&mut explorer, failed()).is_some());
+    }
+
+    #[test]
+    fn a_failed_need_counts_as_answered_once_it_stands() {
+        use crate::completion::{Completion, Need};
+        let mut explorer = Explorer::default();
+        let id = ConnectionId::new();
+        let now = Instant::now();
+        let waiting = Completion {
+            needs: vec![
+                Need::Objects("public".into()),
+                Need::Columns("public".into(), "orders".into()),
+            ],
+            ..Completion::default()
+        };
+        let answered = |explorer: &Explorer| {
+            let catalog = ConnectionCatalog {
+                explorer,
+                id: Some(id),
+            };
+            waiting.needs_answered(&catalog, None)
+        };
+        assert!(!answered(&explorer));
+        // Failed but to be asked again: still waiting.
+        explorer.objects_loaded(id, "public".into(), objects_failure(), now);
+        assert!(!answered(&explorer));
+        explorer.objects_loaded(id, "public".into(), objects_failure(), now);
+        explorer.objects_loaded(id, "public".into(), objects_failure(), now);
+        assert!(answered(&explorer));
+    }
+
+    #[test]
+    fn a_load_given_up_on_is_failed_and_forgetting_clears_the_waits() {
+        let mut explorer = Explorer::default();
+        let id = ConnectionId::new();
+        let now = Instant::now();
+        explorer.columns_loaded(
+            id,
+            "public".into(),
+            "t".into(),
+            Err(DbError::new(ErrorKind::Connection, "x")),
+            now,
+        );
+        assert!(explorer.retries.next_due(now).is_some());
+        explorer.abandon(
+            LoadKey::Columns(id, "public".into(), "t".into()),
+            "not connected",
+        );
+        let key = (id, "public".to_owned(), "t".to_owned());
+        assert!(matches!(explorer.columns[&key], Loadable::Failed(_)));
+        explorer.forget(id);
+        assert!(explorer.retries.next_due(now).is_none());
     }
 }

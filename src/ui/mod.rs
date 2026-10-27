@@ -59,7 +59,7 @@ use crate::sql;
 use action::{Action, RunScope};
 use connection_form::{ConnectionForm, PasswordPrompt, TestState};
 use shortcuts::Command;
-use state::{ConnectionCatalog, Explorer, Link, Loadable, NodeKey};
+use state::{ConnectionCatalog, Explorer, Link, LoadKey, Loadable, NodeKey};
 use theme::Palette;
 use toasts::{Toast, Toasts};
 use workspace::{
@@ -739,7 +739,7 @@ impl VioletApp {
                     }
                 }
                 self.explorer
-                    .objects_loaded(id, schema, result.map(Into::into));
+                    .objects_loaded(id, schema, result.map(Into::into), Instant::now());
             }
             Event::Columns {
                 id,
@@ -747,9 +747,13 @@ impl VioletApp {
                 relation,
                 result,
             } => {
-                self.explorer
-                    .columns
-                    .insert((id, schema, relation), Loadable::from_result(result));
+                self.explorer.columns_loaded(
+                    id,
+                    schema,
+                    relation,
+                    result.map(Into::into),
+                    Instant::now(),
+                );
             }
             Event::Entries {
                 id,
@@ -771,12 +775,12 @@ impl VioletApp {
                     .insert((id, schema, prefix), Loadable::Ready(keys.into()));
             }
             Event::ForeignKeys { id, schema, result } => {
-                if self
-                    .explorer
-                    .foreign_keys_loaded(id, schema.clone(), result.map(Into::into))
-                {
-                    self.backend.load_foreign_keys(id, schema);
-                }
+                self.explorer.foreign_keys_loaded(
+                    id,
+                    schema,
+                    result.map(Into::into),
+                    Instant::now(),
+                );
             }
             Event::QueryFinished { request, result } => {
                 if let Some(pending) = self.rename_requests.remove(&request) {
@@ -1018,6 +1022,28 @@ impl VioletApp {
                     };
                 }
             }
+        }
+    }
+
+    /// Asks again for the loads that failed and whose wait is over, and has
+    /// the next frame come when the next wait ends.
+    fn retry_loads(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        for key in self.explorer.retries.due(now) {
+            if !self.explorer.link(key.owner()).is_online() {
+                self.explorer.abandon(key, "not connected");
+                continue;
+            }
+            match key {
+                LoadKey::Objects(id, schema) => self.backend.load_objects(id, schema),
+                LoadKey::Columns(id, schema, relation) => {
+                    self.backend.load_columns(id, schema, relation);
+                }
+                LoadKey::ForeignKeys(id, schema) => self.backend.load_foreign_keys(id, schema),
+            }
+        }
+        if let Some(wait) = self.explorer.retries.next_due(now) {
+            ctx.request_repaint_after(wait);
         }
     }
 
@@ -2784,6 +2810,7 @@ impl eframe::App for VioletApp {
             .map(|info| (info.id.as_str().to_owned(), info.language))
             .collect();
         self.handle_events(ctx);
+        self.retry_loads(ctx);
         self.poll_agent(ctx);
         self.capture_shortcut(ctx);
         self.shortcuts(ctx);
