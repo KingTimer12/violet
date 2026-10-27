@@ -2298,6 +2298,42 @@ pub struct Signature {
     pub active: Option<Range<usize>>,
 }
 
+/// The words of a Redis line as the server reads them, quotes keeping their
+/// blanks: each with its byte range, quotes included, and its text without
+/// them. A quote left open runs to the end of the line.
+fn redis_words(line: &str) -> Vec<(Range<usize>, String)> {
+    let mut words = Vec::new();
+    let mut chars = line.char_indices().peekable();
+    while let Some(&(start, first)) = chars.peek() {
+        if first.is_ascii_whitespace() {
+            chars.next();
+            continue;
+        }
+        let mut value = String::new();
+        let mut quote = None;
+        let mut end = line.len();
+        while let Some((at, c)) = chars.next() {
+            match quote {
+                Some(_) if c == '\\' => {
+                    if let Some((_, escaped)) = chars.next() {
+                        value.push(escaped);
+                    }
+                }
+                Some(open) if c == open => quote = None,
+                Some(_) => value.push(c),
+                None if c == '"' || c == '\'' => quote = Some(c),
+                None if c.is_ascii_whitespace() => {
+                    end = at;
+                    break;
+                }
+                None => value.push(c),
+            }
+        }
+        words.push((start..end, value));
+    }
+    words
+}
+
 /// The syntax of the Redis command the cursor's line holds, once its name
 /// is complete (a space after it), and which argument the cursor is in.
 pub fn redis_signature(text: &str, cursor: usize) -> Option<Signature> {
@@ -2307,16 +2343,14 @@ pub fn redis_signature(text: &str, cursor: usize) -> Option<Signature> {
     }
     let line_start = text[..cursor].rfind('\n').map_or(0, |at| at + 1);
     let head = &text[line_start..cursor];
-    let words: Vec<String> = match violet_lang::redis::argv(head) {
-        Ok(args) => args
-            .iter()
-            .map(|arg| String::from_utf8_lossy(arg).into_owned())
-            .collect(),
-        Err(_) => head.split_ascii_whitespace().map(str::to_owned).collect(),
-    };
+    let args = redis_words(head);
+    let words: Vec<String> = args.iter().map(|(_, word)| word.clone()).collect();
     // The name is done once a blank follows it (both words, for a container).
-    let typing = !head.ends_with(char::is_whitespace);
-    let completed = words.len() - usize::from(typing && !words.is_empty());
+    // A word in an open quote runs to the cursor, blanks and all.
+    let typing = args
+        .last()
+        .is_some_and(|(range, _)| range.end == head.len());
+    let completed = words.len() - usize::from(typing);
     let skip = words.first().map_or(1, |w| {
         if is_container(&w.to_ascii_uppercase()) {
             2
@@ -2436,30 +2470,25 @@ pub fn redis_hover(text: &str, offset: usize) -> Option<Hover> {
         .find('\n')
         .map_or(text.len(), |at| offset + at);
     let line = &text[line_start..line_end];
-    let blank = |c: char| c.is_ascii_whitespace();
-    let words: Vec<(usize, &str)> = line
-        .split(blank)
-        .scan(0, |at, part| {
-            let start = *at;
-            *at += part.len() + 1;
-            Some((start, part))
-        })
-        .filter(|(_, part)| !part.is_empty())
-        .collect();
+    let words = redis_words(line);
     let at = offset - line_start;
     let hit = words
         .iter()
-        .position(|(start, part)| (*start..=*start + part.len()).contains(&at))?;
-    let names: Vec<&str> = words.iter().take(2).map(|(_, part)| *part).collect();
+        .position(|(range, _)| (range.start..=range.end).contains(&at))?;
+    let names: Vec<&str> = words
+        .iter()
+        .take(2)
+        .map(|(_, word)| word.as_str())
+        .collect();
     let container = is_container(&names.first()?.to_ascii_uppercase());
     // The command's own words: one, or two for a container.
     if hit > usize::from(container) {
         return None;
     }
     let found = command(&names)?;
-    let (start, part) = words[hit];
+    let range = &words[hit].0;
     Some(Hover {
-        range: line_start + start..line_start + start + part.len(),
+        range: line_start + range.start..line_start + range.end,
         title: found.name.to_owned(),
         detail: found.syntax.to_owned(),
     })
@@ -4261,6 +4290,50 @@ mod tests {
         // Typing the bracket's end opens the list by itself.
         assert!(opens_by_itself("INSERT INTO customers (id)", 26));
         assert!(!opens_by_itself("SELECT (a)", 10));
+    }
+
+    #[test]
+    fn redis_words_keep_quoted_blanks_together() {
+        let line = r#"SET "a b" 'it\'s' x"#;
+        let words = redis_words(line);
+        let seen: Vec<(&str, &str)> = words
+            .iter()
+            .map(|(range, word)| (&line[range.clone()], word.as_str()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("SET", "SET"),
+                ("\"a b\"", "a b"),
+                (r"'it\'s'", "it's"),
+                ("x", "x")
+            ]
+        );
+        // An open quote runs to the end.
+        let open = redis_words("SET k \"hello wor");
+        assert_eq!(open[2], (6..16, "hello wor".to_owned()));
+        assert!(redis_words("  ").is_empty());
+    }
+
+    #[test]
+    fn redis_quoted_arguments_count_as_one() {
+        let signature = |text: &str| {
+            let cursor = text.find('|').expect("cursor");
+            let sig = redis_signature(&text.replacen('|', "", 1), cursor).expect("signature");
+            sig.active.map(|range| sig.label[range].to_owned())
+        };
+        // The value is being written whether or not the key holds blanks,
+        // or the value's quote is still open.
+        assert_eq!(signature("SET \"a b\" |"), signature("SET k |"));
+        assert_eq!(signature("SET k \"hello wor|"), signature("SET k v|"));
+        assert_eq!(signature("SET 'a b c' \"x y|"), signature("SET k v|"));
+        assert_ne!(signature("SET k |"), signature("SET |"));
+        // A quoted command name is still the command.
+        let hover = redis_hover("\"get\" k", 2).expect("command");
+        assert_eq!(hover.title, "GET");
+        assert_eq!(hover.range, 0..5);
+        // A quoted argument with a blank is no command word.
+        assert!(redis_hover("SET \"a get\" 1", 8).is_none());
     }
 
     #[test]
