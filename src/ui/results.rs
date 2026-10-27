@@ -24,6 +24,7 @@ use super::workspace::{
 use crate::export::{to_delimited, write_row};
 use crate::plan::Plan;
 use crate::sql;
+use crate::timing::{Breakdown, Part};
 
 const ROW_HEIGHT: f32 = 26.0;
 
@@ -100,6 +101,14 @@ pub fn show(
             let elapsed = output.elapsed;
             let set = &output.sets[tab.active_set];
             let plan = explained(tab.last_run.as_ref(), set);
+            // What an analyzed plan says the server spent, in seconds.
+            let server_time = plan
+                .as_ref()
+                .filter(|plan| plan.analyzed())
+                .map(|plan| {
+                    (plan.planning_ms.unwrap_or(0.0) + plan.execution_ms.unwrap_or(0.0)) / 1000.0
+                })
+                .filter(|seconds| *seconds > 0.0);
             let server_rows = set.rows.len();
             let pending = Pending {
                 cells: tab
@@ -179,7 +188,11 @@ pub fn show(
                             {
                                 actions.push(Action::RefreshTab(tab.id));
                             }
-                            ui.label(RichText::new(format_duration(elapsed)).color(palette.dim));
+                            let took = ui
+                                .label(RichText::new(format_duration(elapsed)).color(palette.dim));
+                            let server = server_time.map(std::time::Duration::from_secs_f64);
+                            let breakdown = Breakdown::new(elapsed, tab.rtt, server, tab.render);
+                            took.on_hover_ui(|ui| timing_card(ui, &palette, &breakdown));
                             if let Some(age) = output.cached {
                                 widgets::pill(
                                     ui,
@@ -299,7 +312,44 @@ pub fn show(
                     ),
                 );
             }
+            if let Some(at) = tab.received.take() {
+                tab.render = Some(at.elapsed());
+            }
         }
+    }
+}
+
+/// A run's time split by where it went, each part with its share.
+fn timing_card(ui: &mut Ui, palette: &Palette, breakdown: &Breakdown) {
+    ui.label(
+        RichText::new(format!("Where {} went", format_duration(breakdown.felt())))
+            .font(theme::semibold(13.0)),
+    );
+    let felt = breakdown.felt().as_secs_f64().max(f64::EPSILON);
+    for (part, took) in &breakdown.parts {
+        let share = (took.as_secs_f64() / felt) as f32;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(part.label()).color(palette.secondary));
+            let (bar, response) = ui.allocate_exact_size(Vec2::new(120.0, 6.0), Sense::hover());
+            ui.painter().rect_filled(bar, 3.0, palette.outline);
+            let mut filled = bar;
+            filled.set_width(bar.width() * share);
+            let color = if breakdown.slowest() == Some(*part) {
+                palette.warning
+            } else {
+                palette.accent
+            };
+            ui.painter().rect_filled(filled, 3.0, color);
+            ui.label(format_duration(*took));
+            response.on_hover_text(part.hint());
+        });
+    }
+    if breakdown
+        .parts
+        .iter()
+        .all(|(part, _)| *part != Part::Network)
+    {
+        ui.label(RichText::new("No round trip measured yet").color(palette.dim));
     }
 }
 

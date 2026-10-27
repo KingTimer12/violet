@@ -85,6 +85,15 @@ fn redis_profile(text: &str) -> Result<String, String> {
     ))
 }
 
+/// The cheapest statement of the language, to time a round trip with.
+pub fn ping(language: Language) -> &'static str {
+    match language {
+        Language::Sql => "SELECT 1",
+        Language::Redis => "PING",
+        Language::Mongodb => "db.runCommand({ ping: 1 })",
+    }
+}
+
 /// The first cell of a result set of one cell.
 fn only_cell(set: &ResultSet) -> Option<&str> {
     set.rows.get(0, 0)?
@@ -176,6 +185,13 @@ pub fn editor_name(language: Language) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_language_pings() {
+        assert_eq!(ping(Language::Sql), "SELECT 1");
+        assert_eq!(ping(Language::Redis), "PING");
+        assert!(ping(Language::Mongodb).contains("ping"));
+    }
 
     #[test]
     fn explains_by_language() {

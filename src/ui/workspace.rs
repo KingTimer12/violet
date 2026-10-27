@@ -142,6 +142,12 @@ pub struct QueryTab {
     pub snippet: Option<crate::editing::Snippet>,
     /// How an explain's result is shown.
     pub plan_view: super::plan_view::View,
+    /// When the shown result reached the app, until it is on screen.
+    pub received: Option<Instant>,
+    /// How long the shown result took to reach the screen.
+    pub render: Option<Duration>,
+    /// The connection's round trip when the shown result was read.
+    pub rtt: Option<Duration>,
     /// What the tab's explain asks of the server.
     pub explain: crate::dialect::Explain,
     /// The file the script is saved in, and its text as last read or
@@ -308,6 +314,9 @@ impl Workspace {
             diagnostics: crate::diagnostics::Tracker::default(),
             snippet: None,
             plan_view: super::plan_view::View::default(),
+            received: None,
+            render: None,
+            rtt: None,
             explain: crate::dialect::Explain::default(),
             file: None,
             source: None,

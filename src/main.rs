@@ -18,10 +18,12 @@ mod format;
 mod geometry;
 mod lang;
 mod mcp;
+mod metrics;
 mod mongo;
 mod plan;
 mod settings;
 mod sql;
+mod timing;
 mod ui;
 mod update;
 

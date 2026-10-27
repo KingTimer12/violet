@@ -22,6 +22,7 @@ pub mod icons;
 mod key_flow;
 mod keys_flow;
 mod mcp_flow;
+mod metrics_flow;
 mod plan_view;
 mod project_flow;
 mod providers;
@@ -154,6 +155,8 @@ pub struct VioletApp {
     rename_requests: HashMap<violet_app::RequestId, rename_flow::Pending>,
     /// Commands the tree ran on keys, waiting for their answer.
     key_requests: HashMap<violet_app::RequestId, key_flow::Pending>,
+    /// Pings sent, by the connection they measure.
+    ping_requests: HashMap<violet_app::RequestId, ConnectionId>,
     /// Actions to run once their connection opens.
     waiting: Vec<(ConnectionId, Action)>,
     /// The format and header choice advanced copy starts with.
@@ -330,6 +333,7 @@ impl VioletApp {
             drop_prompt: None,
             rename_requests: HashMap::new(),
             key_requests: HashMap::new(),
+            ping_requests: HashMap::new(),
             copy_choice: (crate::export::Format::Tsv, true),
             confirm_delete: None,
             confirm_project_delete: None,
@@ -656,6 +660,8 @@ impl VioletApp {
                     .extend(ready.into_iter().map(|(_, action)| action));
                 self.explorer.links.insert(id, Link::Online(server));
                 self.explorer.forget(id);
+                self.explorer.latency.remove(&id);
+                self.ping(id);
                 self.explorer.schemas.insert(id, Loadable::Loading);
                 self.backend.load_schemas(id);
                 if self.shows_all_databases(id) {
@@ -813,6 +819,10 @@ impl VioletApp {
                     self.renamed(ctx, pending, &result);
                     return;
                 }
+                if let Some(connection) = self.ping_requests.remove(&request) {
+                    self.pinged(connection, &result);
+                    return;
+                }
                 if let Some(pending) = self.key_requests.remove(&request) {
                     self.key_command_done(ctx, pending, &result);
                     return;
@@ -927,6 +937,11 @@ impl VioletApp {
                     tab.active_set = 0;
                     tab.grid_selection.clear();
                 }
+                tab.received = Some(Instant::now());
+                tab.render = None;
+                tab.rtt = connection
+                    .and_then(|id| self.explorer.latency.get(&id))
+                    .and_then(crate::metrics::Latency::last);
                 tab.outcome = Some(match result {
                     Ok(mut output) => {
                         // A key's profile is four answers: show it as one.
@@ -962,6 +977,9 @@ impl VioletApp {
                 });
                 if let Some(entry) = entry {
                     self.record(entry);
+                }
+                if let Some(id) = connection {
+                    self.ping_if_stale(id);
                 }
                 if let Some(id) = ddl {
                     self.reload_catalog(id);

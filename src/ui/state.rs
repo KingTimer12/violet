@@ -305,6 +305,8 @@ pub struct Explorer {
     pub database_filters: BTreeMap<String, BTreeSet<String>>,
     /// Each connection's transaction, as the backend last reported it.
     pub transactions: HashMap<ConnectionId, violet_app::Transaction>,
+    /// Each connection's recent round trips.
+    pub latency: HashMap<ConnectionId, crate::metrics::Latency>,
     /// A node was clicked since this was last cleared.
     pub picked: bool,
     /// The tree was clicked last, so F-key shortcuts act on its selection.
