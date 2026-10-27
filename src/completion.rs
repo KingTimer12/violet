@@ -6,8 +6,10 @@
 //! Like the lexer it reads tokens, not a grammar, so it never fails: text it
 //! cannot place gets columns and keywords.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::rc::Rc;
 
 use violet_core::{ColumnInfo, DbObject, ForeignKey, ObjectKind};
 
@@ -671,8 +673,10 @@ pub fn complete(
     if cursor > text.len() || !text.is_char_boundary(cursor) {
         return None;
     }
-    let (all, separators) = lex(text, options.family);
-    if inside_literal(text, &all, cursor) {
+    let analysis = analyze(text, options.family);
+    let (all, separators, significant) =
+        (&analysis.all, &analysis.separators, &analysis.significant);
+    if inside_literal(text, all, cursor) {
         return None;
     }
     let start = word_start(text, cursor);
@@ -682,10 +686,6 @@ pub fn complete(
     let end = word_end(text, cursor);
     let (qualifiers, qualified_start, quoted) = qualifiers(text, start);
 
-    let significant: Vec<Token> = all
-        .into_iter()
-        .filter(|token| !matches!(token.kind, TokenKind::Whitespace | TokenKind::Comment))
-        .collect();
     let after = separators
         .iter()
         .rfind(|separator| separator.end <= qualified_start)
@@ -702,7 +702,7 @@ pub fn complete(
         .filter(|token| token.range.end <= qualified_start)
         .collect();
 
-    let script = Script::read(text, &significant);
+    let script = &analysis.script;
     let mut scope = Scope::read(text, statement, qualified_start);
     // The word being typed is no table yet.
     scope.relations.retain(|r| r.at != qualified_start);
@@ -718,7 +718,7 @@ pub fn complete(
     let mut builder = Builder {
         catalog,
         options,
-        script: &script,
+        script,
         scope: &scope,
         cursor: qualified_start,
         alias_tables,
@@ -787,6 +787,58 @@ pub fn opens_by_itself(text: &str, cursor: usize) -> bool {
 }
 
 // ---- reading the text -----------------------------------------------------
+
+/// What reading a text yields: its tokens, where its statements end and what
+/// its `CREATE`s make.
+struct Analysis {
+    text: String,
+    family: Family,
+    all: Vec<Token>,
+    separators: Vec<Range<usize>>,
+    /// The tokens that are neither blanks nor comments.
+    significant: Vec<Token>,
+    script: Script,
+}
+
+/// How many `CREATE` statements [`CREATES`] remembers.
+const CREATE_MEMORY: usize = 2048;
+
+thread_local! {
+    /// The last text analysed: completion runs again for the same text when
+    /// the cursor moves or the catalog answers, and reading it is the cost
+    /// that grows with the script.
+    static ANALYSIS: RefCell<Option<Rc<Analysis>>> = const { RefCell::new(None) };
+    /// What each `CREATE` statement reads to, by its source: a script that
+    /// changes after its `CREATE`s reads only the statement that changed.
+    static CREATES: RefCell<HashMap<String, Rc<Script>>> = RefCell::new(HashMap::new());
+}
+
+/// Reads `text`, or hands back the reading of the same text.
+fn analyze(text: &str, family: Family) -> Rc<Analysis> {
+    if let Some(kept) = ANALYSIS.with(|kept| kept.borrow().clone())
+        && kept.family == family
+        && kept.text == text
+    {
+        return kept;
+    }
+    let (all, separators) = lex(text, family);
+    let significant: Vec<Token> = all
+        .iter()
+        .filter(|token| !matches!(token.kind, TokenKind::Whitespace | TokenKind::Comment))
+        .cloned()
+        .collect();
+    let script = Script::read(text, &significant);
+    let analysis = Rc::new(Analysis {
+        text: text.to_owned(),
+        family,
+        all,
+        separators,
+        significant,
+        script,
+    });
+    ANALYSIS.with(|kept| *kept.borrow_mut() = Some(Rc::clone(&analysis)));
+    analysis
+}
 
 /// The text's tokens and where its statements end. A `;` inside a string,
 /// a comment or a `$$` body ends nothing; MySQL knows no `$$` bodies, and
@@ -1409,7 +1461,30 @@ impl Script {
             .enumerate()
             .filter(|(_, token)| is_word(text, Some(token), "CREATE"))
         {
-            script.read_create(text, tokens, create + 1);
+            // The statement, and the token after it, which a table's end
+            // can look at.
+            let end = tokens[create..]
+                .iter()
+                .position(|token| is(text, token, ";"))
+                .map_or(tokens.len(), |at| create + at + 1);
+            let last = tokens.get(end).unwrap_or(&tokens[end - 1]);
+            let source = &text[tokens[create].range.start..last.range.end];
+            let kept = CREATES.with(|memory| memory.borrow().get(source).cloned());
+            let read = kept.unwrap_or_else(|| {
+                let mut read = Self::default();
+                read.read_create(text, tokens, create + 1);
+                let read = Rc::new(read);
+                CREATES.with(|memory| {
+                    let mut memory = memory.borrow_mut();
+                    if memory.len() >= CREATE_MEMORY {
+                        memory.clear();
+                    }
+                    memory.insert(source.to_owned(), Rc::clone(&read));
+                });
+                read
+            });
+            script.created.extend(read.created.iter().cloned());
+            script.keys.extend(read.keys.iter().cloned());
         }
         script
     }
@@ -3358,6 +3433,42 @@ mod tests {
         assert!(found.contains(&"o.total".to_owned()), "{found:?}");
         let next = "DELIMITER //\nSELECT 1 FROM orders //\nSELECT na| FROM customers //";
         assert_eq!(with(Family::MySql, next)[0], "name");
+    }
+
+    #[test]
+    fn the_same_text_is_read_once() {
+        let text = "CREATE TABLE notes (id int, body text);\nSELECT 1";
+        let first = analyze(text, Family::Other);
+        assert!(Rc::ptr_eq(&first, &analyze(text, Family::Other)));
+        // Another dialect splits statements another way.
+        assert!(!Rc::ptr_eq(&first, &analyze(text, Family::MySql)));
+        assert!(!Rc::ptr_eq(&first, &analyze("SELECT 2", Family::Other)));
+    }
+
+    #[test]
+    fn a_create_that_did_not_change_is_not_read_again() {
+        let created = |script: &str| {
+            let tokens: Vec<Token> = sql::tokens(script)
+                .filter(|t| !matches!(t.kind, TokenKind::Whitespace | TokenKind::Comment))
+                .collect();
+            Script::read(script, &tokens)
+        };
+        let kept = || CREATES.with(|memory| memory.borrow().len());
+        let one = "CREATE TABLE only_once_here (id int PRIMARY KEY, body text);\n";
+        let first = created(&format!("{one}SELECT a"));
+        let known = kept();
+        // The text after it moved on; the statement's reading did not.
+        let next = created(&format!("{one}SELECT abc FROM only"));
+        assert_eq!(kept(), known);
+        assert_eq!(first.created[0].columns, next.created[0].columns);
+        assert_eq!(next.created[0].primary, ["id"]);
+        // Editing the statement reads it again.
+        let edited = created(&one.replace("body", "note"));
+        assert_eq!(kept(), known + 1);
+        assert_eq!(edited.created[0].columns, ["id", "note"]);
+        // The memory gives the same script as reading fresh.
+        let again = created(&format!("{one}{one}"));
+        assert_eq!(again.created.len(), 2);
     }
 
     /// 20 schemas of 500 tables, and a script of 300 `CREATE TABLE`s.
