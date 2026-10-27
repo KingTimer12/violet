@@ -812,9 +812,19 @@ fn refresh(
     let stale = popup.completion.as_ref().is_none_or(|completion| {
         popup.cursor != cursor
             || popup.connection != assist.connection
-            || !completion.needs.is_empty()
+            || completion.needs_answered(assist.catalog)
     });
     if !stale {
+        // Still waiting on the catalog: ask again for what is missing, which
+        // costs nothing where it is loading, but do not make the list again.
+        if let (Some(connection), Some(completion)) = (assist.connection, &popup.completion)
+            && !completion.needs.is_empty()
+        {
+            actions.push(Action::LoadForCompletion(
+                connection,
+                completion.needs.clone(),
+            ));
+        }
         return;
     }
     let fresh = popup.completion.is_none()
@@ -1084,5 +1094,90 @@ mod tests {
         assert!(!opened("FROM ", Language::Redis));
         assert!(!opened("db.find({ FROM ", Language::Mongodb));
         assert!(opened("db.", Language::Mongodb));
+    }
+
+    use std::cell::Cell;
+
+    use crate::completion::{History, Need, Options};
+    use crate::dialect::Family;
+    use crate::settings::KeywordCase;
+    use violet_core::{ColumnInfo, DbObject, ForeignKey};
+
+    /// A catalog with `public` loaded or not, counting how often it is read.
+    struct Counting {
+        loaded: bool,
+        reads: Cell<usize>,
+    }
+
+    impl Catalog for Counting {
+        fn schemas(&self) -> &[String] {
+            self.reads.set(self.reads.get() + 1);
+            &[]
+        }
+        fn objects(&self, _: &str) -> Option<&[DbObject]> {
+            self.loaded.then_some(&[][..])
+        }
+        fn columns(&self, _: &str, _: &str) -> Option<&[ColumnInfo]> {
+            None
+        }
+        fn foreign_keys(&self, _: &str) -> Option<&[ForeignKey]> {
+            None
+        }
+    }
+
+    #[test]
+    fn a_list_waiting_on_the_catalog_is_not_made_again_every_frame() {
+        let history = History::default();
+        let search = vec!["public".to_owned()];
+        let quote = |name: &str| name.to_owned();
+        let options = Options {
+            search: &search,
+            database: None,
+            quote: &quote,
+            family: Family::Other,
+            case: KeywordCase::default(),
+            history: &history,
+        };
+        let connection = Some(ConnectionId::new());
+        let sql = "SELECT * FROM ";
+        let mut popup = Popup::default();
+        let mut actions = Vec::new();
+        let show = |popup: &mut Popup, catalog: &Counting, actions: &mut Vec<Action>| {
+            let assist = Assist {
+                connection,
+                language: Language::Sql,
+                catalog,
+                options: Options { ..options },
+                keys: None,
+            };
+            refresh(popup, sql, sql.len(), &assist, actions);
+        };
+        let waiting = Counting {
+            loaded: false,
+            reads: Cell::new(0),
+        };
+        show(&mut popup, &waiting, &mut actions);
+        let first = waiting.reads.get();
+        assert!(first > 0);
+        assert_eq!(actions.len(), 1);
+        // Frames while it loads ask again but do not read the catalog.
+        show(&mut popup, &waiting, &mut actions);
+        show(&mut popup, &waiting, &mut actions);
+        assert_eq!(waiting.reads.get(), first);
+        assert_eq!(actions.len(), 3);
+        assert!(matches!(
+            &actions[2],
+            Action::LoadForCompletion(_, needs) if needs == &[Need::Objects("public".into())]
+        ));
+        // Once it arrives the list is made again.
+        let loaded = Counting {
+            loaded: true,
+            reads: Cell::new(0),
+        };
+        show(&mut popup, &loaded, &mut actions);
+        assert!(loaded.reads.get() > 0);
+        // Nothing is left to wait for, and nothing to list.
+        assert_eq!(actions.len(), 3);
+        assert!(popup.completion.is_none());
     }
 }

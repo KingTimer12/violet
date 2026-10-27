@@ -36,6 +36,21 @@ pub enum Need {
     KeysMatching(String, String),
 }
 
+impl Completion {
+    /// Whether the catalog now answers some of what [`Self::needs`] lists, so
+    /// the list is worth making again. Key lookups cannot be told from here:
+    /// they always count.
+    #[must_use]
+    pub fn needs_answered(&self, catalog: &dyn Catalog) -> bool {
+        self.needs.iter().any(|need| match need {
+            Need::Objects(schema) => catalog.objects(schema).is_some(),
+            Need::Columns(schema, relation) => catalog.columns(schema, relation).is_some(),
+            Need::ForeignKeys(schema) => catalog.foreign_keys(schema).is_some(),
+            Need::Keys(_) | Need::KeysMatching(..) => true,
+        })
+    }
+}
+
 /// What a suggestion is, in the order they are listed when equally good.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Kind {
