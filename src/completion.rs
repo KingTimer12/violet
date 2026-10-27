@@ -2074,7 +2074,7 @@ fn context(text: &str, before: &[&Token], scope: &Scope) -> Context {
         if is(text, last, ")")
             && clause.as_deref() == Some("INTO")
             && is_word(text, before.first().copied(), "INSERT")
-            && let Some(columns) = typed_columns(text, &before)
+            && let Some(columns) = typed_columns(text, before)
         {
             return Context::InsertValues(columns);
         }

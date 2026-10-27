@@ -301,7 +301,7 @@ mod tests {
         assert!(snippet.follow(22, 16));
         assert_eq!(snippet.next(16), Some(18..18));
         // Moving the cursor past the stop with edits ends it.
-        let mut snippet = Snippet::new(0, &[2..2], 10).expect("stops");
+        let mut snippet = Snippet::new(0, std::slice::from_ref(&(2..2)), 10).expect("stops");
         assert!(!snippet.follow(14, 9));
     }
 }
