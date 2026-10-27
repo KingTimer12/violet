@@ -901,6 +901,20 @@ fn alias(text: &str, token: Option<&Token>) -> Option<String> {
     .flatten()
 }
 
+/// The index after `IF [NOT] EXISTS` at `tokens[at]`, as in `CREATE TABLE`,
+/// `DROP INDEX` or `ALTER TABLE ... ADD COLUMN`; `at` when it is not there.
+fn if_exists(text: &str, tokens: &[Token], at: usize) -> usize {
+    if !is_word(text, tokens.get(at), "IF") {
+        return at;
+    }
+    let not = usize::from(is_word(text, tokens.get(at + 1), "NOT"));
+    if is_word(text, tokens.get(at + 1 + not), "EXISTS") {
+        at + 2 + not
+    } else {
+        at
+    }
+}
+
 /// `a`, `a.b` or `a.b.c` from `tokens[at]`, and the index after it.
 fn dotted(text: &str, tokens: &[Token], at: usize) -> Option<(Vec<String>, usize)> {
     let mut parts = vec![name(text, tokens.get(at)?)?];
@@ -1151,6 +1165,10 @@ fn relations(text: &str, tokens: &[Token]) -> Vec<Relation> {
                     from = None;
                 }
             }
+            _ if expect && if_exists(text, tokens, index) > index => {
+                index = if_exists(text, tokens, index);
+                continue;
+            }
             _ if expect => {
                 if let Some((mut parts, mut next)) = dotted(text, tokens, index) {
                     let quoted = tokens[next - 1].kind == TokenKind::QuotedIdentifier;
@@ -1317,10 +1335,7 @@ impl Script {
             Some("VIEW") => true,
             _ => return,
         };
-        at += 1;
-        if is_word(text, tokens.get(at), "IF") {
-            at += 3;
-        }
+        let at = if_exists(text, tokens, at + 1);
         let Some((mut parts, mut next)) = dotted(text, tokens, at) else {
             return;
         };
@@ -1499,6 +1514,16 @@ fn context(text: &str, before: &[&Token], scope: &Scope) -> Context {
     let Some(last) = before.last() else {
         return Context::Start;
     };
+    // `DROP TABLE IF EXISTS` is still a table slot.
+    if is_word(text, Some(last), "EXISTS") {
+        let mut at = before.len() - 1;
+        if at > 0 && is_word(text, Some(before[at - 1]), "NOT") {
+            at -= 1;
+        }
+        if at > 0 && is_word(text, Some(before[at - 1]), "IF") {
+            return context(text, &before[..at - 1], scope);
+        }
+    }
     let previous = before.len().checked_sub(2).map(|at| before[at]);
     if is(text, last, ":") && previous.is_some_and(|p| is(text, p, ":")) {
         return Context::Type;
@@ -3130,5 +3155,27 @@ mod tests {
                 .is_empty()
         );
         assert!(at(&shop, "SELECT * FROM other.public.|").items.is_empty());
+    }
+
+    #[test]
+    fn if_exists_is_read_where_it_is_written() {
+        let shop = shop();
+        let script = "CREATE TABLE IF NOT EXISTS notes (id int, body text);\nSELECT bo| FROM notes";
+        assert_eq!(inserts(&at(&shop, script))[0], "body");
+        let plain = "CREATE TABLE notes (id int, body text);\nSELECT bo| FROM notes";
+        assert_eq!(inserts(&at(&shop, plain))[0], "body");
+        assert_eq!(
+            inserts(&at(&shop, "DROP TABLE IF EXISTS ord|"))[0],
+            "orders"
+        );
+        assert_eq!(
+            inserts(&at(&shop, "ALTER TABLE IF EXISTS cust|"))[0],
+            "customers"
+        );
+        let alter = at(
+            &shop,
+            "ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS note text; SELECT tot| FROM orders",
+        );
+        assert_eq!(inserts(&alter)[0], "total");
     }
 }
