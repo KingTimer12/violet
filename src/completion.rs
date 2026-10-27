@@ -47,16 +47,16 @@ pub enum Need {
 }
 
 impl Completion {
-    /// Whether the catalog now answers some of what [`Self::needs`] lists, so
-    /// the list is worth making again. Key lookups cannot be told from here:
-    /// they always count.
+    /// Whether the catalog, or a key-value database's `keys`, now answers
+    /// some of what [`Self::needs`] lists, so the list is worth making again.
     #[must_use]
-    pub fn needs_answered(&self, catalog: &dyn Catalog) -> bool {
+    pub fn needs_answered(&self, catalog: &dyn Catalog, keys: Option<&Keyspace<'_>>) -> bool {
         self.needs.iter().any(|need| match need {
             Need::Objects(schema) => catalog.objects(schema).is_some(),
             Need::Columns(schema, relation) => catalog.columns(schema, relation).is_some(),
             Need::ForeignKeys(schema) => catalog.foreign_keys(schema).is_some(),
-            Need::Keys(_) | Need::KeysMatching(..) => true,
+            Need::Keys(_) => keys.is_some_and(|keys| keys.listed.is_some()),
+            Need::KeysMatching(_, prefix) => keys.is_some_and(|keys| keys.covers(prefix)),
         })
     }
 }
@@ -179,6 +179,18 @@ pub struct Keyspace<'a> {
     pub whole: bool,
     /// Keys looked up by prefix: the prefix, and its keys once found.
     pub found: &'a [(&'a str, Option<&'a [DbObject]>)],
+}
+
+impl Keyspace<'_> {
+    /// Whether the keys starting with `prefix` are all known: the tree
+    /// listed every key, or a lookup by a prefix of it answered.
+    fn covers(&self, prefix: &str) -> bool {
+        self.whole
+            || self
+                .found
+                .iter()
+                .any(|(by, keys)| prefix.starts_with(by) && keys.is_some())
+    }
 }
 
 /// How many keys a lookup by prefix asks for.
@@ -377,7 +389,7 @@ pub fn complete_redis(
 /// The known keys for a key argument, and what to load for the rest.
 fn key_items(keys: &Keyspace<'_>, prefix: &str, items: &mut Vec<Item>, needs: &mut Vec<Need>) {
     let found = keys.found.iter().filter(|(by, _)| prefix.starts_with(by));
-    let covered = keys.whole || found.clone().any(|(_, keys)| keys.is_some());
+    let covered = keys.covers(prefix);
     let mut seen = HashSet::new();
     let lists = keys
         .listed
@@ -3319,6 +3331,41 @@ mod tests {
         let waiting = keyspace(None);
         let got = complete_redis("GET us", 6, Some(&waiting), &History::default());
         assert_eq!(got.expect("completion").needs[0], Need::Keys("db0".into()));
+    }
+
+    #[test]
+    fn key_needs_are_answered_by_the_keys_not_always() {
+        let shop = shop();
+        let none = Completion {
+            needs: vec![Need::Keys("db0".into())],
+            ..Completion::default()
+        };
+        let keys = [object("user:1", ObjectKind::Key)];
+        // Not listed yet: still waiting, whatever the catalog says.
+        assert!(!none.needs_answered(&shop, None));
+        assert!(!none.needs_answered(&shop, Some(&keyspace(None))));
+        assert!(none.needs_answered(&shop, Some(&keyspace(Some(&keys)))));
+
+        let lookup = Completion {
+            needs: vec![Need::KeysMatching("db0".into(), "user:".into())],
+            ..Completion::default()
+        };
+        let mut space = keyspace(Some(&keys));
+        space.whole = false;
+        assert!(!lookup.needs_answered(&shop, Some(&space)));
+        // A lookup on its way is not an answer; one on a prefix of it is.
+        let loading = [("user:", None)];
+        space.found = &loading;
+        assert!(!lookup.needs_answered(&shop, Some(&space)));
+        let answered = [("us", Some(&keys[..]))];
+        space.found = &answered;
+        assert!(lookup.needs_answered(&shop, Some(&space)));
+        let other = [("or", Some(&keys[..]))];
+        space.found = &other;
+        assert!(!lookup.needs_answered(&shop, Some(&space)));
+        // The whole keyspace listed leaves nothing to look up.
+        space.whole = true;
+        assert!(lookup.needs_answered(&shop, Some(&space)));
     }
 
     #[test]

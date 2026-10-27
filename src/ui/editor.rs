@@ -812,7 +812,7 @@ fn refresh(
     let stale = popup.completion.as_ref().is_none_or(|completion| {
         popup.cursor != cursor
             || popup.connection != assist.connection
-            || completion.needs_answered(assist.catalog)
+            || completion.needs_answered(assist.catalog, assist.keys.as_ref())
     });
     if !stale {
         // Still waiting on the catalog: ask again for what is missing, which
