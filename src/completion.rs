@@ -656,7 +656,7 @@ pub fn complete(
     if cursor > text.len() || !text.is_char_boundary(cursor) {
         return None;
     }
-    let all: Vec<Token> = sql::tokens(text).collect();
+    let (all, separators) = lex(text, options.family);
     if inside_literal(text, &all, cursor) {
         return None;
     }
@@ -671,16 +671,17 @@ pub fn complete(
         .into_iter()
         .filter(|token| !matches!(token.kind, TokenKind::Whitespace | TokenKind::Comment))
         .collect();
-    let semicolon = |token: &Token| is(text, token, ";");
-    let statement_start = significant
+    let after = separators
         .iter()
-        .rposition(|token| semicolon(token) && token.range.end <= qualified_start)
-        .map_or(0, |index| index + 1);
-    let statement_end = significant[statement_start..]
+        .rfind(|separator| separator.end <= qualified_start)
+        .map_or(0, |separator| separator.end);
+    let until = separators
         .iter()
-        .position(|token| semicolon(token) && token.range.start >= cursor)
-        .map_or(significant.len(), |index| statement_start + index);
-    let statement = &significant[statement_start..statement_end];
+        .find(|separator| separator.start >= cursor)
+        .map_or(text.len(), |separator| separator.start);
+    let statement_start = significant.partition_point(|token| token.range.start < after);
+    let statement_end = significant.partition_point(|token| token.range.end <= until);
+    let statement = &significant[statement_start..statement_end.max(statement_start)];
     let before: Vec<&Token> = statement
         .iter()
         .filter(|token| token.range.end <= qualified_start)
@@ -771,6 +772,90 @@ pub fn opens_by_itself(text: &str, cursor: usize) -> bool {
 }
 
 // ---- reading the text -----------------------------------------------------
+
+/// The text's tokens and where its statements end. A `;` inside a string,
+/// a comment or a `$$` body ends nothing; MySQL knows no `$$` bodies, and
+/// its client ends statements with what `DELIMITER` sets.
+fn lex(text: &str, family: Family) -> (Vec<Token>, Vec<Range<usize>>) {
+    if family != Family::MySql {
+        let tokens: Vec<Token> = sql::tokens(text).collect();
+        let separators = tokens
+            .iter()
+            .filter(|token| is(text, token, ";"))
+            .map(|token| token.range.clone())
+            .collect();
+        return (tokens, separators);
+    }
+    let separators = delimited(text);
+    let mut tokens = Vec::new();
+    let mut from = 0;
+    for separator in separators
+        .iter()
+        .cloned()
+        .chain(std::iter::once(text.len()..text.len()))
+    {
+        tokens.extend(
+            sql::tokens(&text[from..separator.start]).map(|token| Token {
+                kind: token.kind,
+                range: token.range.start + from..token.range.end + from,
+            }),
+        );
+        from = separator.end;
+    }
+    (tokens, separators)
+}
+
+/// Where MySQL's client ends statements: each delimiter outside strings and
+/// comments, and each `DELIMITER` line, which sets the next one.
+fn delimited(text: &str) -> Vec<Range<usize>> {
+    let bytes = text.as_bytes();
+    let mut separators = Vec::new();
+    let mut delimiter = ";".to_owned();
+    let mut at = 0;
+    let mut line_start = true;
+    while at < bytes.len() {
+        if line_start {
+            let line_end = text[at..].find('\n').map_or(text.len(), |end| at + end);
+            let line = text[at..line_end].trim();
+            let mut words = line.split_whitespace();
+            if words
+                .next()
+                .is_some_and(|w| w.eq_ignore_ascii_case("DELIMITER"))
+                && let Some(next) = words.next()
+            {
+                delimiter = next.to_owned();
+                separators.push(at..line_end);
+                at = line_end;
+                continue;
+            }
+        }
+        line_start = bytes[at] == b'\n';
+        if text[at..].starts_with(delimiter.as_str()) {
+            separators.push(at..at + delimiter.len());
+            at += delimiter.len();
+            continue;
+        }
+        at = match bytes[at] {
+            quote @ (b'\'' | b'"' | b'`') => {
+                let mut end = at + 1;
+                while end < bytes.len() && bytes[end] != quote {
+                    end += if bytes[end] == b'\\' { 2 } else { 1 };
+                }
+                end + 1
+            }
+            b'#' => text[at..].find('\n').map_or(text.len(), |end| at + end),
+            b'-' if text[at..].starts_with("-- ") => {
+                text[at..].find('\n').map_or(text.len(), |end| at + end)
+            }
+            b'/' if text[at..].starts_with("/*") => text[at + 2..]
+                .find("*/")
+                .map_or(text.len(), |end| at + end + 4),
+            _ => at + text[at..].chars().next().map_or(1, char::len_utf8),
+        }
+        .min(bytes.len());
+    }
+    separators
+}
 
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '$'
@@ -3177,5 +3262,45 @@ mod tests {
             "ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS note text; SELECT tot| FROM orders",
         );
         assert_eq!(inserts(&alter)[0], "total");
+    }
+
+    #[test]
+    fn statements_end_where_the_database_ends_them() {
+        let shop = shop();
+        let with = |family: Family, text: &str| {
+            let cursor = text.find('|').expect("a cursor");
+            let text = text.replacen('|', "", 1);
+            let search = vec!["public".to_owned()];
+            let quote = |name: &str| format!("`{name}`");
+            let history = History::default();
+            let options = Options {
+                search: &search,
+                database: None,
+                quote: &quote,
+                family,
+                case: KeywordCase::default(),
+                history: &history,
+            };
+            let found = complete(&text, cursor, &shop, &options).expect("a completion");
+            found
+                .items
+                .iter()
+                .map(|item| item.insert.clone())
+                .collect::<Vec<_>>()
+        };
+        // A `;` inside a function body ends nothing.
+        let body = "SELECT tot| FROM orders WHERE id IN (SELECT f()) AND $$ ; $$ = '' AND $fn$ a; b $fn$ = ''";
+        assert_eq!(with(Family::Postgres, body)[0], "total");
+        let after = "CREATE FUNCTION f() RETURNS int AS $$ SELECT 1; SELECT 2 $$ LANGUAGE sql;\nSELECT na| FROM customers";
+        assert_eq!(with(Family::Postgres, after)[0], "name");
+        // MySQL ends statements with the delimiter, and `$$` can be one.
+        let mysql = "DELIMITER $$\nCREATE PROCEDURE p() BEGIN SELECT 1; END $$\nDELIMITER ;\nSELECT na| FROM customers;";
+        assert_eq!(with(Family::MySql, mysql)[0], "name");
+        let block = "DELIMITER //\nCREATE PROCEDURE p() BEGIN\n  SELECT 1 FROM orders;\n  SELECT tot| FROM orders o;\nEND //\nDELIMITER ;";
+        // The whole block is one statement: both tables are in scope.
+        let found = with(Family::MySql, block);
+        assert!(found.contains(&"o.total".to_owned()), "{found:?}");
+        let next = "DELIMITER //\nSELECT 1 FROM orders //\nSELECT na| FROM customers //";
+        assert_eq!(with(Family::MySql, next)[0], "name");
     }
 }
