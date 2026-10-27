@@ -9,6 +9,7 @@
 
 mod agent;
 mod ai;
+mod compare;
 mod completion;
 mod diagnostics;
 mod dialect;

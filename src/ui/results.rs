@@ -19,7 +19,8 @@ use super::selection::{Mode, Selection};
 use super::theme::{self, Palette};
 use super::widgets::{self, Tone};
 use super::workspace::{
-    Count, Executed, InlineCell, Outcome, Paging, QueryTab, TabKind, format_duration, thousands,
+    Count, Executed, InlineCell, Outcome, Paging, QueryTab, TabKind, format_duration,
+    previous_plan, thousands,
 };
 use crate::export::{to_delimited, write_row};
 use crate::plan::Plan;
@@ -101,6 +102,7 @@ pub fn show(
             let elapsed = output.elapsed;
             let set = &output.sets[tab.active_set];
             let plan = explained(tab.last_run.as_ref(), set);
+            let previous = previous_plan(&tab.plan_runs);
             // What an analyzed plan says the server spent, in seconds.
             let server_time = plan
                 .as_ref()
@@ -152,7 +154,11 @@ pub fn show(
                             );
                         }
                         if plan.is_some() {
-                            widgets::segmented(ui, &mut tab.plan_view, &View::OPTIONS);
+                            let options = View::options(previous.is_some());
+                            if !options.iter().any(|(view, _)| *view == tab.plan_view) {
+                                tab.plan_view = View::Tree;
+                            }
+                            widgets::segmented(ui, &mut tab.plan_view, &options);
                         }
                         if set.has_rows() {
                             edit_bar(ui, tab.id, &pending, editing, actions);
@@ -239,7 +245,7 @@ pub fn show(
             );
 
             if let Some(plan) = plan.filter(|_| tab.plan_view != View::Rows) {
-                plan_view::show(ui, tab.id, &plan, tab.plan_view);
+                plan_view::show(ui, tab.id, &plan, previous, tab.plan_view);
             } else if set.has_rows() {
                 if let Some(paging) = &tab.paging {
                     let fetching = tab.running.as_ref().is_some_and(|r| r.append);

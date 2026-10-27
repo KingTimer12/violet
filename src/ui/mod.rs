@@ -960,6 +960,7 @@ impl VioletApp {
                         {
                             output.sets = vec![report];
                         }
+                        tab.keep_plan(&running.executed.sql, &output.sets);
                         // Show the last set with rows: usually what was asked for.
                         tab.active_set = output
                             .sets

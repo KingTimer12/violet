@@ -88,6 +88,45 @@ impl DataView {
     }
 }
 
+/// A plan an explain returned, and the statement that asked for it.
+#[derive(Clone, Debug)]
+pub struct PlanRun {
+    pub sql: String,
+    pub plan: crate::plan::Plan,
+}
+
+/// Plans kept per tab.
+const PLAN_RUNS: usize = 8;
+
+/// The plan the last explain of the same statement returned before the
+/// latest of `runs`.
+pub fn previous_plan(runs: &[PlanRun]) -> Option<&crate::plan::Plan> {
+    let (latest, before) = runs.split_last()?;
+    before
+        .iter()
+        .rev()
+        .find(|run| run.sql == latest.sql)
+        .map(|run| &run.plan)
+}
+
+impl QueryTab {
+    /// Keeps the plan of an explain that just ran.
+    pub fn keep_plan(&mut self, sql: &str, sets: &[violet_core::ResultSet]) {
+        if !crate::plan::is_explain(sql) {
+            return;
+        }
+        if let Some(plan) = sets.iter().find_map(crate::plan::Plan::from_result) {
+            self.plan_runs.push(PlanRun {
+                sql: sql.to_owned(),
+                plan,
+            });
+            if self.plan_runs.len() > PLAN_RUNS {
+                self.plan_runs.remove(0);
+            }
+        }
+    }
+}
+
 /// A result read a page at a time.
 #[derive(Debug)]
 pub struct Paging {
@@ -142,6 +181,8 @@ pub struct QueryTab {
     pub snippet: Option<crate::editing::Snippet>,
     /// How an explain's result is shown.
     pub plan_view: super::plan_view::View,
+    /// The plans this tab's explains returned, oldest first, to compare.
+    pub plan_runs: Vec<PlanRun>,
     /// Performance hints on the text.
     pub hints: super::hints_flow::Hints,
     /// When the shown result reached the app, until it is on screen.
@@ -316,6 +357,7 @@ impl Workspace {
             diagnostics: crate::diagnostics::Tracker::default(),
             snippet: None,
             plan_view: super::plan_view::View::default(),
+            plan_runs: Vec::new(),
             hints: super::hints_flow::Hints::default(),
             received: None,
             render: None,
@@ -489,6 +531,28 @@ pub fn thousands(value: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_previous_plan_is_of_the_same_statement() {
+        let run = |sql: &str, cost: f64| PlanRun {
+            sql: sql.into(),
+            plan: crate::plan::Plan {
+                roots: vec![crate::plan::PlanNode {
+                    cost: Some(cost),
+                    ..crate::plan::PlanNode::default()
+                }],
+                ..crate::plan::Plan::default()
+            },
+        };
+        let cost = |runs: &[PlanRun]| previous_plan(runs).and_then(|plan| plan.roots[0].cost);
+        assert_eq!(cost(&[]), None);
+        assert_eq!(cost(&[run("a", 1.0)]), None);
+        assert_eq!(
+            cost(&[run("a", 1.0), run("b", 2.0), run("a", 3.0)]),
+            Some(1.0)
+        );
+        assert_eq!(cost(&[run("a", 1.0), run("b", 2.0)]), None);
+    }
 
     #[test]
     fn closing_the_active_tab_activates_a_neighbour() {

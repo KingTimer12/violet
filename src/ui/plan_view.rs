@@ -5,6 +5,7 @@ use egui::{RichText, Sense, Stroke, Ui, Vec2};
 
 use super::theme::{self, Palette};
 use super::widgets;
+use crate::compare::{Change, Delta};
 use crate::plan::{Buffers, Plan, PlanNode};
 
 const INDENT: f32 = 18.0;
@@ -18,20 +19,26 @@ pub enum View {
     Tree,
     /// Steps as bars as wide as their weight, callees above.
     Flame,
+    /// Each step against the same step of the explain before.
+    Compare,
     /// The rows the server returned.
     Rows,
 }
 
 impl View {
-    pub const OPTIONS: [(Self, &'static str); 3] = [
-        (Self::Tree, "Plan"),
-        (Self::Flame, "Flame"),
-        (Self::Rows, "Rows"),
-    ];
+    /// The choices; comparing needs an earlier explain of the statement.
+    pub fn options(compare: bool) -> Vec<(Self, &'static str)> {
+        let mut options = vec![(Self::Tree, "Plan"), (Self::Flame, "Flame")];
+        if compare {
+            options.push((Self::Compare, "Compare"));
+        }
+        options.push((Self::Rows, "Rows"));
+        options
+    }
 }
 
 /// Draws `plan` in the results pane.
-pub fn show(ui: &mut Ui, tab: u64, plan: &Plan, view: View) {
+pub fn show(ui: &mut Ui, tab: u64, plan: &Plan, previous: Option<&Plan>, view: View) {
     let palette = Palette::current(ui.ctx());
     let scale = plan.max_weight();
     egui::ScrollArea::both()
@@ -80,6 +87,8 @@ pub fn show(ui: &mut Ui, tab: u64, plan: &Plan, view: View) {
             }
             if view == View::Flame {
                 flame(ui, &palette, plan);
+            } else if let (View::Compare, Some(previous)) = (view, previous) {
+                compare(ui, &palette, previous, plan);
             } else {
                 for root in &plan.roots {
                     node(ui, &palette, root, 0, scale);
@@ -162,6 +171,91 @@ fn node(ui: &mut Ui, palette: &Palette, step: &PlanNode, depth: usize, scale: f6
     );
     for child in &step.children {
         node(ui, palette, child, depth + 1, scale);
+    }
+}
+
+/// Each step of `new` against the same step of `old`.
+fn compare(ui: &mut Ui, palette: &Palette, old: &Plan, new: &Plan) {
+    if let (Some(was), Some(now)) = (old.execution_ms, new.execution_ms) {
+        ui.horizontal(|ui| {
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new(format!("Execution {} → {}", millis(was), millis(now)))
+                    .color(palette.secondary),
+            );
+        });
+    }
+    for line in crate::compare::plans(old, new) {
+        let color = match line.change {
+            Change::Added => palette.success,
+            Change::Removed => palette.danger,
+            Change::Replaced => palette.warning,
+            Change::Same => palette.text,
+        };
+        ui.horizontal(|ui| {
+            ui.add_space(10.0 + INDENT * line.depth as f32);
+            ui.vertical(|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let mark = match line.change {
+                        Change::Added => "+ ",
+                        Change::Removed => "− ",
+                        Change::Replaced => "~ ",
+                        Change::Same => "",
+                    };
+                    ui.label(
+                        RichText::new(format!("{mark}{}", line.label))
+                            .font(theme::semibold(13.0))
+                            .color(color),
+                    );
+                    if let Some(target) = &line.target {
+                        ui.label(
+                            RichText::new(target)
+                                .font(theme::mono(12.0))
+                                .color(palette.accent),
+                        );
+                    }
+                    if let Some(was) = &line.was {
+                        ui.label(RichText::new(format!("was {was}")).color(palette.dim));
+                    }
+                });
+                let mut facts = Vec::new();
+                for (name, delta, unit) in [
+                    ("cost", line.cost, ""),
+                    ("rows", line.rows, ""),
+                    ("time", line.time, " ms"),
+                ] {
+                    if let Some(text) = delta_text(name, delta, unit) {
+                        facts.push(text);
+                    }
+                }
+                if !facts.is_empty() {
+                    ui.label(RichText::new(facts.join("  ·  ")).color(palette.secondary));
+                }
+            });
+        });
+        ui.add_space(4.0);
+    }
+}
+
+/// `cost 800 → 80 (-90%)`.
+fn delta_text(name: &str, delta: Delta, unit: &str) -> Option<String> {
+    let figure = |value: f64| {
+        if value.abs() >= 100.0 {
+            format!("{value:.0}{unit}")
+        } else {
+            format!("{value:.2}{unit}")
+        }
+    };
+    match (delta.old, delta.new) {
+        (Some(old), Some(new)) => {
+            let change = delta.change().map_or(String::new(), |change| {
+                format!(" ({:+.0}%)", change * 100.0)
+            });
+            Some(format!("{name} {} → {}{change}", figure(old), figure(new)))
+        }
+        (None, Some(new)) => Some(format!("{name} {}", figure(new))),
+        (Some(old), None) => Some(format!("{name} was {}", figure(old))),
+        (None, None) => None,
     }
 }
 
