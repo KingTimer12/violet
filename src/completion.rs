@@ -685,7 +685,7 @@ pub fn complete(
         .collect();
 
     let script = Script::read(text, &significant);
-    let mut scope = Scope::read(text, statement);
+    let mut scope = Scope::read(text, statement, qualified_start);
     // The word being typed is no table yet.
     scope.relations.retain(|r| r.at != qualified_start);
     // Where the whole name goes: `FROM schema.ta|` is still a table slot.
@@ -1043,9 +1043,17 @@ struct Scope {
 }
 
 impl Scope {
-    fn read(text: &str, tokens: &[Token]) -> Self {
+    /// Inside a subquery in `FROM`, its own tables; a `LATERAL` one also
+    /// sees the tables left of it.
+    fn read(text: &str, tokens: &[Token], cursor: usize) -> Self {
+        let mut relations = relations(text, tokens);
+        if let Some((open, close, lateral)) = derived(text, tokens, cursor) {
+            let start = tokens[open].range.start;
+            relations.retain(|r| lateral && r.at < start);
+            relations.extend(self::relations(text, &tokens[open + 1..close]));
+        }
         Self {
-            relations: relations(text, tokens),
+            relations,
             ctes: ctes(text, tokens),
         }
     }
@@ -1126,7 +1134,12 @@ fn relations(text: &str, tokens: &[Token]) -> Vec<Relation> {
                 expect = true;
                 from = None;
             }
-            Some("ONLY" | "LATERAL") => {}
+            Some("ONLY" | "LATERAL" | "NATURAL") => {}
+            // `DELETE FROM a USING b, c`; `JOIN t USING (` lists columns.
+            Some("USING") if !tokens.get(index + 1).is_some_and(|t| is(text, t, "(")) => {
+                expect = true;
+                from = Some(depth);
+            }
             Some(
                 "WHERE" | "GROUP" | "ORDER" | "HAVING" | "LIMIT" | "SET" | "VALUES" | "ON"
                 | "USING" | "SELECT" | "UNION" | "RETURNING" | "WINDOW",
@@ -1165,6 +1178,28 @@ fn relations(text: &str, tokens: &[Token]) -> Vec<Relation> {
             _ => {}
         }
         index += 1;
+    }
+    found
+}
+
+/// The innermost `(SELECT ...)` after `FROM`, `JOIN` or `LATERAL` holding
+/// the cursor: its brackets' indices, and whether it is `LATERAL`.
+fn derived(text: &str, tokens: &[Token], cursor: usize) -> Option<(usize, usize, bool)> {
+    let mut found = None;
+    for (open, token) in tokens.iter().enumerate() {
+        if !is(text, token, "(") || token.range.end > cursor {
+            continue;
+        }
+        let close = closing(text, tokens, open);
+        if tokens.get(close).is_some_and(|t| t.range.start < cursor)
+            || !is_word(text, tokens.get(open + 1), "SELECT")
+        {
+            continue;
+        }
+        let previous = open.checked_sub(1).and_then(|at| word(text, &tokens[at]));
+        if matches!(previous.as_deref(), Some("FROM" | "JOIN" | "LATERAL")) {
+            found = Some((open, close, previous.as_deref() == Some("LATERAL")));
+        }
     }
     found
 }
@@ -1426,6 +1461,9 @@ enum Context {
     InsertColumns(String),
     /// After `JOIN ... ON`: conditions along foreign keys, then columns.
     JoinOn,
+    /// `JOIN t USING (`: the columns `t` shares with the tables before it,
+    /// `USING` at this byte offset.
+    Using(usize),
     /// After `::`.
     Type,
     Expression,
@@ -1477,8 +1515,21 @@ fn context(text: &str, before: &[&Token], scope: &Scope) -> Context {
             };
         }
         Some("JOIN") => {
+            // A natural join brings its own condition.
+            let natural = before[..before.len() - 1]
+                .iter()
+                .rev()
+                .filter_map(|t| word(text, t))
+                .find(|w| !matches!(w.as_str(), "LEFT" | "RIGHT" | "FULL" | "INNER" | "OUTER"))
+                .is_some_and(|w| w == "NATURAL");
             return Context::Relation {
-                join: true,
+                join: !natural,
+                alias: true,
+            };
+        }
+        Some("USING") if is_word(text, before.first().copied(), "DELETE") => {
+            return Context::Relation {
+                join: false,
                 alias: true,
             };
         }
@@ -1487,6 +1538,9 @@ fn context(text: &str, before: &[&Token], scope: &Scope) -> Context {
     }
     let (clause, bracket) = clause(text, before);
     if let Some(open) = bracket {
+        if open > 0 && is_word(text, Some(before[open - 1]), "USING") {
+            return Context::Using(before[open - 1].range.start);
+        }
         // `INSERT INTO [schema.]table (` lists the table's columns.
         let mut at = open;
         let mut names = Vec::new();
@@ -1587,6 +1641,7 @@ impl<'a> Builder<'a> {
                 self.conditions();
                 self.expression();
             }
+            Context::Using(at) => self.shared(*at),
             Context::Type => {
                 for name in self.options.family.types() {
                     let insert = self.cased(name);
@@ -1981,6 +2036,50 @@ impl<'a> Builder<'a> {
                 self.columns_of(&relation, None);
             }
             _ => {}
+        }
+    }
+
+    /// A relation's column names, when they are known yet.
+    fn column_names(&mut self, relation: &Relation) -> Option<Vec<String>> {
+        match self.source(relation)? {
+            Source::Known(columns) => Some(columns.to_vec()),
+            Source::Script(created) => Some(created.columns.clone()),
+            Source::Catalog(schema, name) => match self.catalog.columns(&schema, &name) {
+                Some(columns) => Some(columns.iter().map(|c| c.name.clone()).collect()),
+                None => {
+                    self.needs.push(Need::Columns(schema, name));
+                    None
+                }
+            },
+        }
+    }
+
+    /// `JOIN t USING (`: the columns of `t`, the table before `USING` at
+    /// `at`, that a table before it has too.
+    fn shared(&mut self, at: usize) {
+        let mut before: Vec<Relation> = self
+            .scope
+            .relations
+            .iter()
+            .filter(|r| r.at < at)
+            .cloned()
+            .collect();
+        let Some(joined) = before.pop() else {
+            return;
+        };
+        let Some(columns) = self.column_names(&joined) else {
+            return;
+        };
+        let mut left = Vec::new();
+        for relation in &before {
+            left.extend(self.column_names(relation).unwrap_or_default());
+        }
+        for column in columns {
+            if left.iter().any(|c| c.eq_ignore_ascii_case(&column)) {
+                let insert = self.ident(&column);
+                let detail = joined.handle().to_owned();
+                self.push_keyed(Kind::Column, column.clone(), insert, detail, column);
+            }
         }
     }
 
@@ -2967,5 +3066,32 @@ mod tests {
         assert!(!opens("SELECT 'FROM "));
         assert!(!opens("-- FROM "));
         assert!(!opens("SELECT 1 /* o."));
+    }
+
+    #[test]
+    fn using_natural_lateral_and_delete_using_read_their_tables() {
+        let shop = shop();
+        let using = at(&shop, "SELECT * FROM customers c JOIN orders o USING (|");
+        assert_eq!(inserts(&using), ["id"]);
+        let natural = at(&shop, "SELECT * FROM customers c NATURAL LEFT JOIN |");
+        assert!(!natural.items.iter().any(|item| item.kind == Kind::Join));
+        assert!(inserts(&natural).contains(&"orders o"));
+        let lateral = at(
+            &shop,
+            "SELECT * FROM customers c, LATERAL (SELECT c.| FROM orders o) l",
+        );
+        assert_eq!(inserts(&lateral), ["id", "name", "country"]);
+        let inner = at(
+            &shop,
+            "SELECT * FROM customers c JOIN LATERAL (SELECT tot| FROM orders o",
+        );
+        assert_eq!(inserts(&inner)[0], "total");
+        let delete = at(&shop, "DELETE FROM orders o USING customers c WHERE c|");
+        let found = inserts(&delete);
+        assert!(
+            found.contains(&"country") && found.contains(&"customer_id"),
+            "{found:?}"
+        );
+        assert!(inserts(&at(&shop, "DELETE FROM orders USING cust|")).contains(&"customers c"));
     }
 }
