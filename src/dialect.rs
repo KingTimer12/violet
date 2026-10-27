@@ -4,6 +4,33 @@
 
 use crate::sql;
 
+/// What an explain asks of the server beyond the plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Explain {
+    /// Runs the statement and measures it.
+    pub analyze: bool,
+    /// Postgres: pages hit, read and written per step. Only with analyze.
+    pub buffers: bool,
+    /// Postgres: a clock reading per step. Off, analyze costs less and
+    /// shows rows only; the clock is a good part of its overhead.
+    pub timing: bool,
+}
+
+impl Explain {
+    /// The plan alone.
+    pub const PLAN: Self = Self {
+        analyze: false,
+        buffers: true,
+        timing: true,
+    };
+}
+
+impl Default for Explain {
+    fn default() -> Self {
+        Self::PLAN
+    }
+}
+
 /// The database family a driver speaks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Family {
@@ -61,14 +88,42 @@ impl Family {
     /// JSON on Postgres and MySQL, `QUERY PLAN` rows on SQLite. `None`
     /// where the database has no such form: SQLite cannot analyze, MySQL
     /// analyzes in text only, and other databases are not known.
-    pub fn explain_tree(self, sql: &str, analyze: bool) -> Option<String> {
-        match (self, analyze) {
+    pub fn explain_tree(self, sql: &str, explain: &Explain) -> Option<String> {
+        match (self, explain.analyze) {
             (Self::Postgres, false) => Some(format!("EXPLAIN (FORMAT JSON) {sql}")),
-            (Self::Postgres, true) => Some(format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}")),
+            (Self::Postgres, true) => {
+                let mut options = vec!["ANALYZE"];
+                if explain.buffers {
+                    options.push("BUFFERS");
+                }
+                if !explain.timing {
+                    options.push("TIMING OFF");
+                }
+                options.push("FORMAT JSON");
+                Some(format!("EXPLAIN ({}) {sql}", options.join(", ")))
+            }
             (Self::MySql, false) => Some(format!("EXPLAIN FORMAT=JSON {sql}")),
             (Self::Sqlite, false) => Some(format!("EXPLAIN QUERY PLAN {sql}")),
             _ => None,
         }
+    }
+
+    /// `explain` wrapped so that what the statement wrote is undone: its
+    /// own transaction, or a savepoint when one is `open` already, which
+    /// then stays as it was. `None` where analyzing a write is not
+    /// possible: no tree form, or no way to undo.
+    pub fn explain_rolled_back(self, sql: &str, explain: &Explain, open: bool) -> Option<String> {
+        if !explain.analyze || !matches!(self, Self::Postgres) {
+            return None;
+        }
+        let inner = self.explain_tree(sql, explain)?;
+        Some(if open {
+            format!(
+                "SAVEPOINT violet_explain;\n{inner};\nROLLBACK TO SAVEPOINT violet_explain;\nRELEASE SAVEPOINT violet_explain"
+            )
+        } else {
+            format!("BEGIN;\n{inner};\nROLLBACK")
+        })
     }
 
     /// Statements offered at the start of one.
@@ -582,14 +637,20 @@ mod tests {
 
     #[test]
     fn explains_as_a_tree_where_the_database_can() {
-        let explain = |family: Family, analyze| family.explain_tree("SELECT 1", analyze);
+        let explain = |family: Family, analyze| {
+            let options = Explain {
+                analyze,
+                ..Explain::PLAN
+            };
+            family.explain_tree("SELECT 1", &options)
+        };
         assert_eq!(
             explain(Family::Postgres, false).as_deref(),
             Some("EXPLAIN (FORMAT JSON) SELECT 1")
         );
         assert_eq!(
             explain(Family::Postgres, true).as_deref(),
-            Some("EXPLAIN (ANALYZE, FORMAT JSON) SELECT 1")
+            Some("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT 1")
         );
         assert_eq!(
             explain(Family::MySql, false).as_deref(),
@@ -602,6 +663,53 @@ mod tests {
         assert_eq!(explain(Family::MySql, true), None);
         assert_eq!(explain(Family::Sqlite, true), None);
         assert_eq!(explain(Family::Other, false), None);
+    }
+
+    #[test]
+    fn postgres_analyze_takes_buffers_and_timing() {
+        let lean = Explain {
+            analyze: true,
+            buffers: false,
+            timing: false,
+        };
+        assert_eq!(
+            Family::Postgres.explain_tree("SELECT 1", &lean).as_deref(),
+            Some("EXPLAIN (ANALYZE, TIMING OFF, FORMAT JSON) SELECT 1")
+        );
+        // Without analyze there is nothing to count or time.
+        let plan = Explain {
+            buffers: false,
+            ..Explain::PLAN
+        };
+        assert_eq!(
+            Family::Postgres.explain_tree("SELECT 1", &plan).as_deref(),
+            Some("EXPLAIN (FORMAT JSON) SELECT 1")
+        );
+    }
+
+    #[test]
+    fn analyzing_a_write_is_undone() {
+        let analyze = Explain {
+            analyze: true,
+            ..Explain::PLAN
+        };
+        let run = |open| Family::Postgres.explain_rolled_back("DELETE FROM t", &analyze, open);
+        assert_eq!(
+            run(false).as_deref(),
+            Some("BEGIN;\nEXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) DELETE FROM t;\nROLLBACK")
+        );
+        let inside = run(true).expect("a script");
+        assert!(inside.starts_with("SAVEPOINT violet_explain;"));
+        assert!(inside.contains("ROLLBACK TO SAVEPOINT violet_explain"));
+        // Nothing to undo without analyze, and only Postgres runs it.
+        assert_eq!(
+            Family::Postgres.explain_rolled_back("DELETE FROM t", &Explain::PLAN, false),
+            None
+        );
+        assert_eq!(
+            Family::Sqlite.explain_rolled_back("DELETE FROM t", &analyze, false),
+            None
+        );
     }
 
     #[test]

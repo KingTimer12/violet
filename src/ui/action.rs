@@ -26,6 +26,13 @@ pub enum RunScope {
     ExplainAnalyze,
 }
 
+/// An option of a tab's explain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExplainFlag {
+    Buffers,
+    Timing,
+}
+
 #[derive(Debug)]
 pub enum Action {
     NewConnection,
@@ -106,6 +113,8 @@ pub enum Action {
         done: String,
     },
     Run(TabId, RunScope),
+    /// Turns an option of a tab's explain on or off.
+    ToggleExplain(TabId, ExplainFlag),
     /// Runs again, the user having accepted statements without `WHERE`.
     RunConfirmed(TabId, RunScope),
     /// Opens the editor for a cell of a tab's rows.

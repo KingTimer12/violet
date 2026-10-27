@@ -630,6 +630,24 @@ pub fn plan(source: &str) -> Plan {
     }
 }
 
+/// Whether `source` is one statement that changes rows (`INSERT`,
+/// `UPDATE`, `DELETE`, `MERGE`, alone or behind a `WITH`): the writes
+/// `EXPLAIN ANALYZE` may run when it undoes them after.
+#[must_use]
+pub fn is_row_write(source: &str) -> bool {
+    let ranges = statements(source);
+    let [range] = ranges.as_slice() else {
+        return false;
+    };
+    let words = words(&source[range.clone()]);
+    let writes = |word: &str| matches!(word, "INSERT" | "UPDATE" | "DELETE" | "MERGE");
+    match words.first().map(|(word, _)| word.as_str()) {
+        Some("WITH") => words.iter().any(|(word, _)| writes(word)),
+        Some(word) => writes(word),
+        None => false,
+    }
+}
+
 /// Whether a statement of `source` changes the schema (`CREATE`, `ALTER`,
 /// `DROP`, `RENAME`, `TRUNCATE`), so what was loaded about it is stale.
 #[must_use]
@@ -1173,6 +1191,13 @@ mod tests {
         assert!(!plan("SELECT now()").cacheable);
         assert!(!plan("DELETE FROM t").reads_only);
         assert!(!plan("SELECT 1; UPDATE t SET a = 1").reads_only);
+        assert!(is_row_write("UPDATE t SET a = 1 WHERE b"));
+        assert!(is_row_write(
+            "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d"
+        ));
+        assert!(!is_row_write("SELECT 1"));
+        assert!(!is_row_write("DROP TABLE t"));
+        assert!(!is_row_write("DELETE FROM a; DELETE FROM b"));
     }
 
     #[test]

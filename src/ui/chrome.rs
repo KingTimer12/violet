@@ -5,7 +5,7 @@ use egui::{Align, Align2, CornerRadius, Layout, RichText, Sense, Stroke, Ui, Vec
 use violet_app::TxCommand;
 use violet_core::{ConnectionId, ConnectionProfile};
 
-use super::action::{Action, RunScope};
+use super::action::{Action, ExplainFlag, RunScope};
 use super::icons::Icon;
 use super::shortcuts::{self, Command};
 use super::sidebar::menu_item;
@@ -554,13 +554,43 @@ pub fn toolbar(
                     ),
                     (
                         Icon::Clock,
-                        "Explain analyze (reads only)",
+                        "Explain analyze (writes rolled back)",
                         shortcuts::get(Command::ExplainAnalyze),
                         RunScope::ExplainAnalyze,
                     ),
                 ] {
                     if mode_item(ui, icon, label, &ctx.format_shortcut(&shortcut)) {
                         actions.push(Action::Run(tab.id, scope));
+                    }
+                }
+                // Only Postgres counts pages and can leave the clock out.
+                let postgres = tab
+                    .connection
+                    .and_then(|id| profiles.iter().find(|profile| profile.id == id))
+                    .is_some_and(|profile| {
+                        crate::dialect::Family::of(profile.driver.as_str())
+                            == crate::dialect::Family::Postgres
+                    });
+                if postgres {
+                    ui.separator();
+                    for (flag, label, on, tip) in [
+                        (
+                            ExplainFlag::Buffers,
+                            "Buffers",
+                            tab.explain.buffers,
+                            "Pages hit, read and written by each step (analyze)",
+                        ),
+                        (
+                            ExplainFlag::Timing,
+                            "Timing",
+                            tab.explain.timing,
+                            "A clock reading per step; off, analyze costs less but shows no times",
+                        ),
+                    ] {
+                        let mut value = on;
+                        if ui.checkbox(&mut value, label).on_hover_text(tip).changed() {
+                            actions.push(Action::ToggleExplain(tab.id, flag));
+                        }
                     }
                 }
             });

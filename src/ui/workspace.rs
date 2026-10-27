@@ -142,6 +142,8 @@ pub struct QueryTab {
     pub snippet: Option<crate::editing::Snippet>,
     /// Shows an explain's rows instead of its plan tree.
     pub plan_raw: bool,
+    /// What the tab's explain asks of the server.
+    pub explain: crate::dialect::Explain,
     /// The file the script is saved in, and its text as last read or
     /// written there.
     pub file: Option<ScriptFile>,
@@ -306,6 +308,7 @@ impl Workspace {
             diagnostics: crate::diagnostics::Tracker::default(),
             snippet: None,
             plan_raw: false,
+            explain: crate::dialect::Explain::default(),
             file: None,
             source: None,
             edits: BTreeMap::new(),

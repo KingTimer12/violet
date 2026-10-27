@@ -55,9 +55,10 @@ use violet_core::{ConnectionId, ConnectionProfile, DriverId, ErrorKind, Language
 use violet_storage::{JsonFile, SavedScript, ScriptFolder, ScriptStore};
 
 use crate::completion::{self, Need};
+use crate::dialect::Explain;
 use crate::settings::Settings;
 use crate::sql;
-use action::{Action, RunScope};
+use action::{Action, ExplainFlag, RunScope};
 use connection_form::{ConnectionForm, PasswordPrompt, TestState};
 use shortcuts::Command;
 use state::{ConnectionCatalog, Explorer, Link, LoadKey, Loadable, NodeKey};
@@ -193,6 +194,29 @@ pub struct VioletApp {
     update_receipt: Option<fastframe_update::Receipt>,
     #[cfg(debug_assertions)]
     snapshot: Option<devtools::Snapshot>,
+}
+
+/// An analyzed write that failed halfway left its transaction, or the
+/// savepoint it ran in, open: closes it.
+fn undo_explain(backend: &violet_app::Backend, connection: ConnectionId, sent: &str) {
+    let undo = if sent.starts_with("BEGIN;\nEXPLAIN") {
+        "ROLLBACK"
+    } else if sent.starts_with("SAVEPOINT violet_explain;") {
+        "ROLLBACK TO SAVEPOINT violet_explain; RELEASE SAVEPOINT violet_explain"
+    } else {
+        return;
+    };
+    let options = ExecOptions {
+        cache: CachePolicy::Refresh,
+        page: None,
+    };
+    backend.execute_script(
+        connection,
+        None,
+        undo.to_owned(),
+        options,
+        sql::transaction_control(undo),
+    );
 }
 
 fn connection_name(
@@ -913,6 +937,9 @@ impl VioletApp {
                         Outcome::Done { output }
                     }
                     Err(error) => {
+                        if let Some(id) = connection {
+                            undo_explain(&self.backend, id, &running.executed.sql);
+                        }
                         if matches!(error.kind, ErrorKind::Connection | ErrorKind::NotConnected)
                             && let Some(id) = connection
                             && !self.backend.is_connected(id)
@@ -1404,18 +1431,31 @@ impl VioletApp {
             return;
         }
         let analyze = scope == RunScope::ExplainAnalyze;
-        if analyze && !sql::plan(text).reads_only {
+        let statement = text.trim_end().trim_end_matches(';').trim_end();
+        let family = self.family(connection);
+        let mut options = self
+            .workspace
+            .get(tab_id)
+            .map_or_else(Explain::default, |tab| tab.explain);
+        options.analyze = analyze;
+        // A write is analyzed inside a transaction that is rolled back, where
+        // the database can undo it.
+        let rolled_back = analyze
+            && !sql::plan(text).reads_only
+            && sql::is_row_write(text)
+            && family
+                .explain_rolled_back(statement, &options, false)
+                .is_some();
+        if analyze && !rolled_back && !sql::plan(text).reads_only {
             self.toasts.push(
                 ctx,
                 Toast::error(
                     "EXPLAIN ANALYZE runs the statement",
-                    "Violet only analyses statements that read. Use Explain to see the plan of one that writes.",
+                    "Violet only analyses statements that read, or Postgres writes it can roll back. Use Explain to see the plan of one that writes.",
                 ),
             );
             return;
         }
-        let statement = text.trim_end().trim_end_matches(';').trim_end();
-        let family = self.family(connection);
         if analyze && family == crate::dialect::Family::Sqlite {
             self.toasts.push(
                 ctx,
@@ -1424,7 +1464,16 @@ impl VioletApp {
             return;
         }
         // Where the database has a tree form, the results pane draws it.
-        let tree = family.explain_tree(statement, analyze);
+        let open = self
+            .explorer
+            .transactions
+            .get(&connection)
+            .is_some_and(|state| state.open);
+        let tree = if rolled_back {
+            family.explain_rolled_back(statement, &options, open)
+        } else {
+            family.explain_tree(statement, &options)
+        };
         let Some(sent) = tree.or_else(|| self.backend.explain_sql(connection, statement, analyze))
         else {
             return;
@@ -1996,6 +2045,14 @@ impl VioletApp {
                 self.run_data(ctx, tab, CachePolicy::Use);
             }
             Action::Run(tab, scope) => self.run(ctx, tab, scope),
+            Action::ToggleExplain(tab, flag) => {
+                if let Some(tab) = self.workspace.get_mut(tab) {
+                    match flag {
+                        ExplainFlag::Buffers => tab.explain.buffers = !tab.explain.buffers,
+                        ExplainFlag::Timing => tab.explain.timing = !tab.explain.timing,
+                    }
+                }
+            }
             action @ (Action::RunConfirmed(..)
             | Action::EditCell(..)
             | Action::SetCell(..)

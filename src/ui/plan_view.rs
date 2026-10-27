@@ -5,7 +5,7 @@ use egui::{RichText, Sense, Stroke, Ui, Vec2};
 
 use super::theme::{self, Palette};
 use super::widgets;
-use crate::plan::{Plan, PlanNode};
+use crate::plan::{Buffers, Plan, PlanNode};
 
 const INDENT: f32 = 18.0;
 
@@ -32,6 +32,16 @@ pub fn show(ui: &mut Ui, tab: u64, plan: &Plan) {
                             );
                         }
                     }
+                });
+                ui.add_space(4.0);
+            }
+            if let Some(buffers) = &plan.planning_buffers {
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new(format!("Planning {}", pages(buffers)))
+                            .color(palette.secondary),
+                    );
                 });
                 ui.add_space(4.0);
             }
@@ -113,6 +123,9 @@ fn node(ui: &mut Ui, palette: &Palette, step: &PlanNode, depth: usize, scale: f6
                     if let Some(loops) = step.loops.filter(|loops| *loops > 1.0) {
                         facts.push(format!("x{loops:.0} loops"));
                     }
+                    if let Some(buffers) = &step.buffers {
+                        facts.push(pages(buffers));
+                    }
                     if !facts.is_empty() {
                         ui.label(RichText::new(facts.join("  ·  ")).color(palette.secondary));
                     }
@@ -145,6 +158,24 @@ fn node(ui: &mut Ui, palette: &Palette, step: &PlanNode, depth: usize, scale: f6
     for child in &step.children {
         node(ui, palette, child, depth + 1, scale);
     }
+}
+
+/// The pages a step touched, and how many came from the cache.
+fn pages(buffers: &Buffers) -> String {
+    let mut text = format!("pages hit {:.0} read {:.0}", buffers.hit, buffers.read);
+    if let Some(ratio) = buffers.hit_ratio() {
+        text.push_str(&format!(" ({:.0}% cached)", ratio * 100.0));
+    }
+    if buffers.written > 0.0 {
+        text.push_str(&format!(" written {:.0}", buffers.written));
+    }
+    if buffers.temp_written > 0.0 || buffers.temp_read > 0.0 {
+        text.push_str(&format!(
+            " temp {:.0}/{:.0}",
+            buffers.temp_read, buffers.temp_written
+        ));
+    }
+    text
 }
 
 /// A time in milliseconds, in the unit that reads best.

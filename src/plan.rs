@@ -25,6 +25,8 @@ pub enum Warning {
     ExpensiveLoop,
     /// The planner's row estimate is far from what ran.
     Misestimate,
+    /// Wrote temporary files: a hash or a sort that did not fit in memory.
+    TempFiles,
 }
 
 impl Warning {
@@ -35,6 +37,7 @@ impl Warning {
             Self::Filesort => "Filesort",
             Self::ExpensiveLoop => "Expensive loop",
             Self::Misestimate => "Bad estimate",
+            Self::TempFiles => "Temp files",
         }
     }
 
@@ -47,7 +50,51 @@ impl Warning {
                 "Many outer rows each rescan the inner side. An index on the join column may help."
             }
             Self::Misestimate => "Estimated and actual rows differ a lot. Statistics may be stale.",
+            Self::TempFiles => "Spilled to temporary files. More work memory may help.",
         }
+    }
+}
+
+/// Pages a step touched, those of its children included, as `BUFFERS`
+/// counts them.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Buffers {
+    /// Found in the cache.
+    pub hit: f64,
+    /// Read from disk or the operating system.
+    pub read: f64,
+    pub dirtied: f64,
+    pub written: f64,
+    /// Temporary file pages, read and written.
+    pub temp_read: f64,
+    pub temp_written: f64,
+}
+
+impl Buffers {
+    /// Reads Postgres's `Shared ...`, `Local ...` and `Temp ... Blocks`
+    /// counts; `None` when the plan was run without `BUFFERS`.
+    fn postgres(value: &Value) -> Option<Self> {
+        let sum = |what: &str| {
+            let shared = number(value, &format!("Shared {what} Blocks"));
+            let local = number(value, &format!("Local {what} Blocks"));
+            (shared.is_some() || local.is_some())
+                .then(|| shared.unwrap_or(0.0) + local.unwrap_or(0.0))
+        };
+        let hit = sum("Hit")?;
+        Some(Self {
+            hit,
+            read: sum("Read").unwrap_or(0.0),
+            dirtied: sum("Dirtied").unwrap_or(0.0),
+            written: sum("Written").unwrap_or(0.0),
+            temp_read: number(value, "Temp Read Blocks").unwrap_or(0.0),
+            temp_written: number(value, "Temp Written Blocks").unwrap_or(0.0),
+        })
+    }
+
+    /// Share of the pages read that were found in the cache.
+    pub fn hit_ratio(&self) -> Option<f64> {
+        let total = self.hit + self.read;
+        (total > 0.0).then(|| self.hit / total)
     }
 }
 
@@ -66,6 +113,8 @@ pub struct PlanNode {
     /// Milliseconds spent in the step, with its children.
     pub time_ms: Option<f64>,
     pub loops: Option<f64>,
+    /// Pages touched; only `ANALYZE, BUFFERS` knows.
+    pub buffers: Option<Buffers>,
     pub warnings: Vec<Warning>,
     /// Joins its children by looping over the first one.
     pub join_loop: bool,
@@ -126,6 +175,8 @@ pub struct Plan {
     pub roots: Vec<PlanNode>,
     pub planning_ms: Option<f64>,
     pub execution_ms: Option<f64>,
+    /// Pages the planner itself touched, reading the catalog.
+    pub planning_buffers: Option<Buffers>,
 }
 
 impl Plan {
@@ -189,6 +240,7 @@ impl Plan {
             roots: vec![root],
             planning_ms: number(top, "Planning Time"),
             execution_ms: number(top, "Execution Time"),
+            planning_buffers: top.get("Planning").and_then(Buffers::postgres),
         })
     }
 
@@ -259,6 +311,7 @@ fn postgres_node(value: &Value) -> Option<PlanNode> {
     node.actual_rows = number(value, "Actual Rows");
     node.time_ms = number(value, "Actual Total Time");
     node.loops = number(value, "Actual Loops");
+    node.buffers = Buffers::postgres(value);
     node.join_loop = node.label == "Nested Loop";
     let node_type = node.label.as_str();
     if node_type == "Seq Scan" {
@@ -271,6 +324,9 @@ fn postgres_node(value: &Value) -> Option<PlanNode> {
             .is_some_and(|method| method.contains("external"));
     if spilled {
         node.warnings.push(Warning::DiskSort);
+    }
+    if node.buffers.is_some_and(|b| b.temp_written > 0.0) {
+        node.warnings.push(Warning::TempFiles);
     }
     if let Some(Value::Array(plans)) = value.get("Plans") {
         node.children = plans.iter().filter_map(postgres_node).collect();
@@ -466,6 +522,28 @@ mod tests {
         // Ten estimated, 5000 produced; a big outer side rescanning a table.
         assert!(root.warnings.contains(&Warning::Misestimate));
         assert!(root.warnings.contains(&Warning::ExpensiveLoop));
+    }
+
+    #[test]
+    fn reads_buffers_and_temp_files() {
+        let plan = Plan::from_json(
+            r#"[{"Plan": {"Node Type": "Hash Join", "Total Cost": 9, "Plan Rows": 5,
+                "Shared Hit Blocks": 90, "Shared Read Blocks": 10,
+                "Local Hit Blocks": 5, "Temp Written Blocks": 40, "Temp Read Blocks": 40,
+                "Plans": [{"Node Type": "Seq Scan", "Relation Name": "t", "Total Cost": 1,
+                           "Plan Rows": 5}]},
+                "Planning": {"Shared Hit Blocks": 3, "Shared Read Blocks": 1}}]"#,
+        )
+        .expect("a plan");
+        let join = &plan.roots[0];
+        let buffers = join.buffers.expect("buffers");
+        assert_eq!((buffers.hit, buffers.read), (95.0, 10.0));
+        assert_eq!(buffers.temp_written, 40.0);
+        assert!(join.warnings.contains(&Warning::TempFiles));
+        assert!((buffers.hit_ratio().expect("a ratio") - 95.0 / 105.0).abs() < 1e-9);
+        // Run without BUFFERS: none.
+        assert!(join.children[0].buffers.is_none());
+        assert_eq!(plan.planning_buffers.map(|b| b.hit), Some(3.0));
     }
 
     #[test]
