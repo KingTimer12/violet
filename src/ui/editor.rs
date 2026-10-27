@@ -652,7 +652,14 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
             ui.ctx().request_repaint_after(wait);
         }
     }
-    let marks = diagnostics.marks(selection.start);
+    // Performance hints share the underline and the tooltip of problems.
+    let mut marks = diagnostics.marks(selection.start);
+    marks.extend(
+        hints
+            .list
+            .iter()
+            .map(|hint| (hint.range.clone(), Severity::Warning)),
+    );
     // The layout and the hover both read it, one after the other.
     let highlighter = std::cell::RefCell::new(highlighter);
     let mut layouter = |ui: &Ui, buffer: &dyn egui::TextBuffer, wrap: f32| -> Arc<egui::Galley> {
@@ -772,6 +779,7 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
                         sql,
                         assist,
                         diagnostics.found(),
+                        &hints.list,
                         &mut highlighter.borrow_mut(),
                     );
                     if let Some(hint) = hint {
@@ -829,37 +837,6 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
                     if current && reveal {
                         ui.scroll_to_rect(rect.expand(24.0), Some(egui::Align::Center));
                     }
-                }
-
-                // Performance hints, underlined; the tooltip tells why.
-                for (index, hint) in hints.list.iter().enumerate() {
-                    if hint.range.end > sql.len() || !sql.is_char_boundary(hint.range.start) || !sql.is_char_boundary(hint.range.end) {
-                        continue;
-                    }
-                    let start = sql[..hint.range.start].chars().count();
-                    let end = start + sql[hint.range.clone()].chars().count();
-                    let from = output.galley.pos_from_cursor(CCursor::new(start));
-                    let to = output.galley.pos_from_cursor(CCursor::new(end));
-                    if to.top() != from.top() {
-                        continue;
-                    }
-                    let rect = egui::Rect::from_min_max(from.min, egui::pos2(to.left(), from.max.y))
-                        .translate(output.galley_pos.to_vec2());
-                    ui.painter().hline(
-                        rect.x_range(),
-                        rect.bottom() - 1.0,
-                        Stroke::new(1.5, palette.warning),
-                    );
-                    let response = ui.interact(rect, Id::new(("hint", *id, index)), egui::Sense::hover());
-                    response.on_hover_ui_at_pointer(|ui| {
-                        ui.set_max_width(380.0);
-                        ui.label(
-                            egui::RichText::new(hint.kind.label())
-                                .font(theme::semibold(12.5))
-                                .color(palette.warning),
-                        );
-                        ui.label(&hint.message);
-                    });
                 }
 
                 // Line numbers: one per logical line, not per wrapped row.
@@ -925,6 +902,7 @@ fn hovered_word(
     sql: &str,
     assist: &Assist<'_>,
     problems: &[Diagnostic],
+    hints: &[crate::hints::Hint],
     highlighter: &mut Highlighter,
 ) -> Option<completion::Hover> {
     let pointer = output.response.hover_pos()?;
@@ -939,7 +917,22 @@ fn hovered_word(
             title: problem.message.clone(),
             detail: String::new(),
         });
-    let hint = problem.or_else(|| match assist.language {
+    let tip = || {
+        hints
+            .iter()
+            .find(|hint| {
+                hint.range.contains(&offset)
+                    && hint.range.end <= sql.len()
+                    && sql.is_char_boundary(hint.range.start)
+                    && sql.is_char_boundary(hint.range.end)
+            })
+            .map(|hint| completion::Hover {
+                range: hint.range.clone(),
+                title: hint.kind.label().to_owned(),
+                detail: hint.message.clone(),
+            })
+    };
+    let hint = problem.or_else(tip).or_else(|| match assist.language {
         Language::Redis => completion::redis_hover(sql, offset),
         Language::Sql => completion::hover(sql, offset, assist.catalog, &assist.options),
         Language::Mongodb => completion::mongo_hover(sql, offset),
