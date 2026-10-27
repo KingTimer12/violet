@@ -398,6 +398,29 @@ impl Popup {
     }
 }
 
+/// What Tab does while a list is open or a snippet has stops left.
+#[derive(Debug, PartialEq, Eq)]
+enum Tab {
+    /// Accepts the item chosen in the list.
+    Item,
+    /// Moves to the next stop of the snippet.
+    Stop,
+    /// Is left to the editor.
+    Plain,
+}
+
+/// Who takes Tab: a snippet's stops come before the list, which Enter
+/// still accepts.
+fn tab_picks(list_open: bool, stops_left: bool) -> Tab {
+    if stops_left {
+        Tab::Stop
+    } else if list_open {
+        Tab::Item
+    } else {
+        Tab::Plain
+    }
+}
+
 /// What completion knows about the editor's connection.
 pub struct Assist<'a> {
     pub connection: Option<ConnectionId>,
@@ -536,6 +559,7 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
     }
 
     // An open list takes the keys it uses before the editor sees them.
+    let pending = snippet.as_ref().is_some_and(|open| !open.is_empty());
     let mut accept = None;
     if focused && popup.open {
         let count = popup.items().len();
@@ -550,7 +574,8 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
                     popup.reveal = true;
                 }
                 if input.consume_key(Modifiers::NONE, Key::Enter)
-                    || input.consume_key(Modifiers::NONE, Key::Tab)
+                    || (tab_picks(true, pending) == Tab::Item
+                        && input.consume_key(Modifiers::NONE, Key::Tab))
                 {
                     accept = Some(popup.selected);
                 }
@@ -560,12 +585,14 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
             }
         });
     }
-    // Tab moves through what is left of an inserted snippet.
+    // Tab moves through what is left of an inserted snippet, even over a
+    // list the typing in a placeholder opened.
     if focused
-        && !popup.open
+        && tab_picks(popup.open, pending) == Tab::Stop
         && let Some(open) = snippet.as_mut()
         && ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Tab))
     {
+        popup.close();
         if let Some(stop) = open.next(selection.start) {
             select(ui.ctx(), text_id, sql, stop.clone());
             *selection = stop;
@@ -1292,6 +1319,14 @@ mod tests {
         assert!(!opened("FROM ", Language::Redis));
         assert!(!opened("db.find({ FROM ", Language::Mongodb));
         assert!(opened("db.", Language::Mongodb));
+    }
+
+    #[test]
+    fn tab_moves_through_pending_stops_before_it_takes_a_list_item() {
+        assert_eq!(tab_picks(true, false), Tab::Item);
+        assert_eq!(tab_picks(true, true), Tab::Stop);
+        assert_eq!(tab_picks(false, true), Tab::Stop);
+        assert_eq!(tab_picks(false, false), Tab::Plain);
     }
 
     #[test]
