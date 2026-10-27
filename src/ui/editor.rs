@@ -17,7 +17,7 @@ use super::widgets::{self, Tone};
 use super::workspace::QueryTab;
 use crate::completion::{self, Catalog, Completion, Item, Kind};
 use crate::diagnostics::{self, Diagnostic, Severity};
-use crate::editing::{self, Edited, Snippet};
+use crate::editing::{self, CharIndex, Edited, Snippet};
 use crate::sql::{self, TokenKind};
 
 const FONT_SIZE: f32 = 13.5;
@@ -29,6 +29,8 @@ pub struct Highlighter {
     /// The job holds the text it was made from: comparing against it is a
     /// `memcmp`, far cheaper than hashing the whole buffer every frame.
     job: Option<(LayoutJob, bool, Option<usize>, Language, Marks)>,
+    /// Char indices of the job's text as byte offsets, made when asked.
+    chars: Option<CharIndex>,
 }
 
 /// The ranges the editor underlines for the problems it found.
@@ -54,6 +56,7 @@ impl Highlighter {
                     && job.text == text
             });
         if !fresh {
+            self.chars = None;
             self.job = Some((
                 highlight(text, palette, error_at, language, marks),
                 palette.dark,
@@ -66,6 +69,21 @@ impl Highlighter {
             .as_ref()
             .map(|(job, ..)| job.clone())
             .unwrap_or_default()
+    }
+}
+
+impl Highlighter {
+    /// The byte offset of char `index` of `text`. The offsets are worked out
+    /// once for the text the layout was made from, not scanned from its
+    /// start at every call.
+    fn byte_at(&mut self, text: &str, index: usize) -> usize {
+        let fresh = self.job.as_ref().is_some_and(|(job, ..)| job.text == text);
+        if !fresh {
+            return CharIndex::new(text).byte(text, index);
+        }
+        self.chars
+            .get_or_insert_with(|| CharIndex::new(text))
+            .byte(text, index)
     }
 }
 
@@ -634,8 +652,16 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
         }
     }
     let marks = diagnostics.marks(selection.start);
+    // The layout and the hover both read it, one after the other.
+    let highlighter = std::cell::RefCell::new(highlighter);
     let mut layouter = |ui: &Ui, buffer: &dyn egui::TextBuffer, wrap: f32| -> Arc<egui::Galley> {
-        let mut job = highlighter.job(buffer.as_str(), &palette, error_at, assist.language, &marks);
+        let mut job = highlighter.borrow_mut().job(
+            buffer.as_str(),
+            &palette,
+            error_at,
+            assist.language,
+            &marks,
+        );
         job.wrap.max_width = wrap;
         ui.painter().layout_job(job)
     };
@@ -729,7 +755,13 @@ pub fn show(ui: &mut Ui, tab: &mut QueryTab, assist: &Assist<'_>, actions: &mut 
                 // Tooltips for the word under the pointer; the syntax of the
                 // command being written, under the cursor.
                 if !popup.showing() {
-                    let hint = hovered_word(&output, sql, assist, diagnostics.found());
+                    let hint = hovered_word(
+                        &output,
+                        sql,
+                        assist,
+                        diagnostics.found(),
+                        &mut highlighter.borrow_mut(),
+                    );
                     if let Some(hint) = hint {
                         output
                             .response
@@ -850,14 +882,12 @@ fn hovered_word(
     sql: &str,
     assist: &Assist<'_>,
     problems: &[Diagnostic],
+    highlighter: &mut Highlighter,
 ) -> Option<completion::Hover> {
     let pointer = output.response.hover_pos()?;
     let local = pointer - output.galley_pos;
     let index = output.galley.cursor_from_pos(local).index.0;
-    let offset = sql
-        .char_indices()
-        .nth(index)
-        .map_or(sql.len(), |(at, _)| at);
+    let offset = highlighter.byte_at(sql, index);
     let problem = problems
         .iter()
         .find(|problem| problem.range.contains(&offset))

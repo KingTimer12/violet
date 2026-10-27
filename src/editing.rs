@@ -10,6 +10,48 @@ pub struct Edited {
     pub selection: Range<usize>,
 }
 
+/// Turns char indices of a text into byte offsets without reading the text
+/// from its start each time: a few chars from a mark, or none at all for
+/// ASCII.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CharIndex {
+    ascii: bool,
+    /// The byte offset of every `STEP`th char.
+    marks: Vec<usize>,
+}
+
+impl CharIndex {
+    const STEP: usize = 64;
+
+    pub fn new(text: &str) -> Self {
+        let ascii = text.is_ascii();
+        let marks = if ascii {
+            Vec::new()
+        } else {
+            text.char_indices()
+                .step_by(Self::STEP)
+                .map(|(at, _)| at)
+                .collect()
+        };
+        Self { ascii, marks }
+    }
+
+    /// The byte offset of char `index` of `text`, the text this was made
+    /// for; the end of it past the last char.
+    pub fn byte(&self, text: &str, index: usize) -> usize {
+        if self.ascii {
+            return index.min(text.len());
+        }
+        let Some(&mark) = self.marks.get(index / Self::STEP) else {
+            return text.len();
+        };
+        text[mark..]
+            .char_indices()
+            .nth(index % Self::STEP)
+            .map_or(text.len(), |(at, _)| mark + at)
+    }
+}
+
 /// The stops left in an inserted snippet, which Tab visits in turn.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Snippet {
@@ -225,6 +267,24 @@ mod tests {
             replace_all(text, &find_all(text, "nome", true), "name"),
             "Select name FROM t WHERE name = 'NOME'"
         );
+    }
+
+    #[test]
+    fn char_indices_become_byte_offsets() {
+        let texts = [
+            String::new(),
+            "SELECT 1".to_owned(),
+            "ação çã ".repeat(40),
+            format!("{}é{}", "a".repeat(130), "z".repeat(70)),
+        ];
+        for text in &texts {
+            let index = CharIndex::new(text);
+            let chars = text.chars().count();
+            for at in 0..=chars + 2 {
+                let expected = text.char_indices().nth(at).map_or(text.len(), |(b, _)| b);
+                assert_eq!(index.byte(text, at), expected, "{at} of {}", text.len());
+            }
+        }
     }
 
     #[test]
