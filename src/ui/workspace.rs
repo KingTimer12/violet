@@ -140,8 +140,8 @@ pub struct QueryTab {
     pub diagnostics: crate::diagnostics::Tracker,
     /// The stops Tab still visits in an inserted snippet.
     pub snippet: Option<crate::editing::Snippet>,
-    /// Shows an explain's rows instead of its plan tree.
-    pub plan_raw: bool,
+    /// How an explain's result is shown.
+    pub plan_view: super::plan_view::View,
     /// What the tab's explain asks of the server.
     pub explain: crate::dialect::Explain,
     /// The file the script is saved in, and its text as last read or
@@ -307,7 +307,7 @@ impl Workspace {
             popup: Popup::default(),
             diagnostics: crate::diagnostics::Tracker::default(),
             snippet: None,
-            plan_raw: false,
+            plan_view: super::plan_view::View::default(),
             explain: crate::dialect::Explain::default(),
             file: None,
             source: None,

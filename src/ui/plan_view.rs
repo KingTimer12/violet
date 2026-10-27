@@ -8,9 +8,30 @@ use super::widgets;
 use crate::plan::{Buffers, Plan, PlanNode};
 
 const INDENT: f32 = 18.0;
+const FLAME_ROW: f32 = 26.0;
+
+/// How an explain's result is shown.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum View {
+    /// Steps indented under their parents.
+    #[default]
+    Tree,
+    /// Steps as bars as wide as their weight, callees above.
+    Flame,
+    /// The rows the server returned.
+    Rows,
+}
+
+impl View {
+    pub const OPTIONS: [(Self, &'static str); 3] = [
+        (Self::Tree, "Plan"),
+        (Self::Flame, "Flame"),
+        (Self::Rows, "Rows"),
+    ];
+}
 
 /// Draws `plan` in the results pane.
-pub fn show(ui: &mut Ui, tab: u64, plan: &Plan) {
+pub fn show(ui: &mut Ui, tab: u64, plan: &Plan, view: View) {
     let palette = Palette::current(ui.ctx());
     let scale = plan.max_weight();
     egui::ScrollArea::both()
@@ -57,8 +78,12 @@ pub fn show(ui: &mut Ui, tab: u64, plan: &Plan) {
                 });
                 ui.add_space(4.0);
             }
-            for root in &plan.roots {
-                node(ui, &palette, root, 0, scale);
+            if view == View::Flame {
+                flame(ui, &palette, plan);
+            } else {
+                for root in &plan.roots {
+                    node(ui, &palette, root, 0, scale);
+                }
             }
             ui.add_space(8.0);
         });
@@ -105,27 +130,7 @@ fn node(ui: &mut Ui, palette: &Palette, step: &PlanNode, depth: usize, scale: f6
                             .on_hover_text(warning.hint());
                         }
                     });
-                    let mut facts = Vec::new();
-                    if let Some(cost) = step.cost {
-                        facts.push(format!("cost {cost:.2}"));
-                    }
-                    match (step.est_rows, step.actual_rows) {
-                        (Some(est), Some(actual)) => {
-                            facts.push(format!("rows {actual:.0} (est {est:.0})"));
-                        }
-                        (Some(est), None) => facts.push(format!("rows est {est:.0}")),
-                        (None, Some(actual)) => facts.push(format!("rows {actual:.0}")),
-                        (None, None) => {}
-                    }
-                    if let Some(ms) = step.time_ms {
-                        facts.push(millis(ms));
-                    }
-                    if let Some(loops) = step.loops.filter(|loops| *loops > 1.0) {
-                        facts.push(format!("x{loops:.0} loops"));
-                    }
-                    if let Some(buffers) = &step.buffers {
-                        facts.push(pages(buffers));
-                    }
+                    let facts = facts(step);
                     if !facts.is_empty() {
                         ui.label(RichText::new(facts.join("  ·  ")).color(palette.secondary));
                     }
@@ -158,6 +163,97 @@ fn node(ui: &mut Ui, palette: &Palette, step: &PlanNode, depth: usize, scale: f6
     for child in &step.children {
         node(ui, palette, child, depth + 1, scale);
     }
+}
+
+/// What a step cost and did, as short phrases.
+fn facts(step: &PlanNode) -> Vec<String> {
+    let mut facts = Vec::new();
+    if let Some(cost) = step.cost {
+        facts.push(format!("cost {cost:.2}"));
+    }
+    match (step.est_rows, step.actual_rows) {
+        (Some(est), Some(actual)) => facts.push(format!("rows {actual:.0} (est {est:.0})")),
+        (Some(est), None) => facts.push(format!("rows est {est:.0}")),
+        (None, Some(actual)) => facts.push(format!("rows {actual:.0}")),
+        (None, None) => {}
+    }
+    if let Some(ms) = step.time_ms {
+        facts.push(millis(ms));
+    }
+    if let Some(loops) = step.loops.filter(|loops| *loops > 1.0) {
+        facts.push(format!("x{loops:.0} loops"));
+    }
+    if let Some(buffers) = &step.buffers {
+        facts.push(pages(buffers));
+    }
+    facts
+}
+
+/// The plan as a flame graph: the root at the bottom, callees above, each
+/// bar as wide as its weight. Hovering one tells what the step did.
+fn flame(ui: &mut Ui, palette: &Palette, plan: &Plan) {
+    let bars = plan.flame();
+    let rows = bars.iter().map(|bar| bar.depth).max().map_or(0, |d| d + 1);
+    let width = (ui.available_width() - 20.0).max(200.0);
+    let height = FLAME_ROW * rows as f32;
+    ui.horizontal(|ui| {
+        ui.add_space(10.0);
+        let (area, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+        for bar in &bars {
+            let Some(step) = plan.node(&bar.path) else {
+                continue;
+            };
+            let top = area.bottom() - FLAME_ROW * (bar.depth + 1) as f32;
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(area.left() + area.width() * bar.start, top),
+                Vec2::new(area.width() * bar.width, FLAME_ROW),
+            )
+            .shrink(1.0);
+            let flagged = !step.warnings.is_empty();
+            let fill = if flagged {
+                palette.warning
+            } else {
+                palette.accent
+            };
+            let response = ui.interact(rect, ui.id().with(&bar.path), Sense::hover());
+            let fill = if response.hovered() {
+                fill
+            } else {
+                fill.gamma_multiply(0.7)
+            };
+            ui.painter().rect_filled(rect, 3.0, fill);
+            if rect.width() > 24.0 {
+                let label = match &step.target {
+                    Some(target) => format!("{} {target}", step.label),
+                    None => step.label.clone(),
+                };
+                ui.painter()
+                    .with_clip_rect(rect.shrink2(Vec2::new(4.0, 0.0)))
+                    .text(
+                        rect.left_center() + Vec2::new(5.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        label,
+                        theme::mono(11.0),
+                        palette.on_accent,
+                    );
+            }
+            response.on_hover_ui(|ui| {
+                ui.label(RichText::new(&step.label).font(theme::semibold(13.0)));
+                if let Some(target) = &step.target {
+                    ui.label(RichText::new(target).font(theme::mono(12.0)));
+                }
+                for fact in facts(step) {
+                    ui.label(fact);
+                }
+                for warning in &step.warnings {
+                    ui.label(
+                        RichText::new(format!("{}: {}", warning.label(), warning.hint()))
+                            .color(palette.warning),
+                    );
+                }
+            });
+        }
+    });
 }
 
 /// The pages a step touched, and how many came from the cache.

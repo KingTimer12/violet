@@ -169,6 +169,20 @@ impl PlanNode {
     }
 }
 
+/// One step of a plan as a bar of a flame graph: the root at the bottom,
+/// each step's callees stacked above it, its width its share of the total.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Bar {
+    /// Rows up from the root.
+    pub depth: usize,
+    /// Where the bar starts and how wide it is, as shares of the whole.
+    pub start: f32,
+    pub width: f32,
+    /// The step's position in the plan, to find it again: the root's index
+    /// then each child's.
+    pub path: Vec<usize>,
+}
+
 /// A statement's plan.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Plan {
@@ -186,6 +200,36 @@ impl Plan {
             .iter()
             .map(PlanNode::max_weight)
             .fold(0.0, f64::max)
+    }
+
+    /// The plan as a flame graph. A step's width is its weight, kept within
+    /// its parent's: steps whose weights add up to more than the parent's
+    /// (times are per loop) share its width, and weightless plans split
+    /// evenly. Bars are ordered by depth, then left to right.
+    pub fn flame(&self) -> Vec<Bar> {
+        let mut bars = Vec::new();
+        let weights: Vec<f64> = self.roots.iter().map(PlanNode::weight).collect();
+        spread(
+            &self.roots,
+            &weights,
+            0.0,
+            1.0,
+            0,
+            &mut Vec::new(),
+            &mut bars,
+        );
+        bars.sort_by(|a, b| a.depth.cmp(&b.depth).then(a.start.total_cmp(&b.start)));
+        bars
+    }
+
+    /// The step at `path`, as [`Bar::path`] gives it.
+    pub fn node(&self, path: &[usize]) -> Option<&PlanNode> {
+        let (first, rest) = path.split_first()?;
+        let mut node = self.roots.get(*first)?;
+        for index in rest {
+            node = node.children.get(*index)?;
+        }
+        Some(node)
     }
 
     /// Whether the plan carries actual rows and times.
@@ -323,6 +367,58 @@ pub fn is_explain(sql: &str) -> bool {
             .get(..7)
             .is_some_and(|start| start.eq_ignore_ascii_case("explain"))
     })
+}
+
+/// Lays `nodes` side by side from `start` across `width`, each as wide as
+/// its share of `weights`, then their children above them.
+fn spread(
+    nodes: &[PlanNode],
+    weights: &[f64],
+    start: f32,
+    width: f32,
+    depth: usize,
+    path: &mut Vec<usize>,
+    bars: &mut Vec<Bar>,
+) {
+    let total: f64 = weights.iter().sum();
+    let mut at = start;
+    for (index, node) in nodes.iter().enumerate() {
+        let share = if total > 0.0 {
+            (weights[index] / total) as f32
+        } else {
+            1.0 / nodes.len() as f32
+        };
+        let span = width * share;
+        path.push(index);
+        bars.push(Bar {
+            depth,
+            start: at,
+            width: span,
+            path: path.clone(),
+        });
+        // The children fill at most the step's own width.
+        let child_weights: Vec<f64> = node.children.iter().map(PlanNode::weight).collect();
+        let children: f64 = child_weights.iter().sum();
+        let own = weights[index];
+        let used = if own > 0.0 && children > own {
+            span
+        } else if own > 0.0 {
+            span * (children / own) as f32
+        } else {
+            span
+        };
+        spread(
+            &node.children,
+            &child_weights,
+            at,
+            used,
+            depth + 1,
+            path,
+            bars,
+        );
+        path.pop();
+        at += span;
+    }
 }
 
 fn number(value: &Value, key: &str) -> Option<f64> {
@@ -783,6 +879,39 @@ mod tests {
         assert_eq!(plan.roots[0].details, ["Filter: (t.a > 1)"]);
         assert_eq!(plan.roots[0].children[0].cost, Some(1.1));
         assert!(Plan::from_mysql_text("nothing here").is_none());
+    }
+
+    #[test]
+    fn lays_out_a_flame_graph() {
+        let plan = Plan::from_json(POSTGRES).expect("a plan");
+        let bars = plan.flame();
+        assert_eq!(bars.len(), 3);
+        // The root fills the width; its children share what they used.
+        assert_eq!((bars[0].depth, bars[0].start, bars[0].width), (0, 0.0, 1.0));
+        let (orders, items) = (&bars[1], &bars[2]);
+        assert_eq!((orders.depth, orders.start), (1, 0.0));
+        // 5 ms and 90 ms of 120.5: children are 95/120.5 of the root.
+        assert!((orders.width + items.width - 95.0 / 120.5).abs() < 1e-5);
+        assert!(items.width > orders.width * 10.0);
+        assert!((items.start - orders.width).abs() < 1e-6);
+        assert_eq!(
+            plan.node(&items.path).map(|n| n.label.as_str()),
+            Some("Seq Scan")
+        );
+        assert!(plan.node(&[3]).is_none());
+    }
+
+    #[test]
+    fn a_flame_without_weights_splits_evenly() {
+        let steps = [
+            (1, 0, "SCAN a".to_owned()),
+            (2, 0, "SCAN b".to_owned()),
+            (3, 1, "SCAN c".to_owned()),
+        ];
+        let bars = Plan::from_sqlite(&steps).expect("a plan").flame();
+        assert_eq!(bars.len(), 3);
+        assert_eq!((bars[0].width, bars[1].width), (0.5, 0.5));
+        assert_eq!((bars[2].depth, bars[2].start, bars[2].width), (1, 0.0, 0.5));
     }
 
     #[test]

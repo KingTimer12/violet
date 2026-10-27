@@ -13,7 +13,7 @@ use super::action::Action;
 use super::cells::{self, Cell, Look};
 use super::edit_flow::{EditTarget, Editing};
 use super::icons::Icon;
-use super::plan_view;
+use super::plan_view::{self, View};
 use super::reference::{self, Reference};
 use super::selection::{Mode, Selection};
 use super::theme::{self, Palette};
@@ -143,10 +143,7 @@ pub fn show(
                             );
                         }
                         if plan.is_some() {
-                            let mut view = usize::from(tab.plan_raw);
-                            if widgets::segmented(ui, &mut view, &[(0, "Plan"), (1, "Rows")]) {
-                                tab.plan_raw = view == 1;
-                            }
+                            widgets::segmented(ui, &mut tab.plan_view, &View::OPTIONS);
                         }
                         if set.has_rows() {
                             edit_bar(ui, tab.id, &pending, editing, actions);
@@ -228,8 +225,8 @@ pub fn show(
                 Stroke::new(1.0, palette.outline),
             );
 
-            if let Some(plan) = plan.filter(|_| !tab.plan_raw) {
-                plan_view::show(ui, tab.id, &plan);
+            if let Some(plan) = plan.filter(|_| tab.plan_view != View::Rows) {
+                plan_view::show(ui, tab.id, &plan, tab.plan_view);
             } else if set.has_rows() {
                 if let Some(paging) = &tab.paging {
                     let fetching = tab.running.as_ref().is_some_and(|r| r.append);
