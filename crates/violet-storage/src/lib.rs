@@ -18,6 +18,7 @@ mod cache;
 mod dirs;
 mod history;
 mod json;
+mod revisions;
 pub mod scripts;
 mod secrets;
 
@@ -25,5 +26,8 @@ pub use cache::{MemoryKv, MemoryResultCache};
 pub use dirs::{AppDirs, ProjectPaths};
 pub use history::JsonLinesHistory;
 pub use json::{JsonFile, JsonProfileRepository};
+pub use revisions::{
+    KEPT as REVISIONS_KEPT, Performance, PlanSummary, Revision, RevisionNote, RunSummary,
+};
 pub use scripts::{SavedScript, ScriptFolder, ScriptStore};
 pub use secrets::{KeyringApiKeys, KeyringSecretStore, MemorySecretStore};

@@ -27,6 +27,11 @@ pub struct ScriptPrompt {
     /// Where it goes: the connection and database.
     pub target: String,
     pub error: Option<String>,
+    /// Kept with the version this save makes.
+    pub comment: String,
+    /// Whether the script still needs a name; else it is saved to its
+    /// file and only the comment is asked.
+    pub ask_name: bool,
 }
 
 /// Closing editors whose scripts have changes not saved to their files.
@@ -228,7 +233,45 @@ impl VioletApp {
         match action {
             Action::SaveScript(tab) => self.save_script(ctx, tab),
             Action::SaveScriptAs(tab) => self.save_script_as(ctx, tab),
-            Action::SaveScriptNamed(tab, name) => self.save_script_named(ctx, tab, &name),
+            Action::SaveScriptNamed(tab, name, comment) => {
+                self.pending_comment = Some(comment);
+                self.save_script_named(ctx, tab, &name);
+                self.pending_comment = None;
+            }
+            Action::CommentSave(tab) => {
+                let saved = self
+                    .workspace
+                    .get(tab)
+                    .is_some_and(|tab| tab.file.is_some());
+                if saved {
+                    self.script_prompt = Some(ScriptPrompt {
+                        tab,
+                        name: String::new(),
+                        target: String::new(),
+                        error: None,
+                        comment: String::new(),
+                        ask_name: false,
+                    });
+                } else {
+                    self.save_script(ctx, tab);
+                }
+            }
+            Action::SaveScriptCommented(tab, comment) => {
+                self.script_prompt = None;
+                self.pending_comment = Some(comment);
+                self.save_script(ctx, tab);
+                self.pending_comment = None;
+            }
+            Action::SetRevisionComment(path, id, comment) => {
+                let mut note = self.scripts.revision_note(&path, id);
+                note.comment = comment.trim().to_owned();
+                if let Err(error) = self.scripts.set_revision_note(&path, id, &note) {
+                    self.toasts.push(
+                        ctx,
+                        Toast::error("Could not save the comment", error.to_string()),
+                    );
+                }
+            }
             Action::OpenScriptFile => {
                 let mut picker = rfd::FileDialog::new()
                     .set_title("Open script")
@@ -242,6 +285,8 @@ impl VioletApp {
             }
             Action::OpenScript(path) => self.open_script(ctx, path),
             Action::MoveScript(path, folder) => self.move_script(ctx, &path, &folder),
+            Action::ScriptHistory(path) => self.show_script_history(ctx, path),
+            Action::RestoreRevision(path, id) => self.restore_revision(ctx, path, id),
             Action::MoveScriptFolder(connection, database, folder, parent) => {
                 self.move_script_folder(ctx, connection, &database, &folder, &parent);
             }
@@ -279,6 +324,7 @@ impl VioletApp {
             );
             return;
         }
+        self.scripts.move_revisions(path, &to);
         for tab in &mut self.workspace.tabs {
             if let Some(file) = &mut tab.file
                 && file.path == path
@@ -413,6 +459,7 @@ impl VioletApp {
                             );
                             return;
                         }
+                        self.scripts.move_revisions(&file.path, &moved);
                         moved
                     }
                     _ => file.path,
@@ -426,6 +473,8 @@ impl VioletApp {
                     name,
                     target: self.target_name(connection, &database),
                     error: None,
+                    comment: String::new(),
+                    ask_name: true,
                 });
             }
             (None, None) => self.save_script_as(ctx, tab_id),
@@ -497,6 +546,7 @@ impl VioletApp {
 
     /// Writes an editor's text to `path`, which becomes its file.
     fn write_script(&mut self, ctx: &egui::Context, tab_id: TabId, path: PathBuf) {
+        let comment = self.pending_comment.take().unwrap_or_default();
         let Some(tab) = self.workspace.get_mut(tab_id) else {
             return;
         };
@@ -506,6 +556,13 @@ impl VioletApp {
                 Toast::error("Could not save the script", error.to_string()),
             );
             return;
+        }
+        let note = violet_storage::RevisionNote {
+            comment: comment.trim().to_owned(),
+            performance: super::revisions_flow::performance_of(tab),
+        };
+        if let Err(error) = self.scripts.record_revision(&path, &tab.sql, &note) {
+            log::warn!("script history: {error}");
         }
         tab.title = script_title(&self.scripts, &path);
         tab.file = Some(ScriptFile {
@@ -638,20 +695,50 @@ pub fn show_prompt(
                 .inner_margin(egui::Margin::same(22)),
         )
         .show(ctx, |ui| {
-            ui.set_width(380.0);
+            ui.set_width(400.0);
             ui.spacing_mut().item_spacing.y = 12.0;
+            let first_frame = ui.memory(|memory| memory.focused().is_none());
+            let (title, hint) = if prompt.ask_name {
+                (
+                    "Save script",
+                    format!("Saved for {}.", prompt.target),
+                )
+            } else {
+                (
+                    "Save with comment",
+                    "The comment is kept with this version in the script's history.".to_owned(),
+                )
+            };
             ui.label(
-                RichText::new("Save script")
+                RichText::new(title)
                     .font(theme::semibold(16.0))
                     .color(palette.text),
             );
-            ui.label(
-                RichText::new(format!("Saved for {}.", prompt.target)).color(palette.secondary),
+            ui.add(egui::Label::new(RichText::new(hint).color(palette.secondary)).wrap());
+            let mut submit = false;
+            if prompt.ask_name {
+                let response = ui.add(widgets::text_input(&mut prompt.name, "Name"));
+                if first_frame {
+                    response.request_focus();
+                }
+                submit =
+                    response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            }
+            let comment = ui.add(
+                egui::TextEdit::multiline(&mut prompt.comment)
+                    .hint_text("Comment (optional): what changed, why")
+                    .desired_rows(3)
+                    .margin(egui::vec2(10.0, 7.0))
+                    .desired_width(f32::INFINITY),
             );
-            let response = ui.add(widgets::text_input(&mut prompt.name, "Name"));
-            response.request_focus();
-            let submit =
-                response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            if first_frame && !prompt.ask_name {
+                comment.request_focus();
+            }
+            if comment.has_focus()
+                && ui.input(|input| input.modifiers.command && input.key_pressed(egui::Key::Enter))
+            {
+                submit = true;
+            }
             if let Some(error) = &prompt.error {
                 ui.label(RichText::new(error).color(palette.danger));
             }
@@ -660,7 +747,15 @@ pub fn show_prompt(
                     if widgets::button(ui, Tone::Primary, Some(Icon::Save), "Save").clicked()
                         || submit
                     {
-                        actions.push(Action::SaveScriptNamed(prompt.tab, prompt.name.clone()));
+                        actions.push(if prompt.ask_name {
+                            Action::SaveScriptNamed(
+                                prompt.tab,
+                                prompt.name.clone(),
+                                prompt.comment.clone(),
+                            )
+                        } else {
+                            Action::SaveScriptCommented(prompt.tab, prompt.comment.clone())
+                        });
                     }
                     if widgets::button(ui, Tone::Ghost, None, "Cancel").clicked() {
                         open = false;
