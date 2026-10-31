@@ -132,6 +132,7 @@ impl ScriptStore {
             )));
         }
         rename(&from, &target)?;
+        self.move_revisions(&from, &target);
         Ok((from, target))
     }
 

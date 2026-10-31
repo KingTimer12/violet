@@ -1017,6 +1017,9 @@ impl ScriptLevel<'_> {
                         ));
                     }
                 });
+                if menu_item(ui, Icon::Clock, "History…") {
+                    actions.push(Action::ScriptHistory(script.path.clone()));
+                }
                 if menu_item(ui, Icon::FolderOpen, "Show in folder") {
                     actions.push(Action::Reveal(script.path.clone()));
                 }
