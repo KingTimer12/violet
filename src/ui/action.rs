@@ -159,8 +159,15 @@ pub enum Action {
     SaveScript(TabId),
     /// Saves an editor to a file the user picks.
     SaveScriptAs(TabId),
-    /// Saves an editor as a script of its connection's database, named.
-    SaveScriptNamed(TabId, String),
+    /// Saves an editor as a script of its connection's database, named,
+    /// with a comment for the version.
+    SaveScriptNamed(TabId, String, String),
+    /// Asks for a comment, then saves the editor.
+    CommentSave(TabId),
+    /// Saves an editor to its file with a comment for the version.
+    SaveScriptCommented(TabId, String),
+    /// Changes the comment of a saved version of a script (by id).
+    SetRevisionComment(PathBuf, u64, String),
     /// Opens a `.sql` file the user picks.
     OpenScriptFile,
     /// Opens a script, on the database it was saved for.
@@ -168,6 +175,10 @@ pub enum Action {
     /// Moves a saved script to a folder of its database; empty for the
     /// database's own.
     MoveScript(PathBuf, String),
+    /// Shows the earlier versions of a saved script.
+    ScriptHistory(PathBuf),
+    /// Puts a saved version of a script (by id) in its editor, unsaved.
+    RestoreRevision(PathBuf, u64),
     /// Moves a script folder (connection, database, folder) into another
     /// of its database; empty for the top level.
     MoveScriptFolder(ConnectionId, String, String, String),

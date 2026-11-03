@@ -31,6 +31,7 @@ mod providers;
 mod reference;
 mod rename_flow;
 mod results;
+mod revisions_flow;
 mod script_flow;
 mod selection;
 mod shortcuts;
@@ -124,6 +125,9 @@ pub struct VioletApp {
     /// The folders below databases' scripts, as last listed.
     script_folders: Vec<ScriptFolder>,
     script_prompt: Option<script_flow::ScriptPrompt>,
+    script_history: Option<revisions_flow::History>,
+    /// The comment for the version a save in progress keeps.
+    pending_comment: Option<String>,
     /// Asks about unsaved scripts before their tabs close.
     close_confirm: Option<script_flow::CloseConfirm>,
     /// The window closes once unsaved scripts were saved or discarded.
@@ -320,6 +324,8 @@ impl VioletApp {
             script_list: Vec::new(),
             script_folders: Vec::new(),
             script_prompt: None,
+            script_history: None,
+            pending_comment: None,
             close_confirm: None,
             quitting: false,
             tx_confirm: None,
@@ -2186,10 +2192,15 @@ impl VioletApp {
             action @ (Action::SaveScript(_)
             | Action::SaveScriptAs(_)
             | Action::SaveScriptNamed(..)
+            | Action::CommentSave(_)
+            | Action::SaveScriptCommented(..)
+            | Action::SetRevisionComment(..)
             | Action::OpenScriptFile
             | Action::OpenScript(_)
             | Action::MoveScript(..)
-            | Action::MoveScriptFolder(..)) => self.script_action(ctx, action),
+            | Action::MoveScriptFolder(..)
+            | Action::ScriptHistory(_)
+            | Action::RestoreRevision(..)) => self.script_action(ctx, action),
             action @ (Action::SwitchProject(_)
             | Action::AskDeleteProject(_)
             | Action::DeleteProject(_)) => self.project_action(ctx, action),
@@ -2547,6 +2558,7 @@ impl VioletApp {
         let modal_open = self.form.is_some()
             || self.prompt.is_some()
             || self.script_prompt.is_some()
+            || self.script_history.is_some()
             || self.cell_editor.is_some()
             || self.edit_review.is_some()
             || self.run_review.is_some()
@@ -2865,6 +2877,11 @@ impl VioletApp {
             && !script_flow::show_prompt(ctx, prompt, &mut self.actions)
         {
             self.script_prompt = None;
+        }
+        if let Some(history) = &mut self.script_history
+            && !revisions_flow::show(ctx, history, &mut self.actions)
+        {
+            self.script_history = None;
         }
         if let Some(editor) = &mut self.cell_editor
             && !edit_flow::show_cell_editor(ctx, editor, &mut self.actions)

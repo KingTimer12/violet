@@ -683,6 +683,9 @@ pub fn toolbar(
             actions.push(Action::SaveScript(tab.id));
         }
         save.context_menu(|ui| {
+            if ui.button("Save with comment…").clicked() {
+                actions.push(Action::CommentSave(tab.id));
+            }
             let label = format!(
                 "Save as… ({})",
                 ui.ctx().format_shortcut(&shortcuts::get(Command::SaveAs))
