@@ -237,6 +237,10 @@ impl ConnectionProfile {
 /// file edited behind Violet's back (to point a connection at another
 /// server) cannot get the password sent there.
 ///
+/// The TLS mode counts too, as the mode a driver must use (see
+/// [`SslMode::effective`]): a profile edited to `Disable` would otherwise
+/// send the password in clear to the very server it was saved for.
+///
 /// The database is left out on purpose: a saved connection opens the other
 /// databases of the same server with the same password.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,6 +249,7 @@ pub struct SecretTarget {
     pub host: String,
     pub port: u16,
     pub user: String,
+    pub ssl: SslMode,
 }
 
 impl fmt::Display for SecretTarget {
@@ -256,7 +261,7 @@ impl fmt::Display for SecretTarget {
         if !self.user.is_empty() {
             write!(f, "{}@", self.user)?;
         }
-        write!(f, "{}:{}", self.host, self.port)
+        write!(f, "{}:{} (TLS {})", self.host, self.port, self.ssl.label())
     }
 }
 
@@ -270,6 +275,7 @@ impl ConnectionProfile {
             host: self.host.trim().to_ascii_lowercase(),
             port: self.port,
             user: self.username.trim().to_owned(),
+            ssl: self.ssl.effective(&self.host),
         }
     }
 }
@@ -324,7 +330,10 @@ mod tests {
         profile.host = " DB.example.com ".to_owned();
         profile.username = "app".to_owned();
         let target = profile.secret_target();
-        assert_eq!(target.to_string(), "postgres app@db.example.com:5432");
+        assert_eq!(
+            target.to_string(),
+            "postgres app@db.example.com:5432 (TLS Require)"
+        );
 
         profile.database = "other".to_owned();
         profile.name = "Renamed".to_owned();
@@ -335,6 +344,7 @@ mod tests {
             |p: &mut ConnectionProfile| p.port = 5433,
             |p: &mut ConnectionProfile| p.username = "root".to_owned(),
             |p: &mut ConnectionProfile| p.driver = DriverId::new("mysql"),
+            |p: &mut ConnectionProfile| p.ssl = SslMode::Disable,
         ] {
             let mut moved = profile.clone();
             change(&mut moved);

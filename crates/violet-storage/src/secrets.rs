@@ -194,6 +194,7 @@ mod tests {
             host: host.to_owned(),
             port: 5432,
             user: "app".to_owned(),
+            ssl: violet_core::SslMode::Require,
         }
     }
 
@@ -246,7 +247,7 @@ mod tests {
         }
         // An envelope from a later version is neither used nor taken for a
         // bare password (which would overwrite it).
-        let later = r#"{"v":2,"target":{"driver":"postgres","host":"prod","port":5432,"user":"app"},"password":"pw"}"#;
+        let later = r#"{"v":2,"target":{"driver":"postgres","host":"prod","port":5432,"user":"app","ssl":"require"},"password":"pw"}"#;
         assert_eq!(open(later, &target("prod")), Some(SavedSecret::None));
         assert_eq!(open(r#"{"v":1}"#, &target("prod")), Some(SavedSecret::None));
     }

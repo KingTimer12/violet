@@ -603,6 +603,7 @@ mod tests {
             host: host.to_owned(),
             port: 5432,
             user: "app".to_owned(),
+            ssl: violet_core::SslMode::Require,
         }
     }
 
