@@ -232,6 +232,54 @@ impl ConnectionProfile {
     }
 }
 
+/// Where a saved password may be sent: the driver, server and user it was
+/// saved for. The keychain keeps it beside the password, so a profiles
+/// file edited behind Violet's back (to point a connection at another
+/// server) cannot get the password sent there.
+///
+/// The TLS mode counts too, as the mode a driver must use (see
+/// [`SslMode::effective`]): a profile edited to `Disable` would otherwise
+/// send the password in clear to the very server it was saved for.
+///
+/// The database is left out on purpose: a saved connection opens the other
+/// databases of the same server with the same password.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretTarget {
+    pub driver: String,
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub ssl: SslMode,
+}
+
+impl fmt::Display for SecretTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.port == 0 {
+            return write!(f, "{} {}", self.driver, self.host);
+        }
+        write!(f, "{} ", self.driver)?;
+        if !self.user.is_empty() {
+            write!(f, "{}@", self.user)?;
+        }
+        write!(f, "{}:{} (TLS {})", self.host, self.port, self.ssl.label())
+    }
+}
+
+impl ConnectionProfile {
+    /// The target a password saved for this profile is bound to. Host names
+    /// are compared ignoring case, as DNS does.
+    #[must_use]
+    pub fn secret_target(&self) -> SecretTarget {
+        SecretTarget {
+            driver: self.driver.0.clone(),
+            host: self.host.trim().to_ascii_lowercase(),
+            port: self.port,
+            user: self.username.trim().to_owned(),
+            ssl: self.ssl.effective(&self.host),
+        }
+    }
+}
+
 /// What a connection is opened with besides the profile.
 #[derive(Clone, Debug, Default)]
 pub struct Credentials {
@@ -274,6 +322,34 @@ mod tests {
         assert_eq!(profile.display_name(), "localhost/");
         profile.username = "app".to_owned();
         assert_eq!(profile.validate(crate::Login::Required), Ok(()));
+    }
+
+    #[test]
+    fn the_secret_target_is_the_server_and_user_not_the_database() {
+        let mut profile = ConnectionProfile::new(DriverId::new("postgres"), 5432);
+        profile.host = " DB.example.com ".to_owned();
+        profile.username = "app".to_owned();
+        let target = profile.secret_target();
+        assert_eq!(
+            target.to_string(),
+            "postgres app@db.example.com:5432 (TLS Require)"
+        );
+
+        profile.database = "other".to_owned();
+        profile.name = "Renamed".to_owned();
+        assert_eq!(profile.secret_target(), target);
+
+        for change in [
+            |p: &mut ConnectionProfile| p.host = "evil.example.com".to_owned(),
+            |p: &mut ConnectionProfile| p.port = 5433,
+            |p: &mut ConnectionProfile| p.username = "root".to_owned(),
+            |p: &mut ConnectionProfile| p.driver = DriverId::new("mysql"),
+            |p: &mut ConnectionProfile| p.ssl = SslMode::Disable,
+        ] {
+            let mut moved = profile.clone();
+            change(&mut moved);
+            assert_ne!(moved.secret_target(), target);
+        }
     }
 
     #[test]

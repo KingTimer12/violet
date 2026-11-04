@@ -697,6 +697,8 @@ pub struct PasswordPrompt {
     pub id: violet_core::ConnectionId,
     pub name: String,
     pub password: String,
+    /// Why the saved password was not used, when there is one.
+    pub reason: Option<String>,
 }
 
 impl Drop for PasswordPrompt {
@@ -729,10 +731,14 @@ pub fn show_prompt(
                     .font(theme::semibold(16.0))
                     .color(palette.text),
             );
-            ui.label(
-                RichText::new(format!("Enter the password for {}.", prompt.name))
-                    .color(palette.secondary),
-            );
+            if let Some(reason) = &prompt.reason {
+                ui.add(egui::Label::new(RichText::new(reason).color(palette.secondary)).wrap());
+            } else {
+                ui.label(
+                    RichText::new(format!("Enter the password for {}.", prompt.name))
+                        .color(palette.secondary),
+                );
+            }
             let response =
                 ui.add(widgets::text_input(&mut prompt.password, "Password").password(true));
             response.request_focus();

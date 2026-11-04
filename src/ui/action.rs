@@ -53,6 +53,21 @@ pub enum Action {
     SwitchProject(Option<String>),
     AskDeleteProject(String),
     DeleteProject(String),
+    /// Asks for a password and exports the open workspace to a backup.
+    ExportProject,
+    /// Picks a backup and asks for its password, to import it.
+    ImportProject,
+    /// Runs the export or import the backup dialog is set for.
+    RunBackup,
+    /// Unlocks the saved passwords, or sets, changes or removes the master
+    /// password that guards them.
+    MasterPassword,
+    /// Unlocks with the password typed in the vault dialog.
+    UnlockVault,
+    /// Saves the vault dialog's new master password, or removes it.
+    SaveMasterPassword {
+        remove: bool,
+    },
     Connect(ConnectionId),
     /// Disconnects, asking first about an open transaction.
     Disconnect(ConnectionId),

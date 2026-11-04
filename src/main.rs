@@ -41,7 +41,7 @@ use violet_core::ports::{
 use violet_providers::{DEFAULT_INDEX, Providers, Source};
 use violet_storage::{
     AppDirs, JsonFile, JsonLinesHistory, JsonProfileRepository, KeyringSecretStore,
-    MemoryResultCache, ScriptStore,
+    MemoryResultCache, ScriptStore, VaultSecretStore,
 };
 
 use settings::Settings;
@@ -121,7 +121,24 @@ fn main() -> eframe::Result {
             egui_extras::install_image_loaders(&ctx);
             fastframe_icons::install::<ui::icons::Icon>(&ctx);
 
-            let secrets: Arc<dyn SecretStore> = Arc::new(KeyringSecretStore);
+            // Saved passwords, sealed in the vault. Should it not open (its
+            // key gone from the keychain, say), the keychain is used as before
+            // Violet had a vault, and the vault is left as it is.
+            let vault = match VaultSecretStore::open(dirs.vault_file()) {
+                Ok(vault) => Some(Arc::new(vault)),
+                Err(error) => {
+                    log::error!("vault: {error}");
+                    startup_errors.push(ui::toast_error(
+                        "The password vault could not be opened",
+                        format!("{} Passwords are kept in the keychain instead.", error.message),
+                    ));
+                    None
+                }
+            };
+            let secrets: Arc<dyn SecretStore> = match &vault {
+                Some(vault) => Arc::clone(vault) as Arc<dyn SecretStore>,
+                None => Arc::new(KeyringSecretStore),
+            };
             let project = dirs.project(settings.project());
             let repository: Arc<dyn ProfileRepository> =
                 Arc::new(JsonProfileRepository::new(&project.profiles_file));
@@ -185,6 +202,7 @@ fn main() -> eframe::Result {
                     })
                     .flatten(),
                 update_receipt: launch.receipt,
+                vault,
             };
             Ok(Box::new(VioletApp::new(
                 &ctx,

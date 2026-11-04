@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 use violet_core::{ConnectionId, Result};
 
-use crate::json::{open_private, storage_error};
+use crate::json::{create_private_dir, open_private, storage_error};
 
 /// The extension SQL scripts are saved with.
 pub const EXTENSION: &str = "sql";
@@ -110,7 +110,7 @@ impl ScriptStore {
         folder: &str,
     ) -> Result<()> {
         let path = self.folder_path(connection, database, folder);
-        fs::create_dir_all(&path)
+        create_private_dir(&path)
             .map_err(|error| storage_error(format!("Cannot create {}: {error}", path.display())))
     }
 
@@ -246,7 +246,7 @@ pub fn write(path: &Path, sql: &str) -> Result<()> {
     let directory = path
         .parent()
         .ok_or_else(|| storage_error(format!("{} has no directory", path.display())))?;
-    fs::create_dir_all(directory).map_err(|error| {
+    create_private_dir(directory).map_err(|error| {
         storage_error(format!("Cannot create {}: {error}", directory.display()))
     })?;
     let mut temporary = path.as_os_str().to_owned();
@@ -267,7 +267,7 @@ pub fn write(path: &Path, sql: &str) -> Result<()> {
 /// Moves a script, creating the folder it goes to.
 pub fn rename(from: &Path, to: &Path) -> Result<()> {
     if let Some(directory) = to.parent() {
-        fs::create_dir_all(directory).map_err(|error| {
+        create_private_dir(directory).map_err(|error| {
             storage_error(format!("Cannot create {}: {error}", directory.display()))
         })?;
     }

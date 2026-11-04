@@ -7,7 +7,7 @@ use async_trait::async_trait;
 
 use crate::driver::{Driver, DriverInfo};
 use crate::error::Result;
-use crate::profile::{ConnectionId, ConnectionProfile, DriverId};
+use crate::profile::{ConnectionId, ConnectionProfile, DriverId, SecretTarget};
 use crate::query::QueryOutput;
 use crate::secret::Secret;
 
@@ -55,10 +55,36 @@ pub trait ProfileRepository: Send + Sync + 'static {
     fn save(&self, profiles: &SavedProfiles) -> Result<()>;
 }
 
+/// What the store holds for a connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SavedSecret {
+    /// Nothing saved.
+    None,
+    /// The password, saved for the target asked about.
+    Found(Secret),
+    /// A password saved for another target: the profile was pointed at a
+    /// different server or user since. It is not handed out.
+    Elsewhere(SecretTarget),
+}
+
+impl SavedSecret {
+    /// The password, only when it was saved for the target asked about.
+    #[must_use]
+    pub fn found(self) -> Option<Secret> {
+        match self {
+            Self::Found(secret) => Some(secret),
+            Self::None | Self::Elsewhere(_) => None,
+        }
+    }
+}
+
 /// Where passwords live. Never the profiles file.
+///
+/// Each password is kept with the [`SecretTarget`] it was saved for, and
+/// [`SecretStore::get`] hands it out for that target only.
 pub trait SecretStore: Send + Sync + 'static {
-    fn get(&self, id: ConnectionId) -> Result<Option<Secret>>;
-    fn set(&self, id: ConnectionId, secret: &Secret) -> Result<()>;
+    fn get(&self, id: ConnectionId, target: &SecretTarget) -> Result<SavedSecret>;
+    fn set(&self, id: ConnectionId, target: &SecretTarget, secret: &Secret) -> Result<()>;
     fn delete(&self, id: ConnectionId) -> Result<()>;
 }
 

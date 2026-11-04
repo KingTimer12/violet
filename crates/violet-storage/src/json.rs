@@ -53,7 +53,7 @@ impl<T: Serialize + DeserializeOwned> JsonFile<T> {
             .path
             .parent()
             .ok_or_else(|| storage_error("The settings path has no directory"))?;
-        fs::create_dir_all(directory).map_err(|error| {
+        create_private_dir(directory).map_err(|error| {
             storage_error(format!("Cannot create {}: {error}", directory.display()))
         })?;
 
@@ -71,8 +71,10 @@ impl<T: Serialize + DeserializeOwned> JsonFile<T> {
     }
 }
 
+/// Opens `path` for writing, created or emptied, readable by its owner
+/// only (`0600`) when made.
 #[cfg(unix)]
-pub(crate) fn open_private(path: &Path) -> std::io::Result<fs::File> {
+pub fn open_private(path: &Path) -> std::io::Result<fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
     fs::OpenOptions::new()
         .write(true)
@@ -82,9 +84,33 @@ pub(crate) fn open_private(path: &Path) -> std::io::Result<fs::File> {
         .open(path)
 }
 
+/// On Windows the file inherits the ACL of the folder it is made in. Violet
+/// writes under the user's profile (`%APPDATA%`, `%LOCALAPPDATA%`), whose
+/// ACL already limits access to the user, SYSTEM and administrators, the
+/// same reach as a `0600` file on Unix. An explicit ACL would take Win32
+/// calls this workspace forbids (`unsafe_code`) for no further gain.
 #[cfg(not(unix))]
-pub(crate) fn open_private(path: &Path) -> std::io::Result<fs::File> {
+pub fn open_private(path: &Path) -> std::io::Result<fs::File> {
     fs::File::create(path)
+}
+
+/// Creates `path` and any missing parents. On Unix the folders made are
+/// for their owner only (`0700`): the files in them are private already,
+/// but their names (scripts', connections') need not be listed by others.
+/// Folders that already exist are left as they are.
+#[cfg(unix)]
+pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+}
+
+/// See [`open_private`] for why Windows needs nothing more.
+#[cfg(not(unix))]
+pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(path)
 }
 
 pub(crate) fn storage_error(message: impl Into<String>) -> DbError {
@@ -182,6 +208,24 @@ mod tests {
             .expect("save");
         let mode = fs::metadata(&path).expect("metadata").permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn folders_it_makes_are_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("a/b/connections.json");
+        JsonProfileRepository::new(&path)
+            .save(&SavedProfiles::default())
+            .expect("save");
+        for folder in ["a", "a/b"] {
+            let mode = fs::metadata(directory.path().join(folder))
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700, "{folder}");
+        }
     }
 
     #[test]

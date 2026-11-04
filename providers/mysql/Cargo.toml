@@ -25,6 +25,8 @@ sha2 = "0.10"
 rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }
 rand_core = { version = "0.6", default-features = false }
 getrandom = "0.4"
+# Clears the buffers that hold the password in plain text.
+zeroize = "1"
 
 [profile.release]
 opt-level = "z"

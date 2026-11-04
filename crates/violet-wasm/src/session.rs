@@ -177,24 +177,42 @@ struct CancelPlan {
 }
 
 impl WasmSession {
+    /// A new instance of `provider` and the session it opened.
+    async fn connect(
+        provider: &Provider,
+        target: &Target,
+        params: &wit::ConnectParams,
+    ) -> Result<(Instance, ResourceAny)> {
+        let mut instance = Instance::start(provider, Some(target.clone())).await?;
+        let id = instance.info().await?.id;
+        instance.store.data_mut().set_provider(&id);
+        let session = instance
+            .world
+            .violet_provider_provider()
+            .call_connect(&mut instance.store, params)
+            .await
+            .map_err(|error| crashed(&error))?
+            .map_err(convert::error)?;
+        Ok((instance, session))
+    }
+
     #[hotpath::measure]
     pub(crate) async fn open(
         provider: Arc<Provider>,
         target: Target,
-        params: wit::ConnectParams,
+        mut params: wit::ConnectParams,
         dialect: SqlDialect,
         language: Language,
         cancellable: bool,
     ) -> Result<Self> {
-        let mut instance = Instance::start(&provider, Some(target.clone())).await?;
-        let id = instance.info().await?.id;
-        instance.store.data_mut().set_provider(&id);
+        let connected = Self::connect(&provider, &target, &params).await;
+        // The password is needed for the handshake only: clear this copy
+        // whatever the outcome. The cancel plan never gets it.
+        if let Some(mut password) = params.password.take() {
+            zeroize::Zeroize::zeroize(&mut password);
+        }
+        let (mut instance, session) = connected?;
         let exports = instance.world.violet_provider_provider();
-        let session = exports
-            .call_connect(&mut instance.store, &params)
-            .await
-            .map_err(|error| crashed(&error))?
-            .map_err(convert::error)?;
         let ticket = if cancellable {
             exports
                 .session()
@@ -209,10 +227,7 @@ impl WasmSession {
             Arc::new(CancelPlan {
                 provider,
                 target,
-                params: wit::ConnectParams {
-                    password: None,
-                    ..params
-                },
+                params,
                 ticket,
             })
         });

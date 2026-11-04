@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use violet_core::Result;
 use violet_core::ports::{HistoryEntry, QueryHistory};
 
-use crate::json::{open_private, storage_error};
+use crate::json::{create_private_dir, open_private, storage_error};
 
 /// A history file holding at most `keep` entries, the newest. It may grow
 /// past that while Violet runs; loading trims it.
@@ -80,7 +80,7 @@ impl QueryHistory for JsonLinesHistory {
             .map_err(|error| storage_error(format!("Cannot encode the history: {error}")))?;
         line.push(b'\n');
         if let Some(directory) = self.path.parent() {
-            fs::create_dir_all(directory).map_err(|error| {
+            create_private_dir(directory).map_err(|error| {
                 storage_error(format!("Cannot create {}: {error}", directory.display()))
             })?;
         }

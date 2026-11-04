@@ -37,8 +37,10 @@ impl Provider for Postgres {
         }
     }
 
-    fn connect(params: ConnectParams) -> Result<PgSession> {
-        PgSession::connect(&params)
+    fn connect(mut params: ConnectParams) -> Result<PgSession> {
+        let session = PgSession::connect(&params);
+        params.wipe_password();
+        session
     }
 
     fn tasks() -> Vec<Task> {

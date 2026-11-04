@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use violet_core::Result;
 
-use crate::json::{open_private, storage_error};
+use crate::json::{create_private_dir, open_private, storage_error};
 use crate::scripts::ScriptStore;
 
 /// Folder of the scripts folder holding the copies.
@@ -109,7 +109,7 @@ impl ScriptStore {
             }
             return Ok(());
         }
-        fs::create_dir_all(&directory).map_err(|error| {
+        create_private_dir(&directory).map_err(|error| {
             storage_error(format!("Cannot create {}: {error}", directory.display()))
         })?;
         let now = SystemTime::now()
@@ -181,7 +181,10 @@ impl ScriptStore {
         let mut revisions: Vec<Revision> = entries
             .filter_map(|entry| {
                 let name = entry.ok()?.path();
-                if name.extension().is_some_and(|extension| extension == "json") {
+                if name
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+                {
                     return None;
                 }
                 let id: u64 = name.file_stem()?.to_str()?.parse().ok()?;
@@ -216,7 +219,7 @@ impl ScriptStore {
             return;
         }
         if let Some(parent) = to.parent()
-            && let Err(error) = fs::create_dir_all(parent)
+            && let Err(error) = create_private_dir(parent)
         {
             log::warn!("Cannot move history to {}: {error}", to.display());
             return;
@@ -340,7 +343,10 @@ mod tests {
         store.record_revision(&path, "SELECT 1;", &commented)?;
         let revisions = store.revisions(&path)?;
         assert_eq!(revisions.len(), 1);
-        assert_eq!(store.revision_note(&path, revisions[0].id).comment, "baseline");
+        assert_eq!(
+            store.revision_note(&path, revisions[0].id).comment,
+            "baseline"
+        );
 
         store.set_revision_note(&path, revisions[0].id, &RevisionNote::default())?;
         assert!(store.revision_note(&path, revisions[0].id).is_empty());

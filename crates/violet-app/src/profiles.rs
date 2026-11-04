@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use violet_core::ports::{ProfileRepository, SavedProfiles, SecretStore};
+use violet_core::ports::{ProfileRepository, SavedProfiles, SavedSecret, SecretStore};
 use violet_core::{ConnectionId, ConnectionProfile, Result, Secret};
 
 /// Loads, saves and deletes profiles, and keeps each password in the
@@ -72,10 +72,21 @@ impl ProfileService {
 
     /// Adds or replaces a profile. `password` is `None` when the form left
     /// the stored one untouched.
+    ///
+    /// A saved password is bound to the profile's server and user. Edited
+    /// here, a profile that moves keeps its password, bound to the new
+    /// target; moved any other way (the file edited by hand, say), it does
+    /// not get the password.
     pub fn upsert(&mut self, profile: ConnectionProfile, password: Option<&Secret>) -> Result<()> {
+        let target = profile.secret_target();
         if profile.save_password {
             if let Some(password) = password {
-                self.secrets.set(profile.id, password)?;
+                self.secrets.set(profile.id, &target, password)?;
+            } else if let Some(before) = self.get(profile.id).map(ConnectionProfile::secret_target)
+                && before != target
+                && let SavedSecret::Found(kept) = self.secrets.get(profile.id, &before)?
+            {
+                self.secrets.set(profile.id, &target, &kept)?;
             }
         } else {
             self.secrets.delete(profile.id)?;
@@ -87,6 +98,58 @@ impl ProfileService {
             None => next.push(profile),
         }
         self.store(next, self.folders.clone())
+    }
+
+    /// The profiles and the folders made by hand, as saved.
+    #[must_use]
+    pub fn saved(&self) -> SavedProfiles {
+        SavedProfiles {
+            connections: self.profiles.clone(),
+            folders: self.folders.clone(),
+        }
+    }
+
+    /// Merges connections from a backup: each replaces the one with its id
+    /// or is added, and the folders join the ones here. A password the
+    /// backup carries is saved for its connection's target. Returns how
+    /// many connections were added or replaced.
+    ///
+    /// A connection the backup carries no password for keeps whatever is
+    /// saved here; bound to the old target, it is not sent to a new one.
+    pub fn import(
+        &mut self,
+        saved: &SavedProfiles,
+        passwords: &[(ConnectionId, Secret)],
+    ) -> Result<usize> {
+        for profile in &saved.connections {
+            let password = passwords
+                .iter()
+                .find(|(id, _)| *id == profile.id)
+                .map(|(_, secret)| secret);
+            match password {
+                Some(password) if profile.save_password => {
+                    self.secrets
+                        .set(profile.id, &profile.secret_target(), password)?;
+                }
+                _ if !profile.save_password => self.secrets.delete(profile.id)?,
+                _ => {}
+            }
+        }
+        let mut next = self.profiles.clone();
+        for profile in &saved.connections {
+            match next.iter_mut().find(|existing| existing.id == profile.id) {
+                Some(existing) => *existing = profile.clone(),
+                None => next.push(profile.clone()),
+            }
+        }
+        let mut folders = self.folders.clone();
+        for folder in &saved.folders {
+            if !folders.contains(folder) {
+                folders.push(folder.clone());
+            }
+        }
+        self.store(next, folders)?;
+        Ok(saved.connections.len())
     }
 
     /// Deletes a profile and its password.
@@ -223,22 +286,7 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct Secrets(Mutex<std::collections::HashMap<ConnectionId, Secret>>);
-
-    impl SecretStore for Secrets {
-        fn get(&self, id: ConnectionId) -> Result<Option<Secret>> {
-            Ok(self.0.lock().expect("lock").get(&id).cloned())
-        }
-        fn set(&self, id: ConnectionId, secret: &Secret) -> Result<()> {
-            self.0.lock().expect("lock").insert(id, secret.clone());
-            Ok(())
-        }
-        fn delete(&self, id: ConnectionId) -> Result<()> {
-            self.0.lock().expect("lock").remove(&id);
-            Ok(())
-        }
-    }
+    type Secrets = violet_storage::MemorySecretStore;
 
     fn service() -> (ProfileService, Arc<Secrets>) {
         let secrets = Arc::new(Secrets::default());
@@ -254,11 +302,21 @@ mod tests {
         service
             .upsert(profile.clone(), Some(&Secret::new("pw")))
             .expect("save");
-        assert!(secrets.get(profile.id).expect("get").is_some());
+        let target = profile.secret_target();
+        assert!(
+            secrets
+                .get(profile.id, &target)
+                .expect("get")
+                .found()
+                .is_some()
+        );
 
         profile.save_password = false;
         service.upsert(profile.clone(), None).expect("save");
-        assert!(secrets.get(profile.id).expect("get").is_none());
+        assert_eq!(
+            secrets.get(profile.id, &target).expect("get"),
+            SavedSecret::None
+        );
         assert_eq!(service.all().len(), 1);
     }
 
@@ -271,7 +329,106 @@ mod tests {
             .expect("save");
         service.remove(profile.id).expect("remove");
         assert!(service.all().is_empty());
-        assert!(secrets.get(profile.id).expect("get").is_none());
+        assert_eq!(
+            secrets
+                .get(profile.id, &profile.secret_target())
+                .expect("get"),
+            SavedSecret::None
+        );
+    }
+
+    #[test]
+    fn editing_the_server_here_moves_the_saved_password_along() {
+        let (mut service, secrets) = service();
+        let mut profile = ConnectionProfile::new(DriverId::new("postgres"), 5432);
+        profile.username = "app".to_owned();
+        service
+            .upsert(profile.clone(), Some(&Secret::new("pw")))
+            .expect("save");
+
+        profile.host = "db.example.com".to_owned();
+        service.upsert(profile.clone(), None).expect("save");
+        assert_eq!(
+            secrets
+                .get(profile.id, &profile.secret_target())
+                .expect("get"),
+            SavedSecret::Found(Secret::new("pw"))
+        );
+    }
+
+    #[test]
+    fn a_profile_moved_behind_violets_back_does_not_get_the_password() {
+        let repository = Arc::new(Memory::default());
+        let secrets = Arc::new(Secrets::default());
+        let mut profile = ConnectionProfile::new(DriverId::new("postgres"), 5432);
+        profile.host = "prod.example.com".to_owned();
+        let (mut service, _) = ProfileService::load(repository.clone(), secrets.clone());
+        service
+            .upsert(profile.clone(), Some(&Secret::new("pw")))
+            .expect("save");
+
+        // The profiles file is rewritten to send the connection elsewhere.
+        let mut tampered = profile.clone();
+        tampered.host = "evil.example.com".to_owned();
+        repository
+            .save(&SavedProfiles {
+                connections: vec![tampered.clone()],
+                folders: Vec::new(),
+            })
+            .expect("tamper");
+        let (mut service, _) = ProfileService::load(repository, secrets.clone());
+        assert_eq!(
+            secrets
+                .get(tampered.id, &tampered.secret_target())
+                .expect("get"),
+            SavedSecret::Elsewhere(profile.secret_target())
+        );
+
+        // Saving it from the form, untouched, does not carry it over either.
+        tampered.name = "Renamed".to_owned();
+        service.upsert(tampered.clone(), None).expect("save");
+        assert!(
+            secrets
+                .get(tampered.id, &tampered.secret_target())
+                .expect("get")
+                .found()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn importing_merges_by_id_and_saves_the_carried_passwords() {
+        let (mut service, secrets) = service();
+        let mut kept = ConnectionProfile::new(DriverId::new("postgres"), 5432);
+        kept.name = "Here".to_owned();
+        service
+            .upsert(kept.clone(), Some(&Secret::new("here")))
+            .expect("save");
+
+        let mut replaced = kept.clone();
+        replaced.name = "From backup".to_owned();
+        let added = ConnectionProfile::new(DriverId::new("mysql"), 3306);
+        let backup = SavedProfiles {
+            connections: vec![replaced.clone(), added.clone()],
+            folders: vec!["Imported".to_owned()],
+        };
+        let count = service
+            .import(&backup, &[(added.id, Secret::new("there"))])
+            .expect("import");
+        assert_eq!(count, 2);
+        assert_eq!(service.all(), &[replaced.clone(), added.clone()]);
+        assert!(service.folders().contains(&"Imported".to_owned()));
+        assert_eq!(
+            secrets.get(added.id, &added.secret_target()).expect("get"),
+            SavedSecret::Found(Secret::new("there"))
+        );
+        // Same target, no password in the backup: the one here stays.
+        assert_eq!(
+            secrets
+                .get(replaced.id, &replaced.secret_target())
+                .expect("get"),
+            SavedSecret::Found(Secret::new("here"))
+        );
     }
 
     #[test]
