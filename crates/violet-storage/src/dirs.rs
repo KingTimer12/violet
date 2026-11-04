@@ -56,6 +56,13 @@ impl AppDirs {
         self.config.join("connections.json")
     }
 
+    /// Saved passwords, sealed. Shared by every workspace, as connection
+    /// ids are unique.
+    #[must_use]
+    pub fn vault_file(&self) -> PathBuf {
+        self.config.join("vault.json")
+    }
+
     #[must_use]
     pub fn settings_file(&self) -> PathBuf {
         self.config.join("settings.json")

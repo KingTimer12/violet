@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tokio::sync::watch;
 use violet_core::ports::{
-    CacheKey, CachedOutput, ProviderListing, ProviderStore, ResultCache, SecretStore,
+    CacheKey, CachedOutput, ProviderListing, ProviderStore, ResultCache, SavedSecret, SecretStore,
 };
 use violet_core::{
     Canceller, ColumnInfo, ConnectionId, ConnectionProfile, Credentials, DbError, DbObject, Driver,
@@ -471,10 +471,34 @@ impl Shared {
         }
         let shared = Arc::clone(self);
         let id = profile.id;
-        let password = tokio::task::spawn_blocking(move || shared.secrets.get(id))
+        let target = profile.secret_target();
+        let saved = tokio::task::spawn_blocking(move || shared.secrets.get(id, &target))
             .await
             .map_err(|error| DbError::new(ErrorKind::Other, error.to_string()))??;
-        Ok(Credentials { password })
+        match saved {
+            SavedSecret::Found(password) => Ok(Credentials {
+                password: Some(password),
+            }),
+            SavedSecret::None => Ok(Credentials { password: None }),
+            // Sending it would hand the password to whatever server the
+            // profile now names.
+            SavedSecret::Elsewhere(saved_for) => {
+                log::warn!(
+                    "the saved password of {} is for {saved_for}, not {}; not sending it",
+                    profile.id,
+                    profile.secret_target()
+                );
+                Err(DbError::new(
+                    ErrorKind::Authentication,
+                    format!(
+                        "The saved password is for {saved_for}, and this connection now \
+                         points at {}. Enter the password to connect; save it in the \
+                         connection's settings to keep it for the new server.",
+                        profile.secret_target()
+                    ),
+                ))
+            }
+        }
     }
 
     /// Downloads the client programs a driver's provider asks for, in the

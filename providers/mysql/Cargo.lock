@@ -547,6 +547,7 @@ dependencies = [
  "sha1",
  "sha2",
  "violet-sdk",
+ "zeroize",
 ]
 
 [[package]]
@@ -555,6 +556,7 @@ version = "0.1.9"
 dependencies = [
  "log",
  "wit-bindgen",
+ "zeroize",
 ]
 
 [[package]]

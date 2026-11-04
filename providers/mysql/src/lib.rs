@@ -50,8 +50,10 @@ impl Provider for MySql {
         }
     }
 
-    fn connect(params: ConnectParams) -> Result<MySession> {
-        MySession::connect(&params)
+    fn connect(mut params: ConnectParams) -> Result<MySession> {
+        let session = MySession::connect(&params);
+        params.wipe_password();
+        session
     }
 
     fn tasks() -> Vec<Task> {

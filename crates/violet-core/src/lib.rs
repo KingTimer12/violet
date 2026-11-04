@@ -23,7 +23,9 @@ pub use driver::{
     PagedSql, Paging, Session, SqlDialect, string_literal,
 };
 pub use error::{DbError, ErrorKind, Result};
-pub use profile::{ConnectionId, ConnectionProfile, Credentials, DriverId, SslMode, is_loopback};
+pub use profile::{
+    ConnectionId, ConnectionProfile, Credentials, DriverId, SecretTarget, SslMode, is_loopback,
+};
 pub use query::{ColumnMeta, ExecLimits, Page, PageInfo, QueryOutput, ResultSet, Row, Rows};
 pub use secret::Secret;
 pub use tools::{

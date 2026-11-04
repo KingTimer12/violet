@@ -5,6 +5,7 @@
 mod action;
 mod agent_flow;
 mod ai_flow;
+mod backup_flow;
 mod catalog_flow;
 mod cells;
 mod chrome;
@@ -43,6 +44,7 @@ mod tasks;
 pub mod theme;
 mod toasts;
 mod transaction_flow;
+mod vault_flow;
 mod widgets;
 mod workspace;
 
@@ -55,7 +57,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use egui::{Frame, Id, Panel, Stroke};
 use violet_app::{Backend, CachePolicy, Event, ExecOptions, ProfileService, TaskId};
-use violet_core::ports::{HistoryEntry, QueryHistory};
+use violet_core::ports::{HistoryEntry, QueryHistory, SavedSecret};
 use violet_core::{ConnectionId, ConnectionProfile, DriverId, ErrorKind, Language, Page};
 use violet_storage::{JsonFile, SavedScript, ScriptFolder, ScriptStore};
 
@@ -105,6 +107,9 @@ pub struct Services {
     /// Set when this launch is a just-installed update, to confirm once
     /// the window is up.
     pub update_receipt: Option<fastframe_update::Receipt>,
+    /// The saved passwords' vault; `None` when it could not be opened and
+    /// the keychain is used as before.
+    pub vault: Option<Arc<violet_storage::VaultSecretStore>>,
 }
 
 pub struct VioletApp {
@@ -179,6 +184,11 @@ pub struct VioletApp {
     confirm_delete: Option<ConnectionId>,
     /// A workspace waiting for the user to confirm its deletion.
     confirm_project_delete: Option<String>,
+    /// The workspace backup being exported or imported.
+    backup: Option<backup_flow::BackupDialog>,
+    vault: Option<Arc<violet_storage::VaultSecretStore>>,
+    /// Asks for, sets or changes the master password.
+    vault_dialog: Option<vault_flow::VaultDialog>,
     dirs: violet_storage::AppDirs,
     /// A connection string typed on the welcome screen.
     welcome_uri: String,
@@ -358,6 +368,13 @@ impl VioletApp {
             copy_choice: (crate::export::Format::Tsv, true),
             confirm_delete: None,
             confirm_project_delete: None,
+            backup: None,
+            vault_dialog: services
+                .vault
+                .as_ref()
+                .filter(|vault| vault.is_locked())
+                .map(|_| vault_flow::VaultDialog::new(vault_flow::Mode::Unlock)),
+            vault: services.vault,
             dirs: services.dirs,
             welcome_uri: String::new(),
             queued: Vec::new(),
@@ -721,10 +738,28 @@ impl VioletApp {
                         .iter()
                         .any(|t| t.id == *tab && t.connection == Some(id))
                 });
-                let needs_password = error.kind == ErrorKind::Authentication
-                    && self
-                        .profile(id)
-                        .is_some_and(|profile| !profile.save_password);
+                // A saved password bound to another server is withheld: ask
+                // for it, as for a profile that keeps none.
+                let withheld = |profile: &ConnectionProfile| {
+                    matches!(
+                        self.profiles
+                            .secrets()
+                            .get(profile.id, &profile.secret_target()),
+                        Ok(SavedSecret::Elsewhere(_))
+                    )
+                };
+                let (needs_password, reason) = match self.profile(id) {
+                    Some(profile) if error.kind == ErrorKind::Authentication => {
+                        if !profile.save_password {
+                            (true, None)
+                        } else if withheld(&profile) {
+                            (true, Some(error.message.clone()))
+                        } else {
+                            (false, None)
+                        }
+                    }
+                    _ => (false, None),
+                };
                 self.explorer
                     .links
                     .insert(id, Link::Failed(error.to_string()));
@@ -733,6 +768,7 @@ impl VioletApp {
                         id,
                         name: self.profile_name(id),
                         password: String::new(),
+                        reason,
                     });
                 } else {
                     self.toasts.push(
@@ -1991,7 +2027,10 @@ impl VioletApp {
             Action::EditConnection(id) => {
                 if let Some(profile) = self.profiles.get(id).cloned() {
                     let saved = profile.save_password
-                        && self.profiles.secrets().get(id).ok().flatten().is_some();
+                        && matches!(
+                            self.profiles.secrets().get(id, &profile.secret_target()),
+                            Ok(SavedSecret::Found(_))
+                        );
                     self.form = Some(ConnectionForm::edit(profile, saved));
                 }
             }
@@ -2204,6 +2243,12 @@ impl VioletApp {
             action @ (Action::SwitchProject(_)
             | Action::AskDeleteProject(_)
             | Action::DeleteProject(_)) => self.project_action(ctx, action),
+            action @ (Action::ExportProject | Action::ImportProject | Action::RunBackup) => {
+                self.backup_action(action);
+            }
+            action @ (Action::MasterPassword
+            | Action::UnlockVault
+            | Action::SaveMasterPassword { .. }) => self.vault_action(ctx, action),
             Action::RefreshTab(tab) => self.refresh(ctx, tab),
             Action::ApplyFilter(tab) => self.run_data(ctx, tab, CachePolicy::Use),
             Action::ClearFilter(tab) => {
@@ -2564,6 +2609,8 @@ impl VioletApp {
             || self.run_review.is_some()
             || self.confirm_delete.is_some()
             || self.confirm_project_delete.is_some()
+            || self.backup.is_some()
+            || self.vault_dialog.is_some()
             || self.close_confirm.is_some()
             || self.tx_confirm.is_some()
             || self.history_view.is_some()
@@ -2878,6 +2925,16 @@ impl VioletApp {
         {
             self.script_prompt = None;
         }
+        if let Some(dialog) = &mut self.backup
+            && !backup_flow::show(ctx, dialog, &mut self.actions)
+        {
+            self.backup = None;
+        }
+        if let Some(dialog) = &mut self.vault_dialog
+            && !vault_flow::show(ctx, dialog, &mut self.actions)
+        {
+            self.vault_dialog = None;
+        }
         if let Some(history) = &mut self.script_history
             && !revisions_flow::show(ctx, history, &mut self.actions)
         {
@@ -3031,6 +3088,7 @@ impl eframe::App for VioletApp {
         self.handle_events(ctx);
         self.retry_loads(ctx);
         self.poll_agent(ctx);
+        self.poll_backup(ctx);
         self.capture_shortcut(ctx);
         self.shortcuts(ctx);
         self.auto_refresh(ctx);

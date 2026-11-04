@@ -9,6 +9,8 @@ license.workspace = true
 [dependencies]
 wit-bindgen = "0.62"
 log.workspace = true
+# Wipes the password out of `ConnectParams` once a session is open.
+zeroize.workspace = true
 
 # Not the workspace lints: the bindings `wit-bindgen` generates for the
 # component ABI are `unsafe` by nature, so `unsafe_code` cannot be

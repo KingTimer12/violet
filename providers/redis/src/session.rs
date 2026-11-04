@@ -143,6 +143,8 @@ struct Walk {
 }
 
 pub struct RedisSession {
+    /// Kept to open the catalog connection on first use, password
+    /// included; [`Drop`] clears it.
     params: ConnectParams,
     main: RefCell<Client>,
     catalog: RefCell<Option<Client>>,
@@ -214,6 +216,12 @@ fn skip_rows(rows: Rows, width: usize, skip: usize) -> Rows {
             .iter()
             .map(|end| ((end & !NULL) - base) | (end & NULL))
             .collect(),
+    }
+}
+
+impl Drop for RedisSession {
+    fn drop(&mut self) {
+        self.params.wipe_password();
     }
 }
 

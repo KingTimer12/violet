@@ -156,6 +156,16 @@ fn project_switcher(ui: &mut Ui, settings: &crate::settings::Settings, actions: 
                 super::rename_flow::RenameTarget::Project(id.to_owned()),
             ));
         }
+        ui.separator();
+        if menu_item(ui, Icon::Archive, "Export workspace…") {
+            actions.push(Action::ExportProject);
+        }
+        if menu_item(ui, Icon::ArchiveRestore, "Import backup…") {
+            actions.push(Action::ImportProject);
+        }
+        if menu_item(ui, Icon::Lock, "Master password…") {
+            actions.push(Action::MasterPassword);
+        }
         // The default workspace and the open one stay.
         let others: Vec<_> = settings
             .projects

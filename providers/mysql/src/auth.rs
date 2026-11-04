@@ -7,6 +7,7 @@ use rsa::{Oaep, RsaPublicKey};
 use sha1::Sha1;
 use sha2::{Digest as _, Sha256};
 use violet_sdk::{DbError, Result};
+use zeroize::Zeroizing;
 
 pub(crate) const NATIVE: &str = "mysql_native_password";
 pub(crate) const CACHING_SHA2: &str = "caching_sha2_password";
@@ -29,15 +30,15 @@ pub(crate) fn answer(
     password: Option<&str>,
     nonce: &[u8],
     secure: bool,
-) -> Result<Vec<u8>> {
+) -> Result<Zeroizing<Vec<u8>>> {
     let password = password.unwrap_or_default();
     Ok(match plugin {
         // An empty password is answered with nothing, whatever the plugin.
-        _ if password.is_empty() => Vec::new(),
-        NATIVE => native(password.as_bytes(), nonce).to_vec(),
-        CACHING_SHA2 => caching_sha2(password.as_bytes(), nonce).to_vec(),
+        _ if password.is_empty() => Zeroizing::new(Vec::new()),
+        NATIVE => Zeroizing::new(native(password.as_bytes(), nonce).to_vec()),
+        CACHING_SHA2 => Zeroizing::new(caching_sha2(password.as_bytes(), nonce).to_vec()),
         SHA256 if secure => cleartext(password),
-        SHA256 => vec![REQUEST_SHA256_KEY],
+        SHA256 => Zeroizing::new(vec![REQUEST_SHA256_KEY]),
         CLEAR if secure => cleartext(password),
         CLEAR => {
             return Err(DbError::tls(
@@ -55,8 +56,11 @@ pub(crate) fn answer(
 
 /// The password and a NUL, as `sha256_password` and a full
 /// `caching_sha2_password` authentication take it over a secure channel.
-pub(crate) fn cleartext(password: &str) -> Vec<u8> {
-    let mut bytes = password.as_bytes().to_vec();
+/// Sized up front so pushing the NUL never leaves a copy behind, and
+/// cleared when dropped.
+pub(crate) fn cleartext(password: &str) -> Zeroizing<Vec<u8>> {
+    let mut bytes = Zeroizing::new(Vec::with_capacity(password.len() + 1));
+    bytes.extend_from_slice(password.as_bytes());
     bytes.push(0);
     bytes
 }

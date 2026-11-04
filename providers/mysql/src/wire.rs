@@ -204,7 +204,11 @@ impl Wire {
             &greeting.nonce,
             self.secure,
         )?;
-        let mut packet = Vec::with_capacity(128);
+        // Holds the answer, which can be the password itself: cleared when
+        // dropped, and sized so it never grows (growing leaves a copy).
+        let mut packet = zeroize::Zeroizing::new(Vec::with_capacity(
+            512 + params.username.len() + response.len() + database.len(),
+        ));
         self.put_header(&mut packet);
         packet.extend_from_slice(params.username.as_bytes());
         packet.push(0);

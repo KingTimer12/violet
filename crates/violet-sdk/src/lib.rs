@@ -241,6 +241,17 @@ impl Dialect {
 }
 
 impl ConnectParams {
+    /// Overwrites the password with zeros and drops it.
+    ///
+    /// Call it as soon as the handshake is done, and before keeping the
+    /// parameters around: the allocator does not clear what it frees, so
+    /// a password left to drop stays readable in the instance's memory.
+    pub fn wipe_password(&mut self) {
+        if let Some(mut password) = self.password.take() {
+            zeroize::Zeroize::zeroize(&mut password);
+        }
+    }
+
     /// A provider specific option from the profile.
     #[must_use]
     pub fn option(&self, key: &str) -> Option<&str> {

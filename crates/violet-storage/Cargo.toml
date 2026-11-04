@@ -14,6 +14,14 @@ log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+zeroize = { workspace = true, features = ["serde"] }
+# The vault: passwords sealed with a key kept in the keychain, or wrapped
+# by a master password.
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
+getrandom = "0.4"
+# Keeps the vault's key out of swap (mlock / VirtualLock), through a safe API.
+region = "3"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 
 [dev-dependencies]
